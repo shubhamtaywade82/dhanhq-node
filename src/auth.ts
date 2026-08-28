@@ -1,9 +1,23 @@
 import { DhanClient } from "@nemesis-oss/dhanhq-sdk";
 import Redis from "ioredis";
+import axios from "axios";
 
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379/0";
 export const redisSubscriber = new Redis(redisUrl);
 export const redisPublisher = new Redis(redisUrl);
+
+// Fetches a fresh token from the Rails token authority.
+// Rails exposes GET /api/dhan_access_token → { dhan_access_token, expiry_time }
+// The SDK's fromTokenEndpoint() uses a different path/shape, so we call directly.
+async function fetchTokenFromRails(baseUrl: string, bearerToken: string): Promise<string> {
+  const { data } = await axios.get(`${baseUrl}/api/dhan_access_token`, {
+    headers: { Authorization: `Bearer ${bearerToken}`, Accept: "application/json" },
+    timeout: 5000,
+  });
+  const token = data.dhan_access_token || data.dhanaccesstoken;
+  if (!token) throw new Error(`[Auth] Rails responded but returned no token. Keys: ${Object.keys(data).join(", ")}`);
+  return token;
+}
 
 export async function createDhanClient(): Promise<DhanClient> {
   const clientId = (await redisPublisher.get("dhan:auth:client_id")) || process.env.DHAN_CLIENT_ID || "";
@@ -16,10 +30,9 @@ export async function createDhanClient(): Promise<DhanClient> {
   }
 
   if (authProviderUrl && authProviderToken) {
-    return DhanClient.fromTokenEndpoint({
-      endpointBaseUrl: authProviderUrl,
-      bearerToken: authProviderToken,
-    });
+    const token = await fetchTokenFromRails(authProviderUrl, authProviderToken);
+    console.log("[Auth] Token fetched from Rails authority successfully.");
+    return new DhanClient({ clientId, token });
   }
 
   const client = new DhanClient({

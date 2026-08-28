@@ -21,20 +21,6 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
 
   return (
     <div className="dashboard-shell space-y-5">
-      <div className="dashboard-intro">
-        <div>
-          <div className="text-[10px] font-mono text-accent uppercase tracking-[0.18em] font-semibold">
-            Trading desk / session overview
-          </div>
-          <h2>Good afternoon, the book is working.</h2>
-          <p>
-            Live exposure, execution quality, and strategy health in one view.
-          </p>
-        </div>
-        <div className="session-chip">
-          <span className="status-dot live pulse-live" /> NSE session active
-        </div>
-      </div>
       <MetricsGrid state={state} totalPnl={totalPnl} />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -48,17 +34,28 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
                 REALTIME
               </span>
             </div>
+            <div className="flex gap-1.5">
+              <button className="btn btn-ghost text-[10px] py-0.5 px-2.5">
+                1H
+              </button>
+              <button className="btn btn-ghost text-[10px] py-0.5 px-2.5 border-accent/30 text-accent">
+                SESSION
+              </button>
+              <button className="btn btn-ghost text-[10px] py-0.5 px-2.5">
+                1W
+              </button>
+            </div>
           </div>
           <canvas ref={canvasRef} height={190} className="w-full" />
         </Card>
-        <Card className="p-4 flex flex-col justify-between overflow-hidden">
+        <Card className="p-4 flex flex-col justify-between">
           <div>
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center justify-between mb-3 gap-2">
               <span className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">
                 Active Strategies
               </span>
               <button
-                className="text-[10px] font-mono text-accent hover:underline shrink-0"
+                className="text-[10px] font-mono text-accent hover:underline whitespace-nowrap"
                 onClick={() => onNavigate("strategies")}
               >
                 View All →
@@ -70,21 +67,21 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
                 .map((s) => (
                   <div
                     key={s.id}
-                    className="p-2.5 rounded-lg bg-surface-50 border border-border hover:border-[#2a3d5e] transition-all cursor-pointer overflow-hidden"
+                    className="p-2.5 rounded-lg bg-surface-50 border border-border hover:border-[#2a3d5e] transition-all cursor-pointer"
                     onClick={() => onNavigate("strategies")}
                   >
-                    <div className="flex items-center justify-between mb-1.5 min-w-0">
-                      <span className="text-xs font-semibold text-white truncate mr-2">
+                    <div className="flex items-center justify-between mb-1 gap-2">
+                      <span className="text-[11px] font-semibold text-white truncate min-w-0">
                         {s.name}
                       </span>
                       <StratBadge status={s.status} />
                     </div>
-                    <div className="flex items-center justify-between min-w-0">
-                      <span className="text-[9.5px] font-mono text-muted truncate mr-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[9px] font-mono text-muted shrink-0">
                         {s.symbol} · {s.type} · {s.lots}L
                       </span>
                       <span
-                        className={`text-xs font-mono font-bold shrink-0 ${pnlClass(s.pnl)}`}
+                        className={`text-[11px] font-mono font-bold whitespace-nowrap ${pnlClass(s.pnl)}`}
                       >
                         {fmtINR(s.pnl)}
                       </span>
@@ -108,26 +105,28 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
             {Object.entries(state.indices).map(([sym, d]) => {
               if (!d) return null;
               return (
-              <div
-                key={sym}
-                className="flex items-center justify-between p-2 rounded bg-surface-50 border border-border"
-              >
-                <div>
-                  <div className="text-xs font-semibold text-white">{sym}</div>
-                  <div className="text-[9px] font-mono text-muted">SPOT</div>
-                </div>
-                <div className="text-right">
-                  <div className="text-xs font-mono font-bold text-white">
-                    {fmt(d.ltp)}
+                <div
+                  key={sym}
+                  className="flex items-center justify-between p-2 rounded bg-surface-50 border border-border"
+                >
+                  <div>
+                    <div className="text-xs font-semibold text-white">
+                      {sym}
+                    </div>
+                    <div className="text-[9px] font-mono text-muted">SPOT</div>
                   </div>
-                  <div
-                    className={`${d.change >= 0 ? "text-accent" : "text-danger"} text-[10px] font-mono`}
-                  >
-                    {d.change >= 0 ? "▲" : "▼"}
-                    {fmt(Math.abs(d.change))} ({fmt(Math.abs(d.pct))}%)
+                  <div className="text-right">
+                    <div className="text-xs font-mono font-bold text-white">
+                      {fmt(d.ltp)}
+                    </div>
+                    <div
+                      className={`${d.change >= 0 ? "text-accent" : "text-danger"} text-[10px] font-mono`}
+                    >
+                      {d.change >= 0 ? "▲" : "▼"}
+                      {fmt(Math.abs(d.change))} ({fmt(Math.abs(d.pct))}%)
+                    </div>
                   </div>
                 </div>
-              </div>
               );
             })}
           </div>

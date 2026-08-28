@@ -1,45 +1,45 @@
-import { useState, useCallback } from 'react';
-import { AppProvider, useApp } from './store/AppContext';
-import { Header } from './components/layout/Header';
-import { Sidebar } from './components/layout/Sidebar';
-import { ToastContainer, ModalContainer } from './components/layout/ToastModal';
-import { Dashboard } from './pages/Dashboard';
-import { Strategies } from './pages/Strategies';
-import { OptionsChain } from './pages/OptionsChain';
-import { Positions } from './pages/Positions';
-import { Orders } from './pages/Orders';
-import { AgentConsole } from './pages/AgentConsole';
-import { AgentMonitor } from './pages/AgentMonitor';
-import { AgentToolsMemory } from './pages/AgentToolsMemory';
-import { GreeksAnalytics } from './pages/GreeksAnalytics';
-import { MarginRisk } from './pages/MarginRisk';
-import { SidekiqInfra } from './pages/SidekiqInfra';
-import { Alerts } from './pages/Alerts';
-import { Logs } from './pages/Logs';
-import { Config } from './pages/Config';
-import { useSimulation } from './hooks/useSimulation';
-import { openDeployStrategyModal } from './pages/DeployModal';
+import { useState, useCallback } from "react";
+import { AppProvider, useApp } from "./store/AppContext";
+import { Header } from "./components/layout/Header";
+import { Sidebar } from "./components/layout/Sidebar";
+import { ToastContainer, ModalContainer } from "./components/layout/ToastModal";
+import { Dashboard } from "./pages/Dashboard";
+import { Strategies } from "./pages/Strategies";
+import { OptionsChain } from "./pages/OptionsChain";
+import { Positions } from "./pages/Positions";
+import { Orders } from "./pages/Orders";
+import { AgentConsole } from "./pages/AgentConsole";
+import { AgentMonitor } from "./pages/AgentMonitor";
+import { AgentToolsMemory } from "./pages/AgentToolsMemory";
+import { GreeksAnalytics } from "./pages/GreeksAnalytics";
+import { MarginRisk } from "./pages/MarginRisk";
+import { SidekiqInfra } from "./pages/SidekiqInfra";
+import { Alerts } from "./pages/Alerts";
+import { Logs } from "./pages/Logs";
+import { Config } from "./pages/Config";
+import { useSimulation } from "./hooks/useSimulation";
+import { openDeployStrategyModal } from "./pages/DeployModal";
 
 const PAGE_TITLES: Record<string, [string, string]> = {
-  dashboard: ['Dashboard', 'REAL-TIME CONTROL PLANE'],
-  strategies: ['Strategies', 'AASM STATE MACHINE BACKED'],
-  'options-chain': ['Option Chain', 'LIVE DHAN /v2/optionchain'],
-  positions: ['Positions', 'OPTIMISTIC LOCKING (AR)'],
-  orders: ['Order Book', 'FULL AUDIT TRAIL'],
-  'agent-console': ['Agent Console', 'REACT MULTI-AGENT LOOP'],
-  'agent-monitor': ['Ops Telemetry', 'AGENT INTERNAL METRICS'],
-  'agent-tools-memory': ['Tools & Memory', 'PILLARS 2 & 3'],
-  'greeks-analytics': ['Greeks & Volatility', 'ANALYTICS & IV SURFACE'],
-  'margin-risk': ['Margin & Risk', 'DHAN HEDGE & CIRCUIT BREAKERS'],
-  'sidekiq-infra': ['Sidekiq & Infra', 'BACKGROUND JOBS & PUMA'],
-  alerts: ['Alerts', 'ACTIVESUPPORT NOTIFICATIONS'],
-  logs: ['Logs & Traces', 'TAGGED REQUEST_ID'],
-  config: ['Configuration', 'SYSTEM & BROKER PARAMS'],
+  dashboard: ["Dashboard", "LIVE OVERVIEW"],
+  strategies: ["Strategies", "AASM STATE MACHINE BACKED"],
+  "options-chain": ["Option Chain", "LIVE DHAN /v2/optionchain"],
+  positions: ["Positions", "OPTIMISTIC LOCKING (AR)"],
+  orders: ["Order Book", "FULL AUDIT TRAIL"],
+  "agent-console": ["Agent Console", "REACT MULTI-AGENT LOOP"],
+  "agent-monitor": ["Ops Telemetry", "AGENT INTERNAL METRICS"],
+  "agent-tools-memory": ["Tools & Memory", "PILLARS 2 & 3"],
+  "greeks-analytics": ["Greeks & Volatility", "ANALYTICS & IV SURFACE"],
+  "margin-risk": ["Margin & Risk", "DHAN HEDGE & CIRCUIT BREAKERS"],
+  "sidekiq-infra": ["Sidekiq & Infra", "BACKGROUND JOBS & PUMA"],
+  alerts: ["Alerts", "ACTIVESUPPORT NOTIFICATIONS"],
+  logs: ["Logs & Traces", "TAGGED REQUEST_ID"],
+  config: ["Configuration", "SYSTEM & BROKER PARAMS"],
 };
 
 function AppInner() {
   const { setState, openModal, closeModal, showToast, addSystemLog } = useApp();
-  const [page, setPage] = useState('dashboard');
+  const [page, setPage] = useState("dashboard");
   useSimulation();
 
   const handleNavigate = useCallback((id: string) => setPage(id), []);
@@ -47,13 +47,20 @@ function AppInner() {
   const handleKillSwitch = useCallback(() => {
     openModal(
       <div className="text-center">
-        <div className="w-14 h-14 rounded-full bg-danger/10 flex items-center justify-center mx-auto mb-3 text-danger text-2xl">⚠</div>
-        <div className="text-base font-bold text-danger mb-1">EMERGENCY KILL SWITCH</div>
+        <div className="w-14 h-14 rounded-full bg-danger/10 flex items-center justify-center mx-auto mb-3 text-danger text-2xl">
+          ⚠
+        </div>
+        <div className="text-base font-bold text-danger mb-1">
+          EMERGENCY KILL SWITCH
+        </div>
         <div className="text-xs text-muted mb-4">
-          This will immediately cancel all orders, close all positions, and stop all strategies.
+          This will immediately cancel all orders, close all positions, and stop
+          all strategies.
         </div>
         <div className="bg-surface-50 border border-danger/20 rounded p-3 mb-4">
-          <div className="text-[9.5px] font-mono text-muted uppercase mb-1">Type CONFIRM to execute:</div>
+          <div className="text-[9.5px] font-mono text-muted uppercase mb-1">
+            Type CONFIRM to execute:
+          </div>
           <input
             type="text"
             className="w-full bg-bg border border-border rounded-md px-3 py-[7px] text-[12px] font-mono text-white outline-none text-center font-bold"
@@ -63,65 +70,135 @@ function AppInner() {
           />
         </div>
         <div className="flex gap-2 justify-center">
-          <button className="px-4 py-[7px] rounded-md text-xs font-semibold bg-transparent text-muted border border-border hover:text-white hover:border-[#2a3d5e] hover:bg-surface-200 transition-all" onClick={closeModal}>Cancel</button>
+          <button
+            className="px-4 py-[7px] rounded-md text-xs font-semibold bg-transparent text-muted border border-border hover:text-white hover:border-[#2a3d5e] hover:bg-surface-200 transition-all"
+            onClick={closeModal}
+          >
+            Cancel
+          </button>
           <button
             className="px-4 py-[7px] rounded-md text-xs font-semibold bg-danger text-white hover:bg-[#ff5c78] transition-all"
             onClick={() => {
-              const input = document.getElementById('killSwitchInput') as HTMLInputElement;
-              if (!input || input.value !== 'CONFIRM') {
-                showToast('Type CONFIRM to proceed', 'error');
+              const input = document.getElementById(
+                "killSwitchInput",
+              ) as HTMLInputElement;
+              if (!input || input.value !== "CONFIRM") {
+                showToast("Type CONFIRM to proceed", "error");
                 return;
               }
               closeModal();
-              setState(prev => ({
+              setState((prev) => ({
                 ...prev,
                 killed: true,
                 live: false,
-                strategies: prev.strategies.map(s => ({ ...s, status: 'STOPPED' as const, pnl: 0 })),
+                strategies: prev.strategies.map((s) => ({
+                  ...s,
+                  status: "STOPPED" as const,
+                  pnl: 0,
+                })),
               }));
-              addSystemLog('ERROR', '*** EMERGENCY KILL SWITCH ACTIVATED ***', 'risk_engine');
-              showToast('EMERGENCY KILL SWITCH ACTIVATED', 'error');
+              addSystemLog(
+                "ERROR",
+                "*** EMERGENCY KILL SWITCH ACTIVATED ***",
+                "risk_engine",
+              );
+              showToast("EMERGENCY KILL SWITCH ACTIVATED", "error");
             }}
           >
             Execute Kill Switch
           </button>
         </div>
-      </div>
+      </div>,
     );
   }, [openModal, closeModal, setState, addSystemLog, showToast]);
 
-  const [title, subtitle] = PAGE_TITLES[page] || ['Overview', ''];
+  const [title, subtitle] = PAGE_TITLES[page] || ["Overview", ""];
 
   const renderPage = () => {
     switch (page) {
-      case 'dashboard': return <Dashboard onNavigate={handleNavigate} onDeploy={() => openDeployStrategyModal(openModal, closeModal, setState, addSystemLog, showToast)} />;
-      case 'strategies': return <Strategies onDeploy={() => openDeployStrategyModal(openModal, closeModal, setState, addSystemLog, showToast)} />;
-      case 'options-chain': return <OptionsChain />;
-      case 'positions': return <Positions />;
-      case 'orders': return <Orders />;
-      case 'agent-console': return <AgentConsole />;
-      case 'agent-monitor': return <AgentMonitor />;
-      case 'agent-tools-memory': return <AgentToolsMemory />;
-      case 'greeks-analytics': return <GreeksAnalytics />;
-      case 'margin-risk': return <MarginRisk />;
-      case 'sidekiq-infra': return <SidekiqInfra />;
-      case 'alerts': return <Alerts />;
-      case 'logs': return <Logs />;
-      case 'config': return <Config />;
-      default: return <Dashboard onNavigate={handleNavigate} onDeploy={() => openDeployStrategyModal(openModal, closeModal, setState, addSystemLog, showToast)} />;
+      case "dashboard":
+        return (
+          <Dashboard
+            onNavigate={handleNavigate}
+            onDeploy={() =>
+              openDeployStrategyModal(
+                openModal,
+                closeModal,
+                setState,
+                addSystemLog,
+                showToast,
+              )
+            }
+          />
+        );
+      case "strategies":
+        return (
+          <Strategies
+            onDeploy={() =>
+              openDeployStrategyModal(
+                openModal,
+                closeModal,
+                setState,
+                addSystemLog,
+                showToast,
+              )
+            }
+          />
+        );
+      case "options-chain":
+        return <OptionsChain />;
+      case "positions":
+        return <Positions />;
+      case "orders":
+        return <Orders />;
+      case "agent-console":
+        return <AgentConsole />;
+      case "agent-monitor":
+        return <AgentMonitor />;
+      case "agent-tools-memory":
+        return <AgentToolsMemory />;
+      case "greeks-analytics":
+        return <GreeksAnalytics />;
+      case "margin-risk":
+        return <MarginRisk />;
+      case "sidekiq-infra":
+        return <SidekiqInfra />;
+      case "alerts":
+        return <Alerts />;
+      case "logs":
+        return <Logs />;
+      case "config":
+        return <Config />;
+      default:
+        return (
+          <Dashboard
+            onNavigate={handleNavigate}
+            onDeploy={() =>
+              openDeployStrategyModal(
+                openModal,
+                closeModal,
+                setState,
+                addSystemLog,
+                showToast,
+              )
+            }
+          />
+        );
     }
   };
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden">
+    <div className="bg-grid flex flex-col h-screen overflow-hidden">
       <ToastContainer />
       <ModalContainer />
-      <Header pageTitle={title} pageSubtitle={subtitle} onKillSwitch={handleKillSwitch} />
+      <Header
+        pageTitle={title}
+        pageSubtitle={subtitle}
+        onKillSwitch={handleKillSwitch}
+      />
       <div className="flex-1 flex overflow-hidden">
         <Sidebar activePage={page} onNavigate={handleNavigate} />
-        <main className="flex-1 overflow-y-auto p-5">
-          {renderPage()}
-        </main>
+        <main className="flex-1 overflow-y-auto p-5">{renderPage()}</main>
       </div>
     </div>
   );
