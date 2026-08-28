@@ -25,6 +25,24 @@ export const api = {
   holdings: () => request<any[]>('/api/portfolio/holdings'),
   profile: () => request<any>('/api/portfolio/profile'),
 
+  placePaperOrder: (order: { symbol: string; quantity: number; transactionType: 'BUY' | 'SELL'; price?: number; orderType?: string; productType?: string; securityId?: string }) =>
+    request<any>('/api/portfolio/paper/order', {
+      method: 'POST',
+      body: JSON.stringify(order),
+    }),
+
+  closePaperPosition: (symbol: string, ltp?: number) =>
+    request<any>('/api/portfolio/paper/positions/close', {
+      method: 'POST',
+      body: JSON.stringify({ symbol, ltp }),
+    }),
+
+  resetPaperWallet: (initialBalance = 1000000) =>
+    request<any>('/api/portfolio/paper/wallet/reset', {
+      method: 'POST',
+      body: JSON.stringify({ initialBalance }),
+    }),
+
   ollamaChat: (messages: Array<{ role: string; content: string }>, model?: string) =>
     request<{ response: string; model: string }>('/api/ollama/chat', {
       method: 'POST',

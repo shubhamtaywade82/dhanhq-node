@@ -1,5 +1,6 @@
 import { DhanClient, PositionMonitor } from "@nemesis-oss/dhanhq-sdk";
 import { redisPublisher } from "../auth";
+import { executePaperOrder } from "../db";
 
 export class PaperExecutionEngine {
   private client: DhanClient;
@@ -23,12 +24,22 @@ export class PaperExecutionEngine {
       await new Promise((resolve) => setTimeout(resolve, this.latencyMs));
     }
 
-    // client.ws.market has no getDepth() on the installed dhanhq-ts version — always fall back to LTP.
-    // (Deliberately not reading client.ws here: this sidecar no longer opens a Dhan WebSocket at all,
-    // see the other commits on this branch — don't reintroduce a live reference to it.)
     const tickSize = 0.05;
     const ltp = params.price || 100.0;
     const fillPrice = transaction_type === "BUY" ? ltp + this.slippageTicks * tickSize : ltp - this.slippageTicks * tickSize;
+    const symbol = params.symbol || params.trading_symbol || `SEC_${security_id}`;
+
+    await executePaperOrder({
+      symbol,
+      securityId: security_id,
+      exchangeSegment: params.exchange_segment || "NSE_FNO",
+      transactionType: transaction_type,
+      orderType: order_type,
+      productType: params.product_type || "INTRADAY",
+      quantity,
+      price: fillPrice,
+      correlationId: correlation_id,
+    });
 
     const fillPayload = {
       intent_id,

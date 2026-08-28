@@ -19,6 +19,7 @@ interface AppContextValue {
   toasts: Toast[];
   modalContent: ReactNode | null;
   addSystemLog: (level: string, message: string, source?: string) => void;
+  refreshPortfolio: () => Promise<void>;
   connected: boolean;
 }
 
@@ -31,7 +32,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [connected, setConnected] = useState(false);
   const toastIdRef = useRef(0);
 
-  // Fetch initial data from API on mount
+  const refreshPortfolio = useCallback(async () => {
+    try {
+      const [positions, orders, funds] = await Promise.all([
+        api.positions().catch(() => []),
+        api.orders().catch(() => []),
+        api.funds().catch(() => ({})),
+      ]);
+      setState((prev) => ({
+        ...prev,
+        positions: Array.isArray(positions) ? positions : prev.positions,
+        orders: Array.isArray(orders) ? orders : prev.orders,
+        funds: typeof funds === 'object' && funds !== null ? { ...prev.funds, ...funds } : prev.funds,
+      }));
+    } catch {
+      // Ignore background sync errors
+    }
+  }, []);
+
   useEffect(() => {
     let mounted = true;
 
@@ -47,49 +65,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
       try {
         const indices = await api.indices();
-        if (!mounted) return;
-        setState((prev) => ({ ...prev, indices }));
+        if (mounted) setState((prev) => ({ ...prev, indices }));
       } catch {
-        // Use mock data as fallback
+        // Fallback
       }
 
-      try {
-        const [positions, orders, funds] = await Promise.all([
-          api.positions().catch(() => []),
-          api.orders().catch(() => []),
-          api.funds().catch(() => ({})),
-        ]);
-        if (!mounted) return;
-        setState((prev) => ({
-          ...prev,
-          positions: Array.isArray(positions) ? positions : prev.positions,
-          orders: Array.isArray(orders) ? orders : prev.orders,
-          funds: typeof funds === 'object' ? { ...prev.funds, ...(funds as any) } : prev.funds,
-        }));
-      } catch {
-        // Use mock data as fallback
-      }
+      await refreshPortfolio();
     }
 
     fetchInitialData();
 
-    // Poll indices every 5s
     const interval = setInterval(async () => {
       try {
         const indices = await api.indices();
-        if (mounted) {
-          setState((prev) => ({ ...prev, indices }));
-        }
+        if (mounted) setState((prev) => ({ ...prev, indices }));
       } catch {
         // Silent fail
       }
-    }, 5000);
+      if (mounted) await refreshPortfolio();
+    }, 4000);
 
     return () => {
       mounted = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [refreshPortfolio]);
 
   const showToast = useCallback((msg: string, type: ToastType = 'success') => {
     const id = ++toastIdRef.current;
@@ -121,7 +121,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
 
   return (
-    <AppContext.Provider value={{ state, setState, showToast, openModal, closeModal, toasts, modalContent, addSystemLog, connected }}>
+    <AppContext.Provider value={{ state, setState, showToast, openModal, closeModal, toasts, modalContent, addSystemLog, refreshPortfolio, connected }}>
       {children}
     </AppContext.Provider>
   );

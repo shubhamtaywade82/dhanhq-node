@@ -5,9 +5,12 @@ import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Select } from '../components/ui/Select';
 import { StatusDot } from '../components/ui/StatusDot';
+import { fmtINR, fmt } from '../utils/formatters';
+import { RotateCcw } from 'lucide-react';
+import { api } from '../services/api';
 
 function GaugeRing({ value, max, color, label, sub }: { value: number; max: number; color: string; label: string; sub: string }) {
-  const pct = value / max;
+  const pct = Math.min(1, Math.max(0, value / max));
   const dashoffset = 314 * (1 - pct);
   return (
     <Card className="p-4">
@@ -16,8 +19,8 @@ function GaugeRing({ value, max, color, label, sub }: { value: number; max: numb
         <svg width="110" height="110" viewBox="0 0 120 120">
           <circle cx="60" cy="60" r="50" fill="none" stroke="#1c283f" strokeWidth="7" />
           <circle cx="60" cy="60" r="50" fill="none" stroke={color} strokeWidth="7" strokeDasharray="314" strokeDashoffset={dashoffset} strokeLinecap="round" className="gauge-ring" />
-          <text x="60" y="56" textAnchor="middle" fill="white" fontFamily="JetBrains Mono" fontSize="15" fontWeight="700">{label.includes('Vol') ? 'MED' : sub}</text>
-          <text x="60" y="72" textAnchor="middle" fill="#64748b" fontFamily="JetBrains Mono" fontSize="9">{label.includes('Loss') ? 'of 50K' : label.includes('Margin') ? 'of 5,00,000' : label.includes('Single') ? 'of 2,00,000' : `IVR ${sub}`}</text>
+          <text x="60" y="56" textAnchor="middle" fill="white" fontFamily="JetBrains Mono" fontSize="13" fontWeight="700">{sub}</text>
+          <text x="60" y="72" textAnchor="middle" fill="#64748b" fontFamily="JetBrains Mono" fontSize="9">{label.includes('Loss') ? 'of 50K' : label.includes('Margin') ? 'of Wallet' : label.includes('Single') ? 'of 2,00,000' : `IVR ${sub}`}</text>
         </svg>
       </div>
       <div className="text-center text-[10px] font-mono text-accent mt-1">
@@ -28,8 +31,25 @@ function GaugeRing({ value, max, color, label, sub }: { value: number; max: numb
 }
 
 export function MarginRisk() {
-  const { state, showToast, addSystemLog } = useApp();
+  const { state, showToast, addSystemLog, refreshPortfolio } = useApp();
   const [activeTab, setActiveTab] = useState('single');
+
+  const avail = Number(state.funds.availableMargin || 1000000);
+  const used = Number(state.funds.usedMargin || 0);
+  const total = Number(state.funds.totalBalance || (avail + used));
+  const realized = Number(state.funds.realizedPnl || 0);
+  const utilPct = total > 0 ? (used / total) * 100 : 0;
+
+  const handleResetWallet = async () => {
+    try {
+      await api.resetPaperWallet(1000000);
+      showToast('Paper Wallet reset to ₹10,00,000 (10 Lakhs)', 'success');
+      addSystemLog('WARN', 'Paper wallet and positions reset to initial state', 'wallet_admin');
+      await refreshPortfolio();
+    } catch (e: any) {
+      showToast(`Failed to reset wallet: ${e.message}`, 'error');
+    }
+  };
 
   const tabs = [
     { id: 'single', label: 'Single Order Margin' },
@@ -40,11 +60,21 @@ export function MarginRisk() {
 
   return (
     <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">Margin & Risk Management</div>
+          <div className="text-xs text-muted mt-0.5">Real-time PostgreSQL demo account balance and margin governor</div>
+        </div>
+        <Button variant="danger" onClick={handleResetWallet}>
+          <RotateCcw size={12} className="mr-1" /> Reset Demo Account (₹10L)
+        </Button>
+      </div>
+
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <GaugeRing value={12400} max={50000} color="#00e5a0" label="Daily Loss Limit" sub="-12.4K" />
-        <GaugeRing value={49} max={100} color="#f0b429" label="Margin Utilization" sub="49%" />
-        <GaugeRing value={25} max={100} color="#00e5a0" label="Max Single Strat Limit" sub="25%" />
-        <GaugeRing value={42} max={100} color="#38bdf8" label="Vol Regime (IVR)" sub="42.3" />
+        <GaugeRing value={Math.abs(realized)} max={50000} color={realized >= 0 ? "#00e5a0" : "#ff3b5c"} label="Realized P&L" sub={fmtINR(realized)} />
+        <GaugeRing value={utilPct} max={100} color={utilPct > 70 ? "#ff3b5c" : "#f0b429"} label="Margin Utilization" sub={`${fmt(utilPct)}%`} />
+        <GaugeRing value={used} max={total || 1000000} color="#38bdf8" label="Margin Used" sub={fmtINR(used)} />
+        <GaugeRing value={avail} max={total || 1000000} color="#00e5a0" label="Available Margin" sub={fmtINR(avail)} />
       </div>
 
       <Card className="p-4">

@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import { createDhanClient } from "./auth";
+import { initDatabase } from "./db";
 import { startExecutor } from "./executor";
 
 dotenv.config();
@@ -17,6 +18,7 @@ async function main() {
   console.log("=================================================");
 
   try {
+    await initDatabase();
     const client = await createDhanClient();
     await startExecutor(client);
 

@@ -4,6 +4,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import dotenv from 'dotenv';
 import { createDhanClient } from './auth';
+import { initDatabase } from './db';
 import { marketRoutes } from './routes/market';
 import { portfolioRoutes } from './routes/portfolio';
 import { ollamaRoutes } from './routes/ollama';
@@ -20,6 +21,7 @@ async function main() {
   console.log(`Port: ${PORT}`);
   console.log('=================================================');
 
+  await initDatabase();
   const client = await createDhanClient();
   const app = express();
 
