@@ -66,4 +66,5 @@ export const api = {
 
   ollamaHealth: () => request<{ status: string }>('/api/ollama/health'),
   ollamaModels: () => request<any>('/api/ollama/models'),
+  infraStats: () => request<any>('/api/infra/stats'),
 };

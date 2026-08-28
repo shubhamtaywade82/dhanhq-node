@@ -8,6 +8,7 @@ import { initDatabase } from './db';
 import { marketRoutes } from './routes/market';
 import { portfolioRoutes } from './routes/portfolio';
 import { ollamaRoutes } from './routes/ollama';
+import { infraRoutes } from './routes/infra';
 import { MarketStreamManager } from './ws/marketStream';
 
 dotenv.config();
@@ -33,6 +34,7 @@ async function main() {
   app.use('/api/market', marketRoutes(client, streamManager));
   app.use('/api/portfolio', portfolioRoutes(client));
   app.use('/api/ollama', ollamaRoutes());
+  app.use('/api/infra', infraRoutes(streamManager));
 
   app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok', mode: process.env.TRADING_MODE || 'paper', uptime: process.uptime() });
