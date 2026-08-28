@@ -79,6 +79,31 @@ body::after {
 .glow-danger { box-shadow: 0 0 20px rgba(255, 59, 92, 0.2); }
 .glow-gold { box-shadow: 0 0 20px rgba(240, 180, 41, 0.15); }
 
+/* Data Table */
+.data-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: var(--font-mono); }
+.data-table th {
+  text-align: left; padding: 8px 10px; color: var(--color-muted); font-weight: 500;
+  border-bottom: 1px solid var(--color-border); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.data-table td { padding: 7px 10px; border-bottom: 1px solid rgba(28, 40, 63, 0.6); }
+.data-table tr:hover td { background: rgba(21, 31, 51, 0.5); }
+
+/* Badges */
+.badge { padding: 2px 7px; border-radius: 4px; font-size: 9.5px; font-family: var(--font-mono); font-weight: 600; white-space: nowrap; }
+.badge-filled { background: rgba(0, 229, 160, 0.12); color: var(--color-accent); }
+.badge-open { background: rgba(56, 189, 248, 0.12); color: var(--color-sky); }
+.badge-rejected { background: rgba(255, 59, 92, 0.12); color: var(--color-danger); }
+.badge-cancelled { background: rgba(100, 116, 139, 0.12); color: var(--color-muted); }
+.badge-transit { background: rgba(240, 180, 41, 0.12); color: var(--color-gold); }
+.badge-purple { background: rgba(168, 85, 247, 0.12); color: var(--color-purple); }
+
+/* Status Dot */
+.status-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.status-dot.live { background: var(--color-accent); box-shadow: 0 0 6px var(--color-accent); }
+.status-dot.idle { background: var(--color-muted); }
+.status-dot.warn { background: var(--color-gold); box-shadow: 0 0 6px var(--color-gold); }
+.status-dot.error { background: var(--color-danger); box-shadow: 0 0 6px var(--color-danger); }
+
 .code-blk {
   background: #04060b;
   border: 1px solid var(--color-border);

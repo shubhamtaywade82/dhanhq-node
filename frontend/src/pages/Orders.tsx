@@ -30,7 +30,7 @@ export function Orders() {
       </div>
 
       <Card className="overflow-x-auto">
-        <table className="w-full border-collapse text-[11px] font-mono">
+        <table className="data-table">
           <thead>
             <tr>
               {['Order ID', 'Correlation ID', 'Time', 'Instrument', 'Type', 'Side', 'Qty', 'Price', 'Filled', 'Avg Price', 'Leg Type', 'AASM State', 'Sidekiq JID', 'Latency'].map(h => (

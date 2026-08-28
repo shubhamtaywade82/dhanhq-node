@@ -143,7 +143,7 @@ export function MarginRisk() {
 
       <Card className="p-4">
         <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest mb-3 font-semibold">Circuit Breaker & Risk Governance Rules</div>
-        <table className="w-full border-collapse text-[11px] font-mono">
+        <table className="data-table">
           <thead>
             <tr>
               {['Circuit Breaker Rule', 'Threshold', 'Current Measured', 'Gate State', 'Automated Action on Trigger'].map(h => (

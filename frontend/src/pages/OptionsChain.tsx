@@ -73,7 +73,7 @@ export function OptionsChain() {
       </div>
 
       <Card className="overflow-x-auto">
-        <table className="w-full border-collapse text-[11px] font-mono">
+        <table className="data-table">
           <thead>
             <tr>
               <th className="text-right px-2.5 py-2 text-accent font-medium border-b border-border text-[9.5px]">OI (CE)</th>

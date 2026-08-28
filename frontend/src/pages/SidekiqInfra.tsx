@@ -34,7 +34,7 @@ export function SidekiqInfra() {
       <Card className="p-4 space-y-2.5">
         <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Active Sidekiq Workers</div>
         <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-[11px] font-mono">
+          <table className="data-table">
             <thead>
               <tr>
                 {['JID', 'Worker Class', 'Queue', 'Started', 'Arguments Payload', 'Elapsed'].map(h => (
@@ -61,7 +61,7 @@ export function SidekiqInfra() {
       <Card className="p-4 space-y-2.5">
         <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Sidekiq Retry Set</div>
         <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-[11px] font-mono">
+          <table className="data-table">
             <thead>
               <tr>
                 {['JID', 'Worker Class', 'Queue', 'Exception Error', 'Retries', 'Next Execution'].map(h => (

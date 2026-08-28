@@ -69,7 +69,7 @@ export function Positions() {
       </div>
 
       <Card className="overflow-x-auto">
-        <table className="w-full border-collapse text-[11px] font-mono">
+        <table className="data-table">
           <thead>
             <tr>
               {['Strategy', 'Instrument', 'Side', 'Qty', 'Buy Avg', 'Sell Avg', 'LTP', 'Unrealized P&L', 'Delta', 'Theta', 'Product', 'Actions'].map(h => (

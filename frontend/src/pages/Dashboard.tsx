@@ -84,7 +84,7 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
             <button className="text-[10px] font-mono text-accent hover:underline" onClick={() => onNavigate('orders')}>Full Order Book →</button>
           </div>
           <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-[11px] font-mono">
+            <table className="data-table">
               <thead>
                 <tr>
                   {['Time', 'Instrument', 'Side', 'Qty', 'Price', 'Strategy / Corr ID', 'Status'].map((h) => (
