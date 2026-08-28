@@ -1,4 +1,5 @@
 import { DhanClient, OrderTracker, PositionMonitor, Pipeline, createSkillRegistry } from "@nemesis-oss/dhanhq-sdk";
+import { OllamaClient } from "@nemesis-oss/ollama-sdk";
 import Redis from "ioredis";
 import { redisPublisher } from "./auth";
 import { PaperExecutionEngine } from "./engines/paper";
@@ -7,12 +8,42 @@ import { LiveExecutionEngine } from "./engines/live";
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379/0";
 const intentSubscriber = new Redis(redisUrl);
 
+async function publishIntentAnalysis(client: OllamaClient, intent: any): Promise<void> {
+  const content = await client.chatText({
+    model: process.env.OLLAMA_MODEL || "llama3.2",
+    messages: [
+      {
+        role: "system",
+        content: "You are a trading risk analyst. Summarize the intent, identify obvious risk concerns, and never recommend bypassing deterministic risk checks. Keep the response under 120 words."
+      },
+      { role: "user", content: JSON.stringify(intent) }
+    ],
+    options: { temperature: 0.1 }
+  });
+
+  await redisPublisher.publish("dhan:execution:ai_analysis", JSON.stringify({
+    intent_id: intent.intent_id,
+    correlation_id: intent.correlation_id,
+    model: process.env.OLLAMA_MODEL || "llama3.2",
+    analysis: content,
+    analyzed_at: new Date().toISOString()
+  }));
+}
+
 export async function startExecutor(client: DhanClient): Promise<void> {
   const tracker = new OrderTracker();
   const monitor = new PositionMonitor();
   const skills = createSkillRegistry();
 
   const isLive = process.env.TRADING_MODE === "live";
+  const ollama = process.env.OLLAMA_ENABLED === "true"
+    ? new OllamaClient({
+      baseUrl: process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434",
+      apiKey: process.env.OLLAMA_API_KEY,
+      timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS) || 10000,
+      retries: 1
+    })
+    : null;
   const paperEngine = new PaperExecutionEngine(client, monitor);
   const liveEngine = new LiveExecutionEngine(client, tracker, monitor);
 
@@ -46,6 +77,12 @@ export async function startExecutor(client: DhanClient): Promise<void> {
     try {
       const intent = JSON.parse(message);
       console.log(`[Sidecar Executor] Processing intent ${intent.intent_id} (${intent.strategy})`);
+
+      if (ollama) {
+        void publishIntentAnalysis(ollama, intent).catch((error) => {
+          console.warn("[Sidecar Executor] Ollama analysis unavailable:", error);
+        });
+      }
 
       // Pre-trade risk pipeline check
       const pipeline = new Pipeline({
