@@ -34,16 +34,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const refreshPortfolio = useCallback(async () => {
     try {
-      const [positions, orders, funds] = await Promise.all([
+      const [positions, orders, funds, strategies] = await Promise.all([
         api.positions().catch(() => []),
         api.orders().catch(() => []),
         api.funds().catch(() => ({})),
+        api.strategies().catch(() => []),
       ]);
       setState((prev) => ({
         ...prev,
         positions: Array.isArray(positions) ? positions : prev.positions,
         orders: Array.isArray(orders) ? orders : prev.orders,
         funds: typeof funds === 'object' && funds !== null ? { ...prev.funds, ...funds } : prev.funds,
+        strategies: Array.isArray(strategies) ? strategies : prev.strategies,
       }));
     } catch {
       // Ignore background sync errors

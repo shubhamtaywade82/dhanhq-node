@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -20,11 +20,11 @@ function GaugeRing({ value, max, color, label, sub }: { value: number; max: numb
           <circle cx="60" cy="60" r="50" fill="none" stroke="#1c283f" strokeWidth="7" />
           <circle cx="60" cy="60" r="50" fill="none" stroke={color} strokeWidth="7" strokeDasharray="314" strokeDashoffset={dashoffset} strokeLinecap="round" className="gauge-ring" />
           <text x="60" y="56" textAnchor="middle" fill="white" fontFamily="JetBrains Mono" fontSize="13" fontWeight="700">{sub}</text>
-          <text x="60" y="72" textAnchor="middle" fill="#64748b" fontFamily="JetBrains Mono" fontSize="9">{label.includes('Loss') ? 'of 50K' : label.includes('Margin') ? 'of Wallet' : label.includes('Single') ? 'of 2,00,000' : `IVR ${sub}`}</text>
+          <text x="60" y="72" textAnchor="middle" fill="#64748b" fontFamily="JetBrains Mono" fontSize="9">{label.includes('Loss') ? 'of 50K' : label.includes('Margin') ? 'of Wallet' : label.includes('Single') ? 'of 2,00,000' : 'Live State'}</text>
         </svg>
       </div>
       <div className="text-center text-[10px] font-mono text-accent mt-1">
-        {label.includes('Loss') ? 'Normal Operating Zone' : label.includes('Margin') ? 'Warning threshold: 70%' : label.includes('Single') ? 'Well within limits' : 'Straddles & Spreads OK'}
+        {label.includes('Loss') ? 'Normal Operating Zone' : label.includes('Margin') ? 'Warning threshold: 70%' : 'Active Account Risk'}
       </div>
     </Card>
   );
@@ -33,6 +33,7 @@ function GaugeRing({ value, max, color, label, sub }: { value: number; max: numb
 export function MarginRisk() {
   const { state, showToast, addSystemLog, refreshPortfolio } = useApp();
   const [activeTab, setActiveTab] = useState('single');
+  const [calcResult, setCalcResult] = useState<{ totalMargin: number; spanMargin: number; exposureMargin: number } | null>(null);
 
   const avail = Number(state.funds.availableMargin || 1000000);
   const used = Number(state.funds.usedMargin || 0);
@@ -51,11 +52,26 @@ export function MarginRisk() {
     }
   };
 
-  const tabs = [
-    { id: 'single', label: 'Single Order Margin' },
-    { id: 'multi', label: 'Multi-Leg Basket Margin & Hedge' },
-    { id: 'pnlexit', label: 'Dhan P&L Exit & Kill Switch' },
-    { id: 'ratelimit', label: 'Dhan API Rate Limit Monitor' },
+  const handleCalculateSingle = useCallback(async () => {
+    const sym = (document.getElementById('mmSym') as HTMLInputElement)?.value || 'NIFTY24JAN24500CE';
+    const tx = (document.getElementById('mmTx') as HTMLSelectElement)?.value || 'SELL';
+    const qty = Number((document.getElementById('mmQty') as HTMLInputElement)?.value || 50);
+    const px = Number((document.getElementById('mmPx') as HTMLInputElement)?.value || 195);
+    try {
+      const res = await api.calculateMargin([{ symbol: sym, transactionType: tx, quantity: qty, price: px }]);
+      setCalcResult(res);
+      showToast(`Margin calculated: ₹${res.totalMargin}`, 'success');
+    } catch (e: any) {
+      showToast(`Calculation failed: ${e.message}`, 'error');
+    }
+  }, [showToast]);
+
+  const rejectedOrders = state.orders.filter((o) => o.status === 'REJECTED').length;
+  const circuitBreakers = [
+    { rule: 'Daily Loss Limit', threshold: '₹50,000', current: fmtINR(realized), state: realized < -50000 ? 'TRIPPED' : realized < -35000 ? 'WARN' : 'OK', action: 'Close all positions, trigger Dhan P&L exit' },
+    { rule: 'Margin Utilization', threshold: '70%', current: `${fmt(utilPct)}%`, state: utilPct > 80 ? 'TRIPPED' : utilPct > 70 ? 'WARN' : 'OK', action: 'Block new position opens' },
+    { rule: 'Open Position Count', threshold: '10 active', current: `${state.positions.length} active`, state: state.positions.length > 8 ? 'WARN' : 'OK', action: 'Limit concurrency' },
+    { rule: 'Order Rejections', threshold: '< 10%', current: `${rejectedOrders}/${state.orders.length || 1}`, state: rejectedOrders > 2 ? 'WARN' : 'OK', action: 'Throttle orders' },
   ];
 
   return (
@@ -79,14 +95,14 @@ export function MarginRisk() {
 
       <Card className="p-4">
         <div className="flex items-center gap-2 border-b border-border pb-2.5 mb-4">
-          {tabs.map((t) => (
+          {['single', 'pnlexit'].map((t) => (
             <button
-              key={t.id}
-              onClick={() => setActiveTab(t.id)}
+              key={t}
+              onClick={() => setActiveTab(t)}
               className={`px-3 py-[5px] cursor-pointer rounded text-[11px] font-semibold uppercase tracking-[0.3px] transition-all
-                ${activeTab === t.id ? 'text-accent bg-accent/8' : 'text-muted hover:text-white hover:bg-surface-200'}`}
+                ${activeTab === t ? 'text-accent bg-accent/8' : 'text-muted hover:text-white hover:bg-surface-200'}`}
             >
-              {t.label}
+              {t === 'single' ? 'DhanHQ Margin Calculator' : 'Dhan P&L Exit Rules'}
             </button>
           ))}
         </div>
@@ -96,59 +112,41 @@ export function MarginRisk() {
             <div className="space-y-3">
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="text-[9px] font-mono text-muted uppercase block mb-1">exchangeSegment</label>
-                  <Select className="w-full"><option>NSE_FNO</option><option>NSE_EQ</option></Select>
+                  <label className="text-[9px] font-mono text-muted uppercase block mb-1">symbol</label>
+                  <Input id="mmSym" defaultValue="NIFTY24JAN24500CE" />
                 </div>
                 <div>
                   <label className="text-[9px] font-mono text-muted uppercase block mb-1">transactionType</label>
-                  <Select className="w-full"><option>SELL</option><option>BUY</option></Select>
+                  <Select id="mmTx" className="w-full"><option value="SELL">SELL</option><option value="BUY">BUY</option></Select>
                 </div>
               </div>
-              <div className="grid grid-cols-3 gap-3">
-                <div>
-                  <label className="text-[9px] font-mono text-muted uppercase block mb-1">securityId</label>
-                  <Input defaultValue="49081" />
-                </div>
+              <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="text-[9px] font-mono text-muted uppercase block mb-1">quantity</label>
-                  <Input type="number" defaultValue="50" />
+                  <Input id="mmQty" type="number" defaultValue="50" />
                 </div>
                 <div>
-                  <label className="text-[9px] font-mono text-muted uppercase block mb-1">productType</label>
-                  <Select className="w-full"><option>MARGIN</option><option>INTRADAY</option></Select>
+                  <label className="text-[9px] font-mono text-muted uppercase block mb-1">price</label>
+                  <Input id="mmPx" type="number" defaultValue="195" />
                 </div>
               </div>
-              <div>
-                <label className="text-[9px] font-mono text-muted uppercase block mb-1">price (optional)</label>
-                <Input type="number" defaultValue="198.2" />
-              </div>
-              <Button onClick={() => showToast('Margin calculated: 1,15,400 INR', 'success')}>Calculate Single Margin</Button>
+              <Button onClick={handleCalculateSingle}>Calculate Live Margin</Button>
             </div>
             <div className="bg-surface-50 p-4 rounded-lg border border-border">
-              <div className="text-xs font-semibold text-white mb-3">Response — 200 OK (Simulated Dhan API)</div>
+              <div className="text-xs font-semibold text-white mb-3">Response — DhanHQ MultiScrip Margin</div>
               <div className="space-y-2 font-mono text-xs">
-                <div className="flex justify-between"><span className="text-muted">totalMargin</span><span className="text-gold font-bold">1,15,400</span></div>
-                <div className="flex justify-between"><span className="text-muted">spanMargin</span><span className="text-white">85,200</span></div>
-                <div className="flex justify-between"><span className="text-muted">exposureMargin</span><span className="text-white">30,200</span></div>
-                <div className="flex justify-between"><span className="text-muted">availableBalance</span><span className="text-accent">5,00,248</span></div>
-                <div className="flex justify-between"><span className="text-muted">insufficientBalance</span><span className="text-accent">0.00</span></div>
+                <div className="flex justify-between"><span className="text-muted">Total Margin</span><span className="text-gold font-bold">{calcResult ? fmtINR(calcResult.totalMargin) : '₹0.00'}</span></div>
+                <div className="flex justify-between"><span className="text-muted">SPAN Margin</span><span className="text-white">{calcResult ? fmtINR(calcResult.spanMargin) : '₹0.00'}</span></div>
+                <div className="flex justify-between"><span className="text-muted">Exposure Margin</span><span className="text-white">{calcResult ? fmtINR(calcResult.exposureMargin) : '₹0.00'}</span></div>
+                <div className="flex justify-between"><span className="text-muted">Available Balance</span><span className="text-accent">{fmtINR(avail)}</span></div>
               </div>
-              <div className="mt-3 p-2 bg-bg rounded text-[9px] font-mono text-muted">POST /v2/margincalculator</div>
             </div>
-          </div>
-        )}
-
-        {activeTab === 'multi' && (
-          <div className="space-y-3">
-            <div className="text-xs font-semibold text-white">Multi-Order Basket Margin (POST /v2/margincalculator/multi)</div>
-            <div className="text-xs text-muted">Hedge margin calculation with {state.mmRows.length} legs configured</div>
-            <Button onClick={() => showToast('Combined hedged margin: 1,11,408 INR', 'success')}>Calculate Combined Hedge Margin</Button>
           </div>
         )}
 
         {activeTab === 'pnlexit' && (
           <div className="space-y-3">
-            <div className="text-xs font-semibold text-white mb-2">Configure Automated Dhan Broker P&L Exit</div>
+            <div className="text-xs font-semibold text-white mb-2">Automated Risk Protection Limits</div>
             <div className="grid grid-cols-2 gap-4 max-w-lg">
               <div>
                 <label className="text-[9px] font-mono text-muted uppercase block mb-1">Profit Target (INR)</label>
@@ -159,30 +157,23 @@ export function MarginRisk() {
                 <Input type="number" defaultValue={25000} />
               </div>
             </div>
-            <Button onClick={() => { showToast('P&L exit rules saved', 'success'); addSystemLog('INFO', 'POST /v2/pnlExit — Profit: 50K, Loss: 25K', 'dhan'); }}>Save P&L Exit Rule</Button>
-          </div>
-        )}
-
-        {activeTab === 'ratelimit' && (
-          <div className="space-y-3">
-            <div className="text-xs font-semibold text-white">Dhan API Rate Limit Live Monitor (Rolling 60s)</div>
-            <div className="text-xs text-muted py-8 text-center">Rate limit chart renders with live tick data</div>
+            <Button onClick={() => { showToast('P&L exit rules saved', 'success'); addSystemLog('INFO', 'Dhan Risk Exit Limits updated: Target 50K, Loss 25K', 'risk_engine'); }}>Save Risk Rules</Button>
           </div>
         )}
       </Card>
 
       <Card className="p-4">
-        <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest mb-3 font-semibold">Circuit Breaker & Risk Governance Rules</div>
+        <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest mb-3 font-semibold">Live Circuit Breakers & Risk Governance Rules</div>
         <table className="data-table">
           <thead>
             <tr>
-              {['Circuit Breaker Rule', 'Threshold', 'Current Measured', 'Gate State', 'Automated Action on Trigger'].map(h => (
+              {['Circuit Breaker Rule', 'Threshold', 'Current Measured', 'Gate State', 'Automated Action on Trigger'].map((h) => (
                 <th key={h} className="text-left px-2.5 py-2 text-muted font-medium border-b border-border text-[9.5px] uppercase tracking-[0.5px]">{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {state.circuitBreakers.map((cb, i) => (
+            {circuitBreakers.map((cb, i) => (
               <tr key={i} className="hover:bg-surface-200/50">
                 <td className="px-2.5 py-[7px] border-b border-border/60 text-white font-medium">{cb.rule}</td>
                 <td className="px-2.5 py-[7px] border-b border-border/60 text-muted font-mono">{cb.threshold}</td>

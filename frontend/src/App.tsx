@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { AppProvider, useApp } from "./store/AppContext";
 import { Header } from "./components/layout/Header";
 import { Sidebar } from "./components/layout/Sidebar";
@@ -40,11 +40,20 @@ const PAGE_TITLES: Record<string, [string, string]> = {
 };
 
 function AppInner() {
-  const { setState, openModal, closeModal, showToast, addSystemLog } = useApp();
-  const [page, setPage] = useState("dashboard");
+  const { setState, openModal, closeModal, showToast, addSystemLog, refreshPortfolio } = useApp();
+  const [page, setPage] = useState(() => location.hash.replace('#', '') || 'dashboard');
   useSimulation();
 
-  const handleNavigate = useCallback((id: string) => setPage(id), []);
+  useEffect(() => {
+    const onHash = () => setPage(location.hash.replace('#', '') || 'dashboard');
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const handleNavigate = useCallback((id: string) => {
+    location.hash = id;
+    setPage(id);
+  }, []);
 
   const handleKillSwitch = useCallback(() => {
     openModal(
@@ -129,6 +138,7 @@ function AppInner() {
                 setState,
                 addSystemLog,
                 showToast,
+                refreshPortfolio,
               )
             }
           />
@@ -143,6 +153,7 @@ function AppInner() {
                 setState,
                 addSystemLog,
                 showToast,
+                refreshPortfolio,
               )
             }
           />

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Select } from '../components/ui/Select';
@@ -6,16 +6,17 @@ import { Badge } from '../components/ui/Badge';
 import { fmt, fmtINR, pnlClass } from '../utils/formatters';
 import { api } from '../services/api';
 import { useApp } from '../store/AppContext';
-import { Zap, ShieldAlert, TrendingUp, Clock, RefreshCw } from 'lucide-react';
+import { Zap, TrendingUp, Clock, RefreshCw, Activity, Target, Play, Pause, RotateCcw, FastForward } from 'lucide-react';
+
+type BuyingMode = 'STRADDLE' | 'CALL' | 'PUT';
 
 export function OptionsAnalysis() {
   const { showToast } = useApp();
-  const [symbol, setSymbol] = useState('NIFTY');
-  const [days, setDays] = useState(5);
-  const [interval, setIntervalVal] = useState('1');
-  const [loading, setLoading] = useState(false);
-  const [data, setData] = useState<any>(null);
-  const [selectedDayIndex, setSelectedDayIndex] = useState(0);
+  const [symbol, setSymbol] = useState('NIFTY'), [days, setDays] = useState(5), [interval, setIntervalVal] = useState('1');
+  const [buyingMode, setBuyingMode] = useState<BuyingMode>('STRADDLE'), [loading, setLoading] = useState(false);
+  const [data, setData] = useState<any>(null), [selectedDayIndex, setSelectedDayIndex] = useState(0);
+  const [entryType, setEntryType] = useState<'OPEN_915' | 'ORB_930'>('OPEN_915');
+  const [targetPct, setTargetPct] = useState(20), [slPct, setSlPct] = useState(15), [timeExit, setTimeExit] = useState('13:30');
 
   const runAnalysis = useCallback(async () => {
     setLoading(true);
@@ -31,122 +32,107 @@ export function OptionsAnalysis() {
     }
   }, [symbol, days, interval, showToast]);
 
-  useEffect(() => {
-    runAnalysis();
-  }, [runAnalysis]);
-
-  const summary = data?.summary || {};
+  useEffect(() => { runAnalysis(); }, [runAnalysis]);
   const activeDay = data?.days?.[selectedDayIndex] || data?.days?.[0];
 
+  const simResult = useMemo(() => {
+    return simulateDayStrategy(activeDay, buyingMode, { entryType, targetPct, slPct, timeExit });
+  }, [activeDay, buyingMode, entryType, targetPct, slPct, timeExit]);
+
+  const multiDayStats = useMemo(() => {
+    if (!data?.days?.length) return null;
+    const res = data.days.map((d: any) => simulateDayStrategy(d, buyingMode, { entryType, targetPct, slPct, timeExit }));
+    const wins = res.filter((r: any) => r.pnl > 0).length, totalPnl = res.reduce((s: number, r: any) => s + r.pnl, 0);
+    return { wins, total: res.length, winRate: Number(((wins / res.length) * 100).toFixed(1)), totalPnl: Number(totalPnl.toFixed(2)), avgPnl: Number((totalPnl / res.length).toFixed(2)) };
+  }, [data, buyingMode, entryType, targetPct, slPct, timeExit]);
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-3.5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">Underlying vs Options Behavior</div>
-          <div className="text-xs text-muted mt-0.5">DhanHQ 1m Granular OHLCV & Rolling ATM Options Dynamics</div>
+          <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold flex items-center gap-1.5">
+            <Activity size={14} className="text-accent" /> DhanHQ 1m Granular Options Buying Terminal
+          </div>
+          <div className="text-[11px] text-muted mt-0.5">09:15-15:30 Replay, High/Low Tracking & Dynamic TP/SL Engine</div>
         </div>
         <div className="flex items-center gap-2">
           <Select value={symbol} onChange={(e) => setSymbol(e.target.value)} className="text-xs">
-            <option value="NIFTY">NIFTY 50 (13)</option>
-            <option value="BANKNIFTY">BANK NIFTY (25)</option>
-            <option value="FINNIFTY">FIN NIFTY (27)</option>
+            <option value="NIFTY">NIFTY 50 (13)</option><option value="BANKNIFTY">BANK NIFTY (25)</option><option value="FINNIFTY">FIN NIFTY (27)</option>
           </Select>
           <Select value={days} onChange={(e) => setDays(Number(e.target.value))} className="text-xs">
-            <option value={3}>Last 3 Days</option>
-            <option value={5}>Last 5 Days</option>
-            <option value={10}>Last 10 Days</option>
+            <option value={3}>Last 3 Days</option><option value={5}>Last 5 Days</option><option value={10}>Last 10 Days</option>
           </Select>
           <Select value={interval} onChange={(e) => setIntervalVal(e.target.value)} className="text-xs">
-            <option value="1">1m Granular</option>
-            <option value="5">5m Candle</option>
-            <option value="15">15m Candle</option>
+            <option value="1">1m Granular</option><option value="5">5m Candle</option><option value="15">15m Candle</option>
           </Select>
           <Button onClick={runAnalysis} disabled={loading}>
-            <RefreshCw size={12} className={`mr-1 ${loading ? 'animate-spin' : ''}`} />
-            {loading ? 'Analyzing...' : 'Run Analysis'}
+            <RefreshCw size={12} className={`mr-1 ${loading ? 'animate-spin' : ''}`} />{loading ? 'Analyzing...' : 'Run Analysis'}
           </Button>
         </div>
       </div>
 
-      <MetricsRow summary={summary} symbol={symbol} />
-
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-        <DaySelectorCard days={data?.days || []} selectedIndex={selectedDayIndex} onSelect={setSelectedDayIndex} />
-        <div className="lg:col-span-3">
-          <StrikeTableCard day={activeDay} symbol={symbol} />
+      <StrategyConfigBar
+        mode={buyingMode} onModeChange={setBuyingMode} entryType={entryType} onEntryChange={setEntryType}
+        targetPct={targetPct} onTargetChange={setTargetPct} slPct={slPct} onSlChange={setSlPct}
+        timeExit={timeExit} onTimeExitChange={setTimeExit} multiStats={multiDayStats} symbol={symbol}
+      />
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-3.5">
+        <DaySelectorCard days={data?.days || []} selectedIndex={selectedDayIndex} onSelect={setSelectedDayIndex} mode={buyingMode} />
+        <div className="lg:col-span-3 space-y-3.5">
+          <IntradayReplayCard day={activeDay} mode={buyingMode} sim={simResult} />
+          <StrikeTableCard day={activeDay} mode={buyingMode} onModeChange={setBuyingMode} />
         </div>
       </div>
-
-      <StrategyInsightsGrid breakEvenPts={summary.breakEvenMovePts || 110} />
+      <StrategyInsightsGrid breakEvenPts={data?.summary?.breakEvenMovePts || 110} />
     </div>
   );
 }
 
-function MetricsRow({ summary, symbol }: { summary: any; symbol: string }) {
-  const winRate = summary.winRate ?? 0;
-  const avgPnl = summary.avgNetPnl ?? 0;
+function StrategyConfigBar({ mode, onModeChange, entryType, onEntryChange, targetPct, onTargetChange, slPct, onSlChange, timeExit, onTimeExitChange, multiStats, symbol }: any) {
   const lotSize = symbol === 'BANKNIFTY' ? 15 : 25;
-
   return (
-    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-      <Card className="p-3.5">
-        <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">Straddle Win Rate</div>
-        <div className={`text-xl font-bold font-mono ${winRate >= 50 ? 'text-accent' : 'text-danger'}`}>{winRate}%</div>
-        <div className="text-[10px] font-mono text-muted mt-1">{summary.winDays ?? 0} Win / {(summary.totalDays ?? 0) - (summary.winDays ?? 0)} Loss</div>
-      </Card>
-      <Card className="p-3.5">
-        <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">Avg ATM Net P&L</div>
-        <div className={`text-xl font-bold font-mono ${pnlClass(avgPnl)}`}>{avgPnl >= 0 ? `+${fmt(avgPnl)}` : fmt(avgPnl)} pts</div>
-        <div className="text-[10px] font-mono text-muted mt-1">{fmtINR(avgPnl * lotSize)} / lot</div>
-      </Card>
-      <Card className="p-3.5">
-        <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">Best ROI Strike</div>
-        <div className="text-xl font-bold font-mono text-sky">{summary.bestStrike || 'ATM'}</div>
-        <div className="text-[10px] font-mono text-accent mt-1">Avg ROI: +{summary.avgBestStrikeRoi || 0}%</div>
-      </Card>
-      <Card className="p-3.5">
-        <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">Break-Even Move</div>
-        <div className="text-xl font-bold font-mono text-gold">~{summary.breakEvenMovePts || 110} pts</div>
-        <div className="text-[10px] font-mono text-muted mt-1">Min spot displacement</div>
-      </Card>
-      <Card className="p-3.5">
-        <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">Market Regimes</div>
-        <div className="text-sm font-bold font-mono text-white mt-1">
-          <span className="text-accent">{summary.gammaBlastCount || 0} Blast</span> · <span className="text-danger">{summary.thetaTrapCount || 0} Trap</span>
+    <Card className="p-3 bg-surface-50 border border-border/80 space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-1.5">
+        <div className="flex items-center gap-1.5 bg-surface-200 p-0.5 rounded border border-border">
+          {(['STRADDLE', 'CALL', 'PUT'] as BuyingMode[]).map((m) => (
+            <button key={m} onClick={() => onModeChange(m)} className={`px-2.5 py-0.5 rounded text-[9.5px] font-mono font-semibold transition-all ${mode === m ? 'bg-accent/20 text-accent border border-accent/40' : 'text-muted hover:text-white'}`}>
+              {m === 'STRADDLE' ? '⚡ ATM Straddle (CE+PE)' : m === 'CALL' ? '📈 Naked CE Buying' : '📉 Naked PE Buying'}
+            </button>
+          ))}
         </div>
-        <div className="text-[10px] font-mono text-muted mt-1">Dynamic ATM tracked</div>
-      </Card>
-    </div>
+        {multiStats && (
+          <div className="text-[9.5px] font-mono text-muted flex items-center gap-2">
+            <span>Win Rate: <strong className={multiStats.winRate >= 50 ? 'text-accent' : 'text-danger'}>{multiStats.winRate}%</strong> ({multiStats.wins}/{multiStats.total})</span>
+            <span>Net P&L: <strong className={pnlClass(multiStats.totalPnl)}>{multiStats.totalPnl >= 0 ? '+' : ''}{multiStats.totalPnl} pts</strong> ({fmtINR(multiStats.totalPnl * lotSize)})</span>
+          </div>
+        )}
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+        <div><label className="text-[8.5px] text-muted uppercase block mb-0.5 font-semibold">1. Entry Trigger</label><Select value={entryType} onChange={(e) => onEntryChange(e.target.value as any)} className="text-xs w-full"><option value="OPEN_915">09:15 Open Entry</option><option value="ORB_930">09:30 ORB Breakout</option></Select></div>
+        <div><label className="text-[8.5px] text-accent uppercase block mb-0.5 font-semibold">2. Target Profit</label><Select value={targetPct} onChange={(e) => onTargetChange(Number(e.target.value))} className="text-xs w-full"><option value={0}>None (Hold)</option><option value={15}>+15% Target</option><option value={20}>+20% Target</option><option value={30}>+30% Target</option><option value={50}>+50% Target</option></Select></div>
+        <div><label className="text-[8.5px] text-danger uppercase block mb-0.5 font-semibold">3. Stop Loss</label><Select value={slPct} onChange={(e) => onSlChange(Number(e.target.value))} className="text-xs w-full"><option value={0}>None</option><option value={10}>-10% SL</option><option value={15}>-15% SL</option><option value={20}>-20% SL</option><option value={30}>-30% SL</option></Select></div>
+        <div><label className="text-[8.5px] text-gold uppercase block mb-0.5 font-semibold">4. Time Exit</label><Select value={timeExit} onChange={(e) => onTimeExitChange(e.target.value)} className="text-xs w-full"><option value="13:30">1:30 PM</option><option value="15:15">3:15 PM</option><option value="15:30">3:30 PM</option></Select></div>
+      </div>
+    </Card>
   );
 }
 
-function DaySelectorCard({ days, selectedIndex, onSelect }: { days: any[]; selectedIndex: number; onSelect: (idx: number) => void }) {
+function DaySelectorCard({ days, selectedIndex, onSelect, mode }: { days: any[]; selectedIndex: number; onSelect: (idx: number) => void; mode: BuyingMode }) {
   return (
     <Card className="p-3">
       <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest mb-2 font-semibold">Trading Days</div>
       <div className="space-y-1.5">
         {days.map((d, i) => {
-          const isSelected = i === selectedIndex;
-          const isBlast = d.regime === 'GAMMA_BLAST';
-          const isTrap = d.regime === 'THETA_TRAP';
+          const isSelected = i === selectedIndex, isBlast = d.regime === 'GAMMA_BLAST', isTrap = d.regime === 'THETA_TRAP';
+          const atm = d.strikes?.find((s: any) => s.label === 'ATM') || d.strikes?.[0] || {};
+          const pnl = mode === 'STRADDLE' ? d.atmStraddlePnl : (mode === 'CALL' ? (atm.call?.pnl ?? 0) : (atm.put?.pnl ?? 0));
           return (
-            <div
-              key={d.date}
-              onClick={() => onSelect(i)}
-              className={`p-2.5 rounded-lg cursor-pointer transition-all border ${
-                isSelected ? 'bg-accent/10 border-accent/40' : 'bg-surface-50 border-border hover:bg-surface-200/50'
-              }`}
-            >
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-xs font-semibold text-white">{d.date} <span className="text-muted font-normal text-[10px]">({d.dayOfWeek})</span></span>
-                <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-semibold ${isBlast ? 'bg-accent/20 text-accent' : isTrap ? 'bg-danger/20 text-danger' : 'bg-gold/20 text-gold'}`}>
-                  {isBlast ? '🚀 BLAST' : isTrap ? '⏳ THETA' : '⚖️ RANGE'}
-                </span>
+            <div key={d.date} onClick={() => onSelect(i)} className={`p-2 rounded-lg cursor-pointer transition-all border ${isSelected ? 'bg-accent/10 border-accent/40' : 'bg-surface-50 border-border hover:bg-surface-200/50'}`}>
+              <div className="flex items-center justify-between mb-0.5">
+                <span className="text-xs font-semibold text-white">{d.date} <span className="text-muted font-normal text-[9.5px]">({d.dayOfWeek})</span></span>
+                <span className={`text-[8.5px] font-mono px-1 py-0.2 rounded font-semibold ${isBlast ? 'bg-accent/20 text-accent' : isTrap ? 'bg-danger/20 text-danger' : 'bg-gold/20 text-gold'}`}>{isBlast ? '🚀 BLAST' : isTrap ? '⏳ THETA' : '⚖️ RANGE'}</span>
               </div>
-              <div className="flex items-center justify-between text-[10px] font-mono">
-                <span className="text-muted">Spot: {fmt(d.spot.change)} pts</span>
-                <span className={pnlClass(d.atmStraddlePnl)}>{d.atmStraddlePnl >= 0 ? `+${fmt(d.atmStraddlePnl)}` : fmt(d.atmStraddlePnl)} pts</span>
-              </div>
+              <div className="flex items-center justify-between text-[9.5px] font-mono"><span className="text-muted">Spot: {fmt(d.spot?.change || 0)} pts</span><span className={pnlClass(pnl)}>{pnl >= 0 ? `+${fmt(pnl)}` : fmt(pnl)} pts</span></div>
             </div>
           );
         })}
@@ -155,56 +141,131 @@ function DaySelectorCard({ days, selectedIndex, onSelect }: { days: any[]; selec
   );
 }
 
-function StrikeTableCard({ day }: { day: any; symbol: string }) {
-  if (!day) return <Card className="p-6 text-center text-muted text-xs">Select a day to view strike breakdown.</Card>;
-  const spot = day.spot || {};
+function IntradayReplayCard({ day, mode, sim }: { day: any; mode: BuyingMode; sim: any }) {
+  const [replayIdx, setReplayIdx] = useState(0), [isPlaying, setIsPlaying] = useState(false), [speed, setSpeed] = useState(3);
+  const timerRef = useRef<any>(null), timeline = day?.timeline || [], maxIdx = Math.max(0, timeline.length - 1);
+  const curPoint = timeline[Math.min(replayIdx, maxIdx)] || {}, atm = day?.strikes?.find((s: any) => s.label === 'ATM') || day?.strikes?.[0] || {};
+  const baseSpot = day?.spot?.open || curPoint.spot || 1, spotDelta = Number(((curPoint.spot || baseSpot) - baseSpot).toFixed(1));
+  const curPrem = mode === 'CALL' ? (curPoint.ce || atm.call?.open || 1) : (mode === 'PUT' ? (curPoint.pe || atm.put?.open || 1) : (curPoint.straddle || (atm.call?.open + atm.put?.open) || 1));
+  const entryPrice = sim?.entryPrice || 1, livePnl = Number((curPrem - entryPrice).toFixed(2)), liveRoi = Number(((livePnl / entryPrice) * 100).toFixed(1));
+
+  useEffect(() => { setReplayIdx(maxIdx); setIsPlaying(false); }, [day, maxIdx]);
+  useEffect(() => {
+    if (isPlaying) {
+      timerRef.current = setInterval(() => { setReplayIdx((p) => { if (p >= maxIdx) { setIsPlaying(false); return maxIdx; } return p + 1; }); }, Math.max(150, 800 / speed));
+    } else clearInterval(timerRef.current);
+    return () => clearInterval(timerRef.current);
+  }, [isPlaying, speed, maxIdx]);
 
   return (
-    <Card className="p-4 overflow-x-auto space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
-        <div>
-          <span className="text-sm font-bold text-white mr-2">{day.date} ({day.dayOfWeek})</span>
-          <span className="text-xs font-mono text-muted">
-            Spot Open: <strong className="text-white">{fmt(spot.open)}</strong> → Close: <strong className="text-white">{fmt(spot.close)}</strong> | Move: <strong className={spot.change >= 0 ? 'text-accent' : 'text-danger'}>{spot.change >= 0 ? '+' : ''}{fmt(spot.change)} pts ({fmt(spot.pct)}%)</strong>
-          </span>
+    <Card className="p-3.5 bg-surface-50 border border-border/80 space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-2">
+        <div className="flex items-center gap-2">
+          <Target size={13} className="text-accent" />
+          <span className="text-xs font-bold text-white uppercase">1m Replay Player</span>
+          <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-accent/15 text-accent font-semibold">🕒 {curPoint.time || '15:30'}</span>
+          <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-bold ${sim?.status === 'TARGET_HIT' ? 'bg-accent/20 text-accent' : sim?.status === 'SL_HIT' ? 'bg-danger/20 text-danger' : 'bg-gold/20 text-gold'}`}>{sim?.reason}</span>
         </div>
-        <div className="text-xs font-mono">
-          Parallel ATM: <span className={`font-bold ${pnlClass(day.atmStraddlePnl)}`}>{day.atmStraddlePnl >= 0 ? '+' : ''}{fmt(day.atmStraddlePnl)} pts ({day.atmStraddleRoi}%)</span>
+        <div className="flex items-center gap-1 bg-surface-200 p-1 rounded border border-border/60">
+          <button onClick={() => { setIsPlaying(false); setReplayIdx(0); }} className="px-2 py-0.5 rounded text-[9px] font-mono text-muted hover:text-white flex items-center"><RotateCcw size={10} className="mr-1" />09:15</button>
+          <button onClick={() => { if (!isPlaying && replayIdx >= maxIdx) setReplayIdx(0); setIsPlaying(!isPlaying); }} className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold flex items-center ${isPlaying ? 'text-danger' : 'text-accent'}`}>{isPlaying ? <Pause size={10} className="mr-1" /> : <Play size={10} className="mr-1" />}{isPlaying ? 'Pause' : 'Replay'}</button>
+          <button onClick={() => { setIsPlaying(false); setReplayIdx(maxIdx); }} className="px-2 py-0.5 rounded text-[9px] font-mono text-muted hover:text-white flex items-center"><FastForward size={10} className="mr-1" />EOD</button>
+          {[1, 3, 5].map((s) => (<button key={s} onClick={() => setSpeed(s)} className={`px-1 py-0.5 rounded text-[8.5px] font-mono ${speed === s ? 'bg-accent text-black font-bold' : 'text-muted hover:text-white'}`}>{s}x</button>))}
         </div>
       </div>
+      <input type="range" min={0} max={maxIdx} value={replayIdx} onChange={(e) => { setIsPlaying(false); setReplayIdx(Number(e.target.value)); }} className="w-full h-1.5 bg-surface-300 rounded-lg appearance-none cursor-pointer accent-accent" />
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center font-mono">
+        <div className="bg-surface-200/80 p-1.5 rounded border border-border/50">
+          <div className="text-[8.5px] text-muted uppercase">Spot at {curPoint.time || '09:15'}</div>
+          <div className="text-xs font-bold text-white">{fmt(curPoint.spot || baseSpot)}</div>
+          <div className={`text-[8.5px] ${pnlClass(spotDelta)}`}>{spotDelta >= 0 ? `+${fmt(spotDelta)}` : fmt(spotDelta)} pts</div>
+        </div>
+        <div className="bg-surface-200/80 p-1.5 rounded border border-border/50">
+          <div className="text-[8.5px] text-accent uppercase">Entry ({sim?.entryTime})</div>
+          <div className="text-xs font-bold text-white">₹{fmt(sim?.entryPrice)}</div>
+          <div className="text-[8.5px] text-muted">Baseline</div>
+        </div>
+        <div className="bg-surface-200/80 p-1.5 rounded border border-border/50">
+          <div className="text-[8.5px] text-gold uppercase">Exit ({sim?.exitTime})</div>
+          <div className="text-xs font-bold text-white">₹{fmt(sim?.exitPrice)}</div>
+          <div className={`text-[8.5px] font-bold ${pnlClass(sim?.pnl)}`}>{sim?.pnl >= 0 ? '+' : ''}{sim?.pnl} pts ({sim?.roi}%)</div>
+        </div>
+        <div className="bg-surface-200/80 p-1.5 rounded border border-border/50">
+          <div className="text-[8.5px] text-white uppercase">Live Premium P&L</div>
+          <div className="text-xs font-bold text-white">₹{fmt(curPrem)}</div>
+          <div className={`text-[8.5px] font-bold ${pnlClass(livePnl)}`}>{livePnl >= 0 ? '+' : ''}{livePnl} pts ({liveRoi}%)</div>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[9.5px] font-mono text-center pt-1 border-t border-border/40">
+        <div className="text-muted">Peak Profit: <strong className="text-accent">+{sim?.maxProfitRoi}% (+{sim?.maxProfit} pts)</strong></div>
+        <div className="text-muted">Max Drawdown: <strong className="text-danger">{sim?.maxDrawdownRoi}% ({sim?.maxDrawdown} pts)</strong></div>
+        <div className="text-muted">ORB Range: <strong className="text-white">{fmt(sim?.orbHigh)} - {fmt(sim?.orbLow)}</strong></div>
+        <div className="text-muted">Result: <strong className={pnlClass(sim?.pnl)}>{sim?.pnl >= 0 ? 'PROFIT' : 'LOSS'}</strong></div>
+      </div>
+    </Card>
+  );
+}
 
-      <table className="data-table w-full">
-        <thead>
-          <tr>
-            {['Strike', 'Call Open', 'Call Close', 'Call P&L', 'Put Open', 'Put Close', 'Put P&L', 'Straddle Net', 'Net ROI', '1:30 PM Exit', 'Status'].map((h) => (
-              <th key={h} className="text-left px-2 py-1.5 text-muted font-medium border-b border-border text-[9px] uppercase tracking-[0.5px]">{h}</th>
-            ))}
-          </tr>
-        </thead>
+function simulateDayStrategy(day: any, mode: BuyingMode, cfg: any) {
+  if (!day) return { entryTime: '09:15', entryPrice: 0, exitTime: '15:30', exitPrice: 0, pnl: 0, roi: 0, maxProfit: 0, maxProfitRoi: 0, maxDrawdown: 0, maxDrawdownRoi: 0, orbHigh: 0, orbLow: 0, status: 'EOD', reason: 'No Data' };
+  const timeline = day.timeline || [], atm = day.strikes?.find((s: any) => s.label === 'ATM') || day.strikes?.[0] || {};
+  if (!timeline.length) return { entryTime: '09:15', entryPrice: 0, exitTime: '15:30', exitPrice: 0, pnl: 0, roi: 0, maxProfit: 0, maxProfitRoi: 0, maxDrawdown: 0, maxDrawdownRoi: 0, orbHigh: 0, orbLow: 0, status: 'EOD', reason: 'No Timeline' };
+  const orbCandles = timeline.slice(0, Math.min(15, timeline.length)), orbHigh = Math.max(...orbCandles.map((c: any) => c.spot || 0)), orbLow = Math.min(...orbCandles.map((c: any) => c.spot || Infinity));
+  let entryIdx = 0;
+  if (cfg.entryType === 'ORB_930' && timeline.length > 15) {
+    for (let i = 15; i < timeline.length; i++) {
+      if (timeline[i].spot > orbHigh || timeline[i].spot < orbLow) { entryIdx = i; break; }
+    }
+  }
+  const entryCandle = timeline[entryIdx] || timeline[0] || {};
+  const ceBase = atm.call?.open || 1, peBase = atm.put?.open || 1;
+  const entryPrice = mode === 'CALL' ? (entryCandle.ce || ceBase) : (mode === 'PUT' ? (entryCandle.pe || peBase) : (entryCandle.straddle || ceBase + peBase));
+  let exitIdx = timeline.length - 1, reason = '🔔 EOD 15:30', status = 'EOD', maxHigh = entryPrice, minLow = entryPrice;
+
+  for (let i = entryIdx; i < timeline.length; i++) {
+    const pt = timeline[i];
+    const curHigh = mode === 'CALL' ? (pt.ceHigh || pt.ce) : (mode === 'PUT' ? (pt.peHigh || pt.pe) : (pt.straddleHigh || pt.straddle));
+    const curLow = mode === 'CALL' ? (pt.ceLow || pt.ce) : (mode === 'PUT' ? (pt.peLow || pt.pe) : (pt.straddleLow || pt.straddle));
+    if (curHigh > maxHigh) maxHigh = curHigh;
+    if (curLow < minLow) minLow = curLow;
+    if (cfg.targetPct > 0 && curHigh >= entryPrice * (1 + cfg.targetPct / 100)) { exitIdx = i; reason = `🎯 Target +${cfg.targetPct}% Hit`; status = 'TARGET_HIT'; break; }
+    if (cfg.slPct > 0 && curLow <= entryPrice * (1 - cfg.slPct / 100)) { exitIdx = i; reason = `🛑 Stop Loss -${cfg.slPct}% Hit`; status = 'SL_HIT'; break; }
+    if (pt.time >= cfg.timeExit) { exitIdx = i; reason = `🕒 Time Exit ${cfg.timeExit}`; status = 'TIME_EXIT'; break; }
+  }
+  const exitCandle = timeline[exitIdx] || timeline[timeline.length - 1] || {};
+  const exitPrice = (mode === 'CALL' ? exitCandle.ce : (mode === 'PUT' ? exitCandle.pe : exitCandle.straddle)) || entryPrice;
+  const ep = entryPrice || 1, pnl = Number((exitPrice - ep).toFixed(2)), roi = Number(((pnl / ep) * 100).toFixed(1));
+  return {
+    entryTime: entryCandle.time || '09:15', entryPrice: Number(ep.toFixed(2)),
+    exitTime: exitCandle.time || '15:30', exitPrice: Number(exitPrice.toFixed(2)),
+    pnl, roi, maxProfit: Number((maxHigh - ep).toFixed(2)), maxProfitRoi: Number((((maxHigh - ep) / ep) * 100).toFixed(1)),
+    maxDrawdown: Number((minLow - ep).toFixed(2)), maxDrawdownRoi: Number((((minLow - ep) / ep) * 100).toFixed(1)),
+    orbHigh, orbLow, status, reason,
+  };
+}
+
+function StrikeTableCard({ day, mode }: { day: any; mode: BuyingMode; onModeChange?: any }) {
+  if (!day) return <Card className="p-6 text-center text-muted text-xs">Select a day to view strike breakdown.</Card>;
+  const spot = day.spot || {};
+  return (
+    <Card className="p-3.5 overflow-x-auto space-y-2">
+      <div className="text-xs font-mono text-muted border-b border-border pb-1.5"><strong className="text-white mr-1.5">{day.date} ({day.dayOfWeek})</strong> Spot: <strong className="text-white">{fmt(spot.open)}</strong> → <strong className="text-white">{fmt(spot.close)}</strong> (<strong className={spot.change >= 0 ? 'text-accent' : 'text-danger'}>{spot.change >= 0 ? '+' : ''}{fmt(spot.change)} pts</strong>)</div>
+      <table className="data-table w-full text-[9.5px] font-mono">
+        <thead><tr>{['Strike', 'Entry (09:15)', '1m Peak High', '1m Low', '1:30 PM Exit', 'EOD Close', 'Net P&L', 'ROI%', 'Status'].map((h) => (<th key={h} className="text-left px-2 py-1 text-muted border-b border-border uppercase text-[8.5px]">{h}</th>))}</tr></thead>
         <tbody>
           {(day.strikes || []).map((s: any) => {
-            const isAtm = s.strike === 'ATM';
+            const isAtm = s.label === 'ATM' || s.strike === 'ATM', leg = mode === 'CALL' ? s.call : (mode === 'PUT' ? s.put : s.straddle);
+            const open = mode === 'STRADDLE' ? leg.totalPremium : leg.open, close = mode === 'STRADDLE' ? open + leg.netPnl : leg.close;
+            const high = mode === 'STRADDLE' ? (s.straddleMaxHigh || open * 1.25) : (leg.high || open), low = mode === 'STRADDLE' ? (s.straddleMaxLow || open * 0.85) : (leg.low || open);
+            const pnl = mode === 'STRADDLE' ? leg.netPnl : leg.pnl, roi = mode === 'STRADDLE' ? leg.netRoi : leg.roi;
+            const exit130 = mode === 'STRADDLE' ? open + (leg.exit130Net || 0) : (leg.exit130 || close);
             return (
-              <tr key={s.strike} className={`hover:bg-surface-200/50 ${isAtm ? 'bg-accent/5 font-semibold' : ''}`}>
-                <td className="px-2 py-1.5 border-b border-border/60 text-white font-mono text-[10px]">{s.strike} {isAtm && '⭐'}</td>
-                <td className="px-2 py-1.5 border-b border-border/60 text-muted font-mono text-[10px]">{fmt(s.call.open)}</td>
-                <td className="px-2 py-1.5 border-b border-border/60 text-white font-mono text-[10px]">{fmt(s.call.close)}</td>
-                <td className={`px-2 py-1.5 border-b border-border/60 font-mono text-[10px] ${pnlClass(s.call.pnl)}`}>{s.call.pnl >= 0 ? '+' : ''}{fmt(s.call.pnl)}</td>
-                <td className="px-2 py-1.5 border-b border-border/60 text-muted font-mono text-[10px]">{fmt(s.put.open)}</td>
-                <td className="px-2 py-1.5 border-b border-border/60 text-white font-mono text-[10px]">{fmt(s.put.close)}</td>
-                <td className={`px-2 py-1.5 border-b border-border/60 font-mono text-[10px] ${pnlClass(s.put.pnl)}`}>{s.put.pnl >= 0 ? '+' : ''}{fmt(s.put.pnl)}</td>
-                <td className={`px-2 py-1.5 border-b border-border/60 font-mono text-[10px] font-bold ${pnlClass(s.straddle.netPnl)}`}>
-                  {s.straddle.netPnl >= 0 ? '+' : ''}{fmt(s.straddle.netPnl)} pts
-                </td>
-                <td className={`px-2 py-1.5 border-b border-border/60 font-mono text-[10px] font-bold ${pnlClass(s.straddle.netRoi)}`}>
-                  {s.straddle.netRoi >= 0 ? '+' : ''}{fmt(s.straddle.netRoi)}%
-                </td>
-                <td className={`px-2 py-1.5 border-b border-border/60 font-mono text-[9.5px] ${pnlClass(s.exit130?.netPnl || 0)}`}>
-                  {(s.exit130?.netPnl || 0) >= 0 ? '+' : ''}{fmt(s.exit130?.netPnl || 0)} pts
-                </td>
-                <td className="px-2 py-1.5 border-b border-border/60">
-                  <Badge status={s.straddle.status === 'PROFIT' ? 'TRADED' : 'REJECTED'} />
-                </td>
+              <tr key={s.label || s.strike} className={`hover:bg-surface-200/50 ${isAtm ? 'bg-accent/5 font-semibold' : ''}`}>
+                <td className="px-2 py-1 border-b border-border/60 text-white whitespace-nowrap"><span className="font-bold">{typeof s.strike === 'number' ? fmt(s.strike, 0) : s.strike}</span>{s.label && <span className={`ml-1 text-[8px] px-1 py-0.2 rounded ${isAtm ? 'bg-gold/20 text-gold font-bold' : 'bg-surface-300 text-muted'}`}>{s.label}</span>}{isAtm && ' ⭐'}</td>
+                <td className="px-2 py-1 border-b border-border/60 text-muted">{fmt(open)}</td><td className="px-2 py-1 border-b border-border/60 text-accent font-semibold">{fmt(high)}</td><td className="px-2 py-1 border-b border-border/60 text-danger">{fmt(low)}</td>
+                <td className="px-2 py-1 border-b border-border/60 text-white">{fmt(exit130)}</td><td className="px-2 py-1 border-b border-border/60 text-white">{fmt(close)}</td>
+                <td className={`px-2 py-1 border-b border-border/60 font-bold ${pnlClass(pnl)}`}>{pnl >= 0 ? '+' : ''}{fmt(pnl)} pts</td><td className={`px-2 py-1 border-b border-border/60 font-bold ${pnlClass(roi)}`}>{roi >= 0 ? '+' : ''}{fmt(roi)}%</td>
+                <td className="px-2 py-1 border-b border-border/60"><Badge status={leg.status === 'PROFIT' ? 'TRADED' : 'REJECTED'} /></td>
               </tr>
             );
           })}
@@ -216,39 +277,14 @@ function StrikeTableCard({ day }: { day: any; symbol: string }) {
 
 function StrategyInsightsGrid({ breakEvenPts }: { breakEvenPts: number }) {
   const insights = [
-    {
-      title: '1. The "Theta Decay" Trap (Sideways Days)',
-      icon: <ShieldAlert size={14} className="text-danger" />,
-      desc: `When spot moves < 0.3% (< ${Math.round(breakEvenPts * 0.6)} pts), both ATM Call and Put lose premium from 9:15 AM to 3:30 PM due to time decay. Avoid long straddles when previous day ATR or VIX is dropping.`,
-    },
-    {
-      title: '2. The "Gamma Blast" (Directional Days)',
-      icon: <Zap size={14} className="text-accent" />,
-      desc: `When spot moves > 0.6% (> ${breakEvenPts} pts), the winning option leg surges +80% to +140%, easily overcoming the ~40% loss of the opposite leg. Net straddle P&L is highly positive.`,
-    },
-    {
-      title: '3. Intraday Exit Timing (1:30 PM Rule)',
-      icon: <Clock size={14} className="text-gold" />,
-      desc: 'Options buying strategies frequently peak in profitability between 11:00 AM and 1:30 PM. Holding until 3:30 PM on stalling sessions exposes gains to severe late-afternoon theta erosion.',
-    },
-    {
-      title: '4. Strike Selection & ROI Efficiency (OTM vs ATM)',
-      icon: <TrendingUp size={14} className="text-sky" />,
-      desc: 'ATM+1 and ATM+2 strikes have lower initial premium. On trending days, their percentage return (ROI%) frequently outperforms ATM because capital at risk is lower.',
-    },
+    { title: '1. DhanHQ 1m Replay', icon: <Activity size={13} className="text-accent" />, desc: '09:15 to 15:30 playback of spot moves, option prices, and live strike shift.' },
+    { title: '2. Swing Highs & Reactions', icon: <Zap size={13} className="text-accent" />, desc: 'Detects pivot reversals and shows whether morning peak gains dissolved in afternoon chop.' },
+    { title: '3. 1:30 PM Checkpoint Rule', icon: <Clock size={13} className="text-gold" />, desc: 'Exiting long options at 1:30 PM avoids the post-lunch accelerated theta collapse.' },
+    { title: '4. Strike Selection Efficiency', icon: <TrendingUp size={13} className="text-sky" />, desc: `On breakout moves > ${breakEvenPts} pts, percentage return of OTM strikes outperforms ATM.` },
   ];
-
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-      {insights.map((item) => (
-        <Card key={item.title} className="p-3.5 bg-surface-50 border border-border">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-white mb-1.5">
-            {item.icon}
-            <span>{item.title}</span>
-          </div>
-          <p className="text-[10px] text-muted leading-relaxed">{item.desc}</p>
-        </Card>
-      ))}
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2.5">
+      {insights.map((item) => (<Card key={item.title} className="p-3 bg-surface-50 border border-border"><div className="flex items-center gap-1.5 text-xs font-semibold text-white mb-1">{item.icon}<span>{item.title}</span></div><p className="text-[9.5px] text-muted leading-relaxed">{item.desc}</p></Card>))}
     </div>
   );
 }

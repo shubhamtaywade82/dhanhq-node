@@ -34,6 +34,12 @@ export const api = {
   holdings: () => request<any[]>('/api/portfolio/holdings'),
   profile: () => request<any>('/api/portfolio/profile'),
 
+  strategies: () => request<any[]>('/api/portfolio/strategies'),
+  deployStrategy: (strat: any) => request<any>('/api/portfolio/paper/strategy/deploy', { method: 'POST', body: JSON.stringify(strat) }),
+  updateStrategyStatus: (id: string, status: string) => request<any>('/api/portfolio/paper/strategy/status', { method: 'POST', body: JSON.stringify({ id, status }) }),
+  closeStrategy: (id: string) => request<any>('/api/portfolio/paper/strategy/close', { method: 'POST', body: JSON.stringify({ id }) }),
+  calculateMargin: (items: any[]) => request<any>('/api/portfolio/margin/calculate', { method: 'POST', body: JSON.stringify({ items }) }),
+
   placePaperOrder: (order: { symbol: string; quantity: number; transactionType: 'BUY' | 'SELL'; price?: number; orderType?: string; productType?: string; securityId?: string }) =>
     request<any>('/api/portfolio/paper/order', {
       method: 'POST',

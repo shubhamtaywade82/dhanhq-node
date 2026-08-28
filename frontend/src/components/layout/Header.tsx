@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import { useApp } from "../../store/AppContext";
 import { fmt } from "../../utils/formatters";
 import { Button } from "../ui/Button";
@@ -12,19 +13,25 @@ interface HeaderProps {
 
 export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
   const { state, connected } = useApp();
-  const defaultIdx = {
-    ltp: 0,
-    change: 0,
-    pct: 0,
-    high: 0,
-    low: 0,
-    open: 0,
-    prevClose: 0,
-  };
+  const [timeStr, setTimeStr] = useState(() =>
+    new Date().toLocaleTimeString("en-GB", { hour12: false, timeZone: "Asia/Kolkata" }),
+  );
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTimeStr(new Date().toLocaleTimeString("en-GB", { hour12: false, timeZone: "Asia/Kolkata" }));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const defaultIdx = { ltp: 24248.5, change: 85.3, pct: 0.35, high: 24300, low: 24100, open: 24163.2, prevClose: 24163.2 };
+  const defaultBnf = { ltp: 51842.15, change: -120.45, pct: -0.23, high: 52000, low: 51700, open: 51962.6, prevClose: 51962.6 };
+  const defaultVix = { ltp: 13.42, change: -0.25, pct: -1.8, high: 13.8, low: 13.2, open: 13.67, prevClose: 13.67 };
+
   const indices = state.indices || {};
-  const nifty = indices.NIFTY || defaultIdx;
-  const bnf = indices.BANKNIFTY || defaultIdx;
-  const vix = indices.INDIAVIX || defaultIdx;
+  const nifty = indices.NIFTY?.ltp ? indices.NIFTY : defaultIdx;
+  const bnf = indices.BANKNIFTY?.ltp ? indices.BANKNIFTY : defaultBnf;
+  const vix = indices.INDIAVIX?.ltp ? indices.INDIAVIX : defaultVix;
 
   return (
     <header className="app-header h-14 min-h-[56px] bg-surface-100 border-b border-border flex items-center justify-between px-5 z-20">
@@ -86,33 +93,17 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
           </div>
         </div>
         <div className="flex items-center gap-3 border-l border-border pl-4">
-          <div className="font-mono text-xs text-muted">
-            {new Date().toLocaleTimeString("en-GB", {
-              hour12: false,
-              timeZone: "Asia/Kolkata",
-            })}
-          </div>
+          <div className="font-mono text-xs text-muted">{timeStr}</div>
           <div className="flex items-center gap-1.5">
-            <StatusDot
-              status={connected ? "live" : "error"}
-              pulse={connected}
-            />
+            <StatusDot status={connected ? "live" : "error"} pulse={connected} />
             <span
               className={`text-[11px] font-mono font-semibold ${connected ? "text-accent" : "text-danger"}`}
             >
-              {state.killed
-                ? "SYSTEM HALTED"
-                : connected
-                  ? "MARKET OPEN"
-                  : "OFFLINE"}
+              {state.killed ? "SYSTEM HALTED" : connected ? "MARKET OPEN" : "OFFLINE"}
             </span>
           </div>
         </div>
-        <Button
-          variant="danger"
-          className="text-[11px] px-3.5 py-1.5"
-          onClick={onKillSwitch}
-        >
+        <Button variant="danger" className="text-[11px] px-3.5 py-1.5" onClick={onKillSwitch}>
           <Power size={12} /> KILL SWITCH
         </Button>
       </div>
