@@ -11,6 +11,16 @@ interface TickData {
   timestamp: number;
 }
 
+function isIndianMarketOpen(): boolean {
+  const now = new Date();
+  const istStr = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+  const istDate = new Date(istStr);
+  const day = istDate.getDay();
+  if (day < 1 || day > 5) return false;
+  const minutes = istDate.getHours() * 60 + istDate.getMinutes();
+  return minutes >= 555 && minutes <= 930;
+}
+
 export class MarketStreamManager {
   private clients: Set<WebSocket> = new Set();
   private instruments: Array<{ securityId: string; exchangeSegment: string }> = [];
@@ -46,61 +56,46 @@ export class MarketStreamManager {
   }
 
   private startPolling(): void {
-    // Poll indices every 2 seconds during market hours
+    const symMap: Record<string, string> = {
+      '13': 'NIFTY',
+      '25': 'BANKNIFTY',
+      '27': 'FINNIFTY',
+      '26': 'INDIAVIX',
+    };
+    const secIds = Object.keys(symMap);
+
     this.tickInterval = setInterval(async () => {
-      if (this.clients.size === 0) return;
-
-      const now = new Date();
-      const hours = now.getHours();
-      const minutes = now.getMinutes();
-      const day = now.getDay();
-
-      // Only poll during market hours (Mon-Fri, 9:15-15:30 IST)
-      const isWeekday = day >= 1 && day <= 5;
-      const totalMinutes = hours * 60 + minutes;
-      const marketOpen = 9 * 60 + 15;
-      const marketClose = 15 * 60 + 30;
-      const isMarketHours = isWeekday && totalMinutes >= marketOpen && totalMinutes <= marketClose;
-
-      if (!isMarketHours) return;
+      if (this.clients.size === 0 || !isIndianMarketOpen()) return;
 
       try {
-        const indices = ['13', '25', '27', '26']; // NIFTY, BANKNIFTY, FINNIFTY, VIX
-        const symbols = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'INDIAVIX'];
+        const quote = await this.client.marketFeed.quote({ IDX_I: secIds });
+        const idxData = (quote.data as any)?.IDX_I || {};
 
-        for (let i = 0; i < indices.length; i++) {
-          try {
-            const quote = await this.client.marketFeed.quote({ IDX_I: [indices[i]] });
-            const d = (quote.data as any)?.IDX_I?.[indices[i]];
+        for (const [secId, sym] of Object.entries(symMap)) {
+          const d = idxData[secId];
+          if (!d) continue;
 
-            if (d) {
-              const ltp = Number(d.lastTradedPrice || d.ltp || 0);
-              const prevClose = Number(d.close || d.prevClose || ltp);
+          const ltp = Number(d.lastTradedPrice || d.ltp || 0);
+          const prevClose = Number(d.close || d.prevClose || ltp);
 
-              const tick: TickData = {
-                securityId: indices[i],
-                ltp,
-                change: ltp - prevClose,
-                pctChange: prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0,
-                volume: Number(d.volume || 0),
-                oi: Number(d.oi || 0),
-                timestamp: Date.now(),
-              };
-
-              this.broadcast({
-                type: 'tick',
-                symbol: symbols[i],
-                data: tick,
-              });
-            }
-          } catch {
-            // Silently skip failed individual fetches
-          }
+          this.broadcast({
+            type: 'tick',
+            symbol: sym,
+            data: {
+              securityId: secId,
+              ltp,
+              change: ltp - prevClose,
+              pctChange: prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0,
+              volume: Number(d.volume || 0),
+              oi: Number(d.oi || 0),
+              timestamp: Date.now(),
+            },
+          });
         }
-      } catch (e: any) {
-        console.warn('[Stream] Poll error:', e.message);
+      } catch {
+        // Silent backoff on polling error
       }
-    }, 2000);
+    }, 3000);
   }
 
   private broadcast(message: any): void {

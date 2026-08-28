@@ -9,38 +9,60 @@ const INDEX_SECURITY_IDS: Record<string, string> = {
   INDIAVIX: '26',
 };
 
+interface IndexQuote {
+  ltp: number;
+  change: number;
+  pct: number;
+  high: number;
+  low: number;
+  open: number;
+  prevClose: number;
+}
+
+function parseQuote(d: any): IndexQuote {
+  if (!d) return { ltp: 0, change: 0, pct: 0, high: 0, low: 0, open: 0, prevClose: 0 };
+  const ltp = Number(d.lastTradedPrice || d.ltp || 0);
+  const prevClose = Number(d.close || d.prevClose || ltp);
+  return {
+    ltp,
+    change: ltp - prevClose,
+    pct: prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0,
+    high: Number(d.high || d.dayHigh || ltp),
+    low: Number(d.low || d.dayLow || ltp),
+    open: Number(d.open || d.dayOpen || ltp),
+    prevClose,
+  };
+}
+
 export function marketRoutes(client: DhanClient, stream: MarketStreamManager): Router {
   const router = Router();
+  let cachedIndices: Record<string, IndexQuote> | null = null;
+  let lastFetchTime = 0;
+  const CACHE_TTL_MS = 3000;
 
   router.get('/indices', async (_req, res) => {
-    try {
-      const results: Record<string, { ltp: number; change: number; pct: number; high: number; low: number; open: number; prevClose: number }> = {};
+    const now = Date.now();
+    if (cachedIndices && now - lastFetchTime < CACHE_TTL_MS) {
+      return res.json(cachedIndices);
+    }
 
+    try {
+      const secIds = Object.values(INDEX_SECURITY_IDS);
+      const quote = await client.marketFeed.quote({ IDX_I: secIds });
+      const idxData = (quote.data as any)?.IDX_I || {};
+
+      const results: Record<string, IndexQuote> = {};
       for (const [sym, secId] of Object.entries(INDEX_SECURITY_IDS)) {
-        try {
-          const quote = await client.marketFeed.quote({ IDX_I: [secId] });
-          const d = (quote.data as any)?.IDX_I?.[secId];
-          if (d) {
-            const ltp = Number(d.lastTradedPrice || d.ltp || 0);
-            const prevClose = Number(d.close || d.prevClose || ltp);
-            results[sym] = {
-              ltp,
-              change: ltp - prevClose,
-              pct: prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0,
-              high: Number(d.high || d.dayHigh || ltp),
-              low: Number(d.low || d.dayLow || ltp),
-              open: Number(d.open || d.dayOpen || ltp),
-              prevClose,
-            };
-          }
-        } catch (e: any) {
-          console.warn(`[Market] Failed to fetch ${sym}:`, e.message);
-          results[sym] = { ltp: 0, change: 0, pct: 0, high: 0, low: 0, open: 0, prevClose: 0 };
-        }
+        results[sym] = parseQuote(idxData[secId]);
       }
 
+      cachedIndices = results;
+      lastFetchTime = now;
       res.json(results);
     } catch (e: any) {
+      if (cachedIndices) {
+        return res.json(cachedIndices);
+      }
       res.status(500).json({ error: e.message });
     }
   });
