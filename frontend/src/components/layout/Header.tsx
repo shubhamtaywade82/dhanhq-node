@@ -27,7 +27,7 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
   const vix = indices.INDIAVIX || defaultIdx;
 
   return (
-    <header className="h-14 min-h-[56px] bg-surface-100 border-b border-border flex items-center justify-between px-5 z-20">
+    <header className="app-header h-14 min-h-[56px] bg-surface-100 border-b border-border flex items-center justify-between px-5 z-20">
       <div className="flex items-center gap-4">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center">

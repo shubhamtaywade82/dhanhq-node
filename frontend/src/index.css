@@ -1,3 +1,4 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
 @import "tailwindcss";
 
 @theme {
@@ -44,4 +45,20 @@ body {
 		linear-gradient(rgba(0, 229, 160, 0.02) 1px, transparent 1px),
 		linear-gradient(90deg, rgba(0, 229, 160, 0.02) 1px, transparent 1px);
 	background-size: 40px 40px;
+}
+
+.card {
+	background: var(--color-surface-100);
+	border: 1px solid var(--color-border);
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+}
+
+.card:hover {
+	border-color: var(--color-surface-400);
+}
+
+.app-header {
+	background: rgba(10, 15, 24, 0.96);
+	border-color: var(--color-border);
+	box-shadow: 0 1px 0 rgba(0, 229, 160, 0.04);
 }
