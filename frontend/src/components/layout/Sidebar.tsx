@@ -75,21 +75,21 @@ export function Sidebar({ activePage, onNavigate }: { activePage: string; onNavi
         <div className="text-[8.5px] font-mono text-muted uppercase tracking-widest font-semibold">System Connectivity</div>
         <SystemStatusRow label="DhanHQ API" latency="18ms" status="live" />
         <SystemStatusRow label="WS Ticks" latency="3.2ms" status="live" />
-        <SystemStatusRow label="Sidekiq" latency="12/25 busy" status="live" />
-        <SystemStatusRow label="Ollama LLM" latency="llama3.1" status="live" />
+        <SystemStatusRow label="Sidekiq" latency="12/25 busy" status="live" valueClass="text-sky" />
+        <SystemStatusRow label="Ollama LLM" latency="llama3.1" status="live" valueClass="text-purple" />
       </div>
     </aside>
   );
 }
 
-function SystemStatusRow({ label, latency, status }: { label: string; latency: string; status: 'live' | 'warn' | 'error' | 'idle' }) {
+function SystemStatusRow({ label, latency, status, valueClass }: { label: string; latency: string; status: 'live' | 'warn' | 'error' | 'idle'; valueClass?: string }) {
   return (
     <div className="flex items-center justify-between text-[10px] font-mono">
       <span className="flex items-center gap-1.5">
         <StatusDot status={status} pulse={status === 'live'} />
         {label}
       </span>
-      <span className="text-accent">{latency}</span>
+      <span className={valueClass || 'text-accent'}>{latency}</span>
     </div>
   );
 }

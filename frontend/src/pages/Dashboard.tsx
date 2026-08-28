@@ -51,14 +51,14 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
           </div>
           <canvas ref={canvasRef} height={190} className="w-full" />
         </Card>
-        <Card className="p-4 flex flex-col justify-between">
+        <Card className="p-4 flex flex-col justify-between overflow-hidden">
           <div>
             <div className="flex items-center justify-between mb-3">
               <span className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">
                 Active Strategies
               </span>
               <button
-                className="text-[10px] font-mono text-accent hover:underline"
+                className="text-[10px] font-mono text-accent hover:underline shrink-0"
                 onClick={() => onNavigate("strategies")}
               >
                 View All →
@@ -70,21 +70,21 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
                 .map((s) => (
                   <div
                     key={s.id}
-                    className="p-2.5 rounded-lg bg-surface-50 border border-border hover:border-[#2a3d5e] transition-all cursor-pointer"
+                    className="p-2.5 rounded-lg bg-surface-50 border border-border hover:border-[#2a3d5e] transition-all cursor-pointer overflow-hidden"
                     onClick={() => onNavigate("strategies")}
                   >
-                    <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-xs font-semibold text-white">
+                    <div className="flex items-center justify-between mb-1.5 min-w-0">
+                      <span className="text-xs font-semibold text-white truncate mr-2">
                         {s.name}
                       </span>
                       <StratBadge status={s.status} />
                     </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-[9.5px] font-mono text-muted">
+                    <div className="flex items-center justify-between min-w-0">
+                      <span className="text-[9.5px] font-mono text-muted truncate mr-2">
                         {s.symbol} · {s.type} · {s.lots}L
                       </span>
                       <span
-                        className={`text-xs font-mono font-bold ${pnlClass(s.pnl)}`}
+                        className={`text-xs font-mono font-bold shrink-0 ${pnlClass(s.pnl)}`}
                       >
                         {fmtINR(s.pnl)}
                       </span>
@@ -105,7 +105,9 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
             Market Spot Indices
           </div>
           <div className="space-y-2.5">
-            {Object.entries(state.indices).map(([sym, d]) => (
+            {Object.entries(state.indices).map(([sym, d]) => {
+              if (!d) return null;
+              return (
               <div
                 key={sym}
                 className="flex items-center justify-between p-2 rounded bg-surface-50 border border-border"
@@ -126,7 +128,8 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
                   </div>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
 

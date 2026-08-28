@@ -12,9 +12,10 @@ interface HeaderProps {
 
 export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
   const { state, connected } = useApp();
-  const nifty = state.indices.NIFTY;
-  const bnf = state.indices.BANKNIFTY;
-  const vix = state.indices.INDIAVIX;
+  const defaultIdx = { ltp: 0, change: 0, pct: 0, high: 0, low: 0, open: 0, prevClose: 0 };
+  const nifty = state.indices.NIFTY || defaultIdx;
+  const bnf = state.indices.BANKNIFTY || defaultIdx;
+  const vix = state.indices.INDIAVIX || defaultIdx;
 
   return (
     <header className="h-14 min-h-[56px] bg-surface-100 border-b border-border flex items-center justify-between px-5 z-20">

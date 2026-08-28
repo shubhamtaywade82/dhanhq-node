@@ -7,6 +7,20 @@ export const redisPublisher = new Redis(redisUrl);
 
 export async function createDhanClient(): Promise<DhanClient> {
   const clientId = (await redisPublisher.get("dhan:auth:client_id")) || process.env.DHAN_CLIENT_ID || "";
+  const accessToken = process.env.DHAN_ACCESS_TOKEN;
+  const authProviderUrl = process.env.DHAN_AUTH_PROVIDER_URL || process.env.DHAN_TOKEN_ENDPOINT;
+  const authProviderToken = process.env.DHAN_AUTH_PROVIDER_TOKEN || process.env.DHAN_TOKEN_ACCESS_TOKEN;
+
+  if (accessToken && accessToken !== "your_access_token") {
+    return new DhanClient({ clientId, token: accessToken });
+  }
+
+  if (authProviderUrl && authProviderToken) {
+    return DhanClient.fromTokenEndpoint({
+      endpointBaseUrl: authProviderUrl,
+      bearerToken: authProviderToken,
+    });
+  }
 
   const client = new DhanClient({
     clientId,
