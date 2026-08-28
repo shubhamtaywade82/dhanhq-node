@@ -5,6 +5,7 @@ import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { StatusDot } from '../components/ui/StatusDot';
 import { Terminal, Play, Network } from 'lucide-react';
+import { api } from '../services/api';
 import type { TelemetryEvent } from '../store/types';
 
 const AGENT_PERSONAS: Record<string, { name: string; color: string }> = {
@@ -45,6 +46,20 @@ export function AgentConsole() {
   };
 
   const runScenario = async (objective: string) => {
+    // Try real Ollama first, fall back to simulation
+    try {
+      addStep('planner', 'THINK', `Analyzing objective: ${objective}`);
+      const response = await api.ollamaChat([
+        { role: 'user', content: objective }
+      ]);
+      addStep('strategy', 'OBSERVE', response.response, 'ollama.chat', response.response);
+      setState(prev => ({ ...prev, agentRunning: false, agentTokens: prev.agentTokens + response.response.length }));
+      showToast('Ollama analysis completed', 'success');
+      return;
+    } catch {
+      // Fall back to simulation
+    }
+
     const lower = objective.toLowerCase();
     const steps = lower.includes('deploy') || lower.includes('condor')
       ? deploySteps

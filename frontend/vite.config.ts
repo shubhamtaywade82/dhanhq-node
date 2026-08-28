@@ -4,4 +4,15 @@ import { defineConfig } from 'vite'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    port: 5175,
+    strictPort: true,
+    proxy: {
+      '/api': 'http://localhost:3003',
+      '/ws': {
+        target: 'ws://localhost:3003',
+        ws: true,
+      },
+    },
+  },
 })

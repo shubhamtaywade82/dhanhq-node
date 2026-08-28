@@ -1,8 +1,12 @@
 export interface IndexData {
-  spot: number;
+  ltp: number;
   change: number;
   pct: number;
-  ltp: number;
+  high: number;
+  low: number;
+  open: number;
+  prevClose: number;
+  spot?: number;
 }
 
 export interface OptionLeg {
@@ -153,6 +157,8 @@ export interface AppState {
   strategies: Strategy[];
   recentFills: Fill[];
   orders: Order[];
+  positions: any[];
+  funds: Record<string, any>;
   circuitBreakers: CircuitBreaker[];
   alerts: Alert[];
   skWorkers: SidekiqWorker[];

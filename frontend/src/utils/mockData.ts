@@ -6,10 +6,10 @@ export const initialAppState: AppState = {
   uptimeSeconds: 0,
   latency: 18,
   indices: {
-    NIFTY: { spot: 24248.5, change: 85.3, pct: 0.35, ltp: 24248.5 },
-    BANKNIFTY: { spot: 51842.15, change: -120.45, pct: -0.23, ltp: 51842.15 },
-    FINNIFTY: { spot: 23156.8, change: 42.1, pct: 0.18, ltp: 23156.8 },
-    INDIAVIX: { spot: 13.42, change: -0.25, pct: -1.8, ltp: 13.42 },
+    NIFTY: { ltp: 24248.5, change: 85.3, pct: 0.35, high: 24300, low: 24100, open: 24163.2, prevClose: 24163.2, spot: 24248.5 },
+    BANKNIFTY: { ltp: 51842.15, change: -120.45, pct: -0.23, high: 52000, low: 51700, open: 51962.6, prevClose: 51962.6, spot: 51842.15 },
+    FINNIFTY: { ltp: 23156.8, change: 42.1, pct: 0.18, high: 23200, low: 23000, open: 23114.7, prevClose: 23114.7, spot: 23156.8 },
+    INDIAVIX: { ltp: 13.42, change: -0.25, pct: -1.8, high: 13.8, low: 13.2, open: 13.67, prevClose: 13.67, spot: 13.42 },
   },
   strategies: [
     {
@@ -75,6 +75,8 @@ export const initialAppState: AppState = {
     { id: 'ORD-240128-006', corr: 'corr_straddle2', time: '11:25:48', instrument: 'NIFTY24JAN24200CE', type: 'LIMIT', side: 'BUY', qty: 50, price: 210.3, filled: 30, avg: 210.3, leg: 'ENTRY_LEG', status: 'PENDING', jid: 'jid_p6q7r8', latency: '-' },
     { id: 'ORD-240128-007', corr: 'corr_fail1', time: '11:15:00', instrument: 'NIFTY24JAN24400CE', type: 'LIMIT', side: 'BUY', qty: 100, price: 95, filled: 0, avg: 0, leg: 'ENTRY_LEG', status: 'REJECTED', jid: 'jid_y5z6a7', latency: '12ms' },
   ],
+  positions: [],
+  funds: { availableMargin: 255000, usedMargin: 245000, spanMargin: 180000, exposureMargin: 65000 },
   circuitBreakers: [
     { rule: 'Daily Loss Limit', threshold: '50,000', current: '-12,400', state: 'OK', action: 'Close all positions, trigger Dhan P&L exit' },
     { rule: 'Margin Utilization', threshold: '70%', current: '49%', state: 'OK', action: 'Block new position opens' },

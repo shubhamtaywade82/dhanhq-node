@@ -2,7 +2,7 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #06090f;
+  --color-bg: #070b12;
   --color-surface-50: #0a0f18;
   --color-surface-100: #0f1624;
   --color-surface-200: #151f33;
@@ -25,8 +25,8 @@
   --color-purple-dim: #9333ea;
   --color-pink: #f472b6;
   --color-pink-dim: #db2777;
-  --color-border: #1c283f;
-  --color-muted: #64748b;
+  --color-border: #24324a;
+  --color-muted: #8290a6;
   --font-sans: 'Space Grotesk', sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
 }
@@ -34,7 +34,10 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-  background: var(--color-bg);
+  background:
+    radial-gradient(circle at 78% -15%, rgba(0, 229, 160, 0.09), transparent 32rem),
+    radial-gradient(circle at 4% 100%, rgba(56, 189, 248, 0.06), transparent 28rem),
+    var(--color-bg);
   color: #e2e8f0;
   font-family: var(--font-sans);
   overflow-x: hidden;
@@ -51,6 +54,60 @@ body {
     linear-gradient(rgba(0, 229, 160, 0.02) 1px, transparent 1px),
     linear-gradient(90deg, rgba(0, 229, 160, 0.02) 1px, transparent 1px);
   background-size: 40px 40px;
+}
+
+.dashboard-shell {
+  max-width: 1800px;
+  margin: 0 auto;
+}
+
+.dashboard-intro {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 2px 2px 4px;
+}
+
+.dashboard-intro h2 {
+  color: #f8fafc;
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.dashboard-intro p {
+  color: var(--color-muted);
+  font-size: 0.75rem;
+  margin-top: 4px;
+}
+
+.session-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(0, 229, 160, 0.25);
+  border-radius: 999px;
+  color: var(--color-accent);
+  background: rgba(0, 229, 160, 0.08);
+  padding: 7px 11px;
+  font: 600 10px var(--font-mono);
+  white-space: nowrap;
+}
+
+.metric-card {
+  background: linear-gradient(145deg, rgba(21, 31, 51, 0.96), rgba(10, 15, 24, 0.96));
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.12);
+}
+
+.metric-card:first-child {
+  border-color: rgba(0, 229, 160, 0.28);
+  box-shadow: inset 3px 0 0 var(--color-accent), 0 10px 30px rgba(0, 0, 0, 0.16);
+}
+
+@media (max-width: 720px) {
+  .dashboard-intro { align-items: start; flex-direction: column; gap: 10px; }
+  .dashboard-intro h2 { font-size: 1.15rem; }
 }
 
 @keyframes pulse-live { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -82,10 +139,10 @@ body::after {
 /* Data Table */
 .data-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: var(--font-mono); }
 .data-table th {
-  text-align: left; padding: 8px 10px; color: var(--color-muted); font-weight: 500;
+  text-align: left; padding: 9px 10px; color: #93a1b5; font-weight: 600;
   border-bottom: 1px solid var(--color-border); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.5px;
 }
-.data-table td { padding: 7px 10px; border-bottom: 1px solid rgba(28, 40, 63, 0.6); }
+.data-table td { padding: 8px 10px; border-bottom: 1px solid rgba(36, 50, 74, 0.65); }
 .data-table tr:hover td { background: rgba(21, 31, 51, 0.5); }
 
 /* Badges */

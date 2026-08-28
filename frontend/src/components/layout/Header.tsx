@@ -11,7 +11,7 @@ interface HeaderProps {
 }
 
 export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
-  const { state } = useApp();
+  const { state, connected } = useApp();
   const nifty = state.indices.NIFTY;
   const bnf = state.indices.BANKNIFTY;
   const vix = state.indices.INDIAVIX;
@@ -65,9 +65,9 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
             {new Date().toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Kolkata' })}
           </div>
           <div className="flex items-center gap-1.5">
-            <StatusDot status="live" pulse />
-            <span className="text-accent text-[11px] font-mono font-semibold">
-              {state.killed ? 'SYSTEM HALTED' : 'MARKET OPEN'}
+            <StatusDot status={connected ? 'live' : 'error'} pulse={connected} />
+            <span className={`text-[11px] font-mono font-semibold ${connected ? 'text-accent' : 'text-danger'}`}>
+              {state.killed ? 'SYSTEM HALTED' : connected ? 'MARKET OPEN' : 'OFFLINE'}
             </span>
           </div>
         </div>
