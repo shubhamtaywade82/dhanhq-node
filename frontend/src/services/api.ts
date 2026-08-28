@@ -16,6 +16,15 @@ export const api = {
 
   optionChain: (symbol: string) => request<{ strikes: Array<{ strike: number; ce: any; pe: any }>; underlying: string }>(`/api/market/option-chain/${symbol}`),
 
+  optionsAnalysis: (params?: { symbol?: string; days?: number; interval?: string; expiryFlag?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.symbol) q.set('symbol', params.symbol);
+    if (params?.days) q.set('days', String(params.days));
+    if (params?.interval) q.set('interval', params.interval);
+    if (params?.expiryFlag) q.set('expiryFlag', params.expiryFlag);
+    return request<any>(`/api/market/options-analysis?${q.toString()}`);
+  },
+
   quote: (securityId: string, exchange = 'NSE_FNO') => request<any>(`/api/market/quote/${securityId}?exchange=${exchange}`),
 
   positions: () => request<any[]>('/api/portfolio/positions'),

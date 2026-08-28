@@ -12,6 +12,7 @@ import { AgentConsole } from "./pages/AgentConsole";
 import { AgentMonitor } from "./pages/AgentMonitor";
 import { AgentToolsMemory } from "./pages/AgentToolsMemory";
 import { GreeksAnalytics } from "./pages/GreeksAnalytics";
+import { OptionsAnalysis } from "./pages/OptionsAnalysis";
 import { MarginRisk } from "./pages/MarginRisk";
 import { SidekiqInfra } from "./pages/SidekiqInfra";
 import { Alerts } from "./pages/Alerts";
@@ -24,6 +25,7 @@ const PAGE_TITLES: Record<string, [string, string]> = {
   dashboard: ["Dashboard", "LIVE OVERVIEW"],
   strategies: ["Strategies", "AASM STATE MACHINE BACKED"],
   "options-chain": ["Option Chain", "LIVE DHAN /v2/optionchain"],
+  "options-analysis": ["Options Behavior", "DYNAMIC ATM & PARALLEL BUYING"],
   positions: ["Positions", "OPTIMISTIC LOCKING (AR)"],
   orders: ["Order Book", "FULL AUDIT TRAIL"],
   "agent-console": ["Agent Console", "REACT MULTI-AGENT LOOP"],
@@ -147,6 +149,8 @@ function AppInner() {
         );
       case "options-chain":
         return <OptionsChain />;
+      case "options-analysis":
+        return <OptionsAnalysis />;
       case "positions":
         return <Positions />;
       case "orders":

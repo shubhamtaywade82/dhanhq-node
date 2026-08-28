@@ -1,7 +1,7 @@
 import { StatusDot } from '../ui/StatusDot';
 import {
   ChartLine, ChessKnight, Layers, Wallet, Receipt, Brain, Satellite, Database,
-  Calculator, Shield, ListChecks, Bell, Terminal, Settings,
+  Calculator, Shield, ListChecks, Bell, Terminal, Settings, TrendingUp,
 } from 'lucide-react';
 
 interface NavItem {
@@ -26,6 +26,7 @@ const agentItems: NavItem[] = [
 ];
 
 const analyticsItems: NavItem[] = [
+  { id: 'options-analysis', label: 'Options Behavior', icon: <TrendingUp size={13} /> },
   { id: 'greeks-analytics', label: 'Greeks & Vol', icon: <Calculator size={13} /> },
   { id: 'margin-risk', label: 'Margin & Risk', icon: <Shield size={13} /> },
 ];

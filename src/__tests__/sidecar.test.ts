@@ -58,4 +58,12 @@ describe("DhanHQ-TS Node.js Sidecar & Paper Trading", () => {
     const wallet = await getPaperWallet();
     expect(wallet.realizedPnl).toBe(1000);
   });
+
+  it("generates a valid 6-digit TOTP from base32 secret", () => {
+    const { DhanAuth } = require("@nemesis-oss/dhanhq-sdk");
+    const secret = "JBSWY3DPEHPK3PXP"; // RFC 4648 Base32 test secret
+    const code = DhanAuth.generateTotp(secret);
+    expect(code).toBeDefined();
+    expect(code).toMatch(/^\d{6}$/);
+  });
 });
