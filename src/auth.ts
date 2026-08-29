@@ -1,5 +1,6 @@
 import { DhanClient, DhanAuth } from "@nemesis-oss/dhanhq-sdk";
 import Redis from "ioredis";
+import { moduleLogger } from "./lib/logger";
 
 /**
  * DhanHQ client factory.
@@ -16,6 +17,8 @@ import Redis from "ioredis";
  */
 
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379/0";
+
+const log = moduleLogger("auth");
 
 function lazyRedis(url: string): Redis {
   const r = new Redis(url, {
@@ -76,24 +79,24 @@ export async function createDhanClient(): Promise<DhanClient> {
   if (authProviderUrl && authProviderToken) {
     try {
       const token = await fetchTokenFromRails(authProviderUrl, authProviderToken);
-      console.log("[Auth] Token fetched from Rails authority successfully.");
+      log.info("DhanHQ token fetched from Rails authority");
       return new DhanClient({ clientId, token });
     } catch (e: any) {
-      console.warn(`[Auth] Token authority unreachable (${e.message}). Falling back to TOTP/Redis...`);
+      log.warn({ err: { message: e.message }, tier: "rails-authority" }, "Token authority unreachable — falling back to TOTP/Redis");
     }
   }
 
   if (pin && totpSecret) {
     try {
       const token = await generateTokenViaTotp(clientId, pin, totpSecret);
-      console.log("[Auth] Token generated via Dhan TOTP successfully.");
+      log.info("DhanHQ token generated via TOTP");
       return new DhanClient({
         clientId,
         token,
         tokenProvider: () => generateTokenViaTotp(clientId, pin, totpSecret),
       });
     } catch (e: any) {
-      console.warn(`[Auth] TOTP generation failed (${e.message}). Falling back to Redis token...`);
+      log.warn({ err: { message: e.message }, tier: "totp" }, "TOTP generation failed — falling back to Redis token");
     }
   }
 
@@ -116,13 +119,13 @@ export async function createDhanClient(): Promise<DhanClient> {
 function setupTokenRotationSubscriber() {
   if (!redisAvailable()) return;
   redisSubscriber.subscribe("dhan:auth:rotated", (err) => {
-    if (err) console.error("[Sidecar] Failed to subscribe to dhan:auth:rotated:", err);
-    else console.log("[Sidecar] Subscribed to dhan:auth:rotated channel.");
+    if (err) log.error({ err: { message: err.message }, channel: "dhan:auth:rotated" }, "Failed to subscribe to token rotation channel");
+    else log.info({ channel: "dhan:auth:rotated" }, "Subscribed to token rotation channel");
   });
 
   redisSubscriber.on("message", (channel) => {
     if (channel === "dhan:auth:rotated") {
-      console.log("[Sidecar] Token rotated notification received. New token will be picked up on next request.");
+      log.info("Token rotated notification received — new token picked up on next request");
     }
   });
 }

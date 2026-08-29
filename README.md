@@ -113,3 +113,68 @@ See `.env.example`. Key variables: `TRADING_MODE`, `DHAN_ACCESS_TOKEN` (or
 Risk limits are also live-tunable from the Config page via
 `POST /api/control/risk-limits` and are enforced by the backend engine on
 every order path.
+
+## Observability & logging
+
+Structured logging spans both sides of the stack with one vocabulary and
+one searchable stream — query by `requestId` or `sessionId` and you see
+the frontend event *and* every backend line it triggered.
+
+**Backend (Pino + pino-http)** — machine-queryable JSON on stdout in
+production, `pino-pretty` in development.
+
+- Every line carries `service`, `env`, `version`, `mode` plus a `module`
+  (`server` / `auth` / `db` / `ws` / `bus` / `portfolio` / `client-logs`).
+- ISO 8601 timestamps; levels `fatal→error→warn→info→debug→trace` via
+  `LOG_LEVEL`.
+- HTTP access logging with method, URL, status, latency; `/api/health`
+  polling is excluded to keep the stream readable.
+- Correlation: an inbound `x-request-id` (or `x-correlation-id`) is
+  reused, echoed back on the response, and bound to `req.log`; a W3C
+  `traceparent` header's `traceId`/`spanId` are folded in for
+  OpenTelemetry log↔trace linking without running an OTel SDK.
+- Redaction: DhanHQ access tokens, TOTP secrets, PINs, `authorization`/
+  `cookie` headers etc. are centrally censored to `[REDACTED]`.
+- **EventBus→stdout bridge**: everything the backend already streams to
+  the UI (logs, alerts, order fills/rejections, system lifecycle) is
+  mirrored into the same structured stream, with a per-minute flood
+  budget (`BUS_BRIDGE_BUDGET`) so a runaway loop can't saturate stdout.
+- Central error middleware: unhandled route errors are logged with
+  request id + stack and answered as `{ error }` JSON; unknown `/api/*`
+  paths get a JSON 404.
+- `uncaughtException` / `unhandledRejection` are logged at `fatal`
+  (and reported on the bus) instead of crashing the autonomous core.
+
+**Frontend (control plane)**
+
+- `services/logger.ts` — structured client logger. Errors always ship;
+  other levels are sampled (`VITE_LOG_SAMPLE_RATE`, default 0.2).
+  Batches flush every 5s and via `sendBeacon` on page unload.
+- `POST /api/client-logs` ingests them (zod-validated, size-capped,
+  rate-limited per IP) and writes `source: "frontend"` lines into the
+  same Pino stream.
+- Every API call sends an `x-request-id`; failures are logged with
+  endpoint, status, duration and the correlation id. The WS stream logs
+  connect/disconnect/reconnect with backoff attempts.
+- `components/ErrorBoundary.tsx` catches render crashes per region
+  (a broken panel never takes down the kill-switch UI) and reports them
+  with component stacks; `services/globalHandlers.ts` installs
+  `window.onerror` + `unhandledrejection` handlers at boot.
+
+**What you get out of the box**
+
+```jsonc
+// backend access log (one request, correlated end-to-end)
+{"level":30,"time":"2026-08-29T05:20:49.098Z","service":"dhanhq-node","env":"production",
+ "req":{"id":"test-req-abc12345","method":"POST","url":"/api/control/kill"},
+ "responseTime":3,"msg":"POST /api/control/kill → 200"}
+
+// frontend event ingested into the same stream
+{"level":50,"time":"...","source":"frontend","sessionId":"…","release":"1.0.0",
+ "requestId":"…","msg":"API request failed","status":502,"endpoint":"/api/market/greeks"}
+```
+
+Ship stdout to any aggregator (Grafana Loki, Datadog, Axiom, CloudWatch)
+and alert on: `level>=50` rate spikes, `channel":"order","kind":"rejection"`
+bursts, kill-switch `system` events, or `module":"market_data` staleness
+warnings.

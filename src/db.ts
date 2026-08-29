@@ -1,4 +1,7 @@
 import { Pool } from 'pg';
+import { moduleLogger } from './lib/logger';
+
+const log = moduleLogger('db');
 
 /**
  * Paper-trading persistence layer.
@@ -99,16 +102,16 @@ export async function initDatabase(): Promise<void> {
   const client = await pool.connect().catch(() => null);
   if (!client) {
     mode = 'memory';
-    console.warn('[Database] PostgreSQL unreachable — running with in-memory paper trading state (not durable).');
+    log.warn('PostgreSQL unreachable — running with in-memory paper trading state (not durable)');
     return;
   }
   try {
     await client.query(SCHEMA_SQL);
     mode = 'postgres';
-    console.log('[Database] PostgreSQL paper trading tables initialized successfully.');
+    log.info('PostgreSQL paper trading tables initialized');
   } catch (e: any) {
     mode = 'memory';
-    console.warn(`[Database] Schema init failed (${e.message}) — falling back to in-memory mode.`);
+    log.warn({ err: { message: e.message } }, 'Schema init failed — falling back to in-memory mode');
   } finally {
     client.release();
   }

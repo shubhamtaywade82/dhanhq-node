@@ -7,6 +7,9 @@ import {
 import type { MarketDataService } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 import { eventBus } from '../services/eventBus';
+import { moduleLogger } from '../lib/logger';
+
+const log = moduleLogger('portfolio');
 
 /**
  * Portfolio & paper-trading routes.
@@ -28,7 +31,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       }
       res.json(await client.positions.list());
     } catch (e: any) {
-      console.warn('[Portfolio] Positions fetch failed:', e.message);
+      log.warn({ requestId: req.id, err: { message: e.message }, resource: 'positions' }, 'Positions fetch failed');
       res.json([]);
     }
   });
@@ -40,7 +43,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       }
       res.json(await client.orders.list());
     } catch (e: any) {
-      console.warn('[Portfolio] Orders fetch failed:', e.message);
+      log.warn({ requestId: req.id, err: { message: e.message }, resource: 'orders' }, 'Orders fetch failed');
       res.json([]);
     }
   });
@@ -52,7 +55,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       }
       res.json(await client.funds.getLimit());
     } catch (e: any) {
-      console.warn('[Portfolio] Funds fetch failed:', e.message);
+      log.warn({ requestId: req.id, err: { message: e.message }, resource: 'funds' }, 'Funds fetch failed');
       res.json({});
     }
   });
@@ -65,7 +68,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       }
       res.json(await client.orders.listTrades());
     } catch (e: any) {
-      console.warn('[Portfolio] Trades fetch failed:', e.message);
+      log.warn({ requestId: req.id, err: { message: e.message }, resource: 'trades' }, 'Trades fetch failed');
       res.json([]);
     }
   });
@@ -268,22 +271,22 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
     }
   });
 
-  router.get('/holdings', async (_req, res) => {
+  router.get('/holdings', async (req, res) => {
     try {
       const holdings = await client.positions.listHoldings();
       res.json(holdings);
     } catch (e: any) {
-      console.warn('[Portfolio] Holdings fetch failed:', e.message);
+      log.warn({ requestId: req.id, err: { message: e.message }, resource: 'holdings' }, 'Holdings fetch failed');
       res.json([]);
     }
   });
 
-  router.get('/profile', async (_req, res) => {
+  router.get('/profile', async (req, res) => {
     try {
       const profile = await client.profile.get();
       res.json(profile);
     } catch (e: any) {
-      console.warn('[Portfolio] Profile fetch failed:', e.message);
+      log.warn({ requestId: req.id, err: { message: e.message }, resource: 'profile' }, 'Profile fetch failed');
       // Honest error — no fake trader identity.
       res.status(502).json({ error: `DhanHQ profile unavailable: ${e.message}`, authenticated: false });
     }

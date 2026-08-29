@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
+import { log } from '../services/logger';
 
 /**
  * Backend telemetry stream — the ONLY realtime channel into the UI.
@@ -45,6 +46,7 @@ export function useBackendStream(
       ws.onopen = () => {
         retriesRef.current = 0;
         setState((s) => ({ ...s, connected: true }));
+        log.info('Telemetry stream connected', { source: 'ws' });
         // Subscribe to telemetry channels (server default is all, but be explicit).
         ws.send(JSON.stringify({ type: 'subscribe', channels: channels ?? ['tick', 'log', 'alert', 'telemetry', 'risk', 'portfolio', 'order', 'system'] }));
       };
@@ -64,6 +66,11 @@ export function useBackendStream(
       ws.onclose = () => {
         setState((s) => ({ ...s, connected: false }));
         const delay = Math.min(30000, 3000 * Math.pow(1.6, retriesRef.current++));
+        log.warn('Telemetry stream disconnected — reconnecting', {
+          source: 'ws',
+          attempt: retriesRef.current,
+          nextRetryMs: delay,
+        });
         reconnectTimer.current = setTimeout(connect, delay);
       };
 

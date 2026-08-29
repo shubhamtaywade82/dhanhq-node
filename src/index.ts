@@ -2,14 +2,20 @@ import dotenv from "dotenv";
 import { startCore } from "./core";
 import Redis from "ioredis";
 import type { Core } from "./core";
+import { moduleLogger, logError } from "./lib/logger";
+import { attachBusLoggerBridge } from "./lib/busLoggerBridge";
 
 dotenv.config();
+
+const log = moduleLogger("sidecar");
 
 // Default Node behavior is to crash the process on these, which kills the whole `bin/dev`
 // foreman group (any Procfile process exiting triggers SIGTERM to all). This is an auxiliary
 // execution sidecar — it must never take the Rails trading daemon down with it.
-process.on("uncaughtException", (e) => console.error("[Sidecar] Uncaught exception:", e));
-process.on("unhandledRejection", (e) => console.error("[Sidecar] Unhandled rejection:", e));
+process.on("uncaughtException", (e) =>
+  log.fatal({ err: { name: e.name, message: e.message, stack: e.stack } }, "Uncaught exception"));
+process.on("unhandledRejection", (e: any) =>
+  log.fatal({ err: { name: e?.name, message: e?.message || String(e), stack: e?.stack } }, "Unhandled rejection"));
 
 /**
  * Headless sidecar entry (no HTTP server).
@@ -21,17 +27,17 @@ process.on("unhandledRejection", (e) => console.error("[Sidecar] Unhandled rejec
  * whether or not anything else is attached.
  */
 async function main() {
-  console.log("=================================================");
-  console.log("Starting DhanHQ-TS Execution Sidecar (headless)");
-  console.log(`Mode: ${process.env.TRADING_MODE || "paper"}`);
-  console.log("=================================================");
+  log.info({ mode: process.env.TRADING_MODE || "paper" }, "Starting DhanHQ-TS Execution Sidecar (headless)");
 
   try {
     const core = await startCore();
+    // Mirror EventBus telemetry into the structured stdout log — same
+    // unified stream as the HTTP server variant.
+    attachBusLoggerBridge();
     await listenForIntents(core);
-    console.log("[Sidecar] Process ready. Autonomous stack running; listening for Rails Redis intents.");
+    log.info("Process ready — autonomous stack running; listening for Rails Redis intents");
   } catch (e) {
-    console.error("[Sidecar] Initialization error:", e);
+    logError(log, "Initialization error", e);
   }
 }
 
@@ -45,22 +51,22 @@ async function listenForIntents(core: Core): Promise<void> {
 
   intentSubscriber.subscribe("dhan:execution:intents", (err) => {
     if (err) {
-      console.error("[Sidecar Executor] Subscribe error:", err.message);
+      log.error({ err: { message: err.message }, channel: "dhan:execution:intents" }, "Subscribe error");
       return;
     }
-    console.log("[Sidecar Executor] Subscribed to dhan:execution:intents");
+    log.info({ channel: "dhan:execution:intents" }, "Subscribed to execution intents");
   });
 
   intentSubscriber.on("message", async (channel, message) => {
     if (channel !== "dhan:execution:intents") return;
     try {
       const intent = JSON.parse(message);
-      console.log(`[Sidecar Executor] Processing intent ${intent.intent_id} (${intent.strategy})`);
+      log.info({ intentId: intent.intent_id, strategy: intent.strategy }, "Processing execution intent");
       const isLive = process.env.TRADING_MODE === "live";
       const engine = isLive ? core.live : core.paper;
       await engine.placeOrder(intent);
     } catch (e: any) {
-      console.error("[Sidecar Executor] Execution failed:", e.message);
+      logError(log, "Execution failed", e);
     }
   });
 }

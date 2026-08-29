@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws';
 import { eventBus, type Envelope, type Channel } from '../services/eventBus';
 import { marketClock } from '../services/marketHours';
+import { moduleLogger } from '../lib/logger';
 
 /**
  * WebSocket hub — the backend→frontend telemetry stream.
@@ -21,6 +22,8 @@ import { marketClock } from '../services/marketHours';
 const ALL_CHANNELS: Channel[] = ['tick', 'log', 'alert', 'telemetry', 'risk', 'portfolio', 'order', 'system'];
 const HYDRATION_CHANNELS: Channel[] = ['log', 'alert', 'telemetry'];
 
+const log = moduleLogger('ws');
+
 export class MarketStreamManager {
   private clients = new Map<WebSocket, { channels: Set<Channel>; send: (env: Envelope) => void }>();
 
@@ -32,7 +35,7 @@ export class MarketStreamManager {
       },
     };
     this.clients.set(ws, entry);
-    console.log(`[WS] Client connected. Total: ${this.clients.size}`);
+    log.info({ clients: this.clients.size }, 'WS client connected');
 
     // Hydrate with real recent history.
     for (const env of eventBus.recent(undefined, HYDRATION_CHANNELS).slice(-60)) {
@@ -60,7 +63,7 @@ export class MarketStreamManager {
 
   unsubscribe(ws: WebSocket): void {
     this.clients.delete(ws);
-    console.log(`[WS] Client disconnected. Total: ${this.clients.size}`);
+    log.info({ clients: this.clients.size }, 'WS client disconnected');
   }
 
   /** Attach the hub to the central bus (called once at boot). */

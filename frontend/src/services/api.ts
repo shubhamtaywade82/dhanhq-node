@@ -1,12 +1,52 @@
+import { log } from './logger';
+
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3003';
 
+/**
+ * Central API client.
+ *
+ * Every request carries an `x-request-id` (UUID) — the backend echoes
+ * it in logs AND on the response, so a failed order can be traced from
+ * the UI click through every backend log line. Failed requests are
+ * reported to the client-log ingest with endpoint, status, duration
+ * and the correlation id.
+ */
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
+  const requestId = crypto.randomUUID();
+  const started = performance.now();
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-request-id': requestId,
+        ...(options?.headers ?? {}),
+      },
+    });
+  } catch (e) {
+    // Network-level failure (backend down / DNS / CORS) — no response exists.
+    log.error('API unreachable', {
+      endpoint: path,
+      method: options?.method ?? 'GET',
+      durationMs: Math.round(performance.now() - started),
+      kind: 'network-error',
+    }, requestId);
+    throw e instanceof Error ? e : new Error(`Network error calling ${path}`);
+  }
+
+  const durationMs = Math.round(performance.now() - started);
+
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
+    log.error('API request failed', {
+      endpoint: path,
+      method: options?.method ?? 'GET',
+      status: res.status,
+      statusText: res.statusText,
+      durationMs,
+      serverError: body?.error,
+    }, requestId);
     throw new Error(body.error || `API ${res.status}: ${res.statusText}`);
   }
   return res.json();
