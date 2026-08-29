@@ -31,14 +31,14 @@ export function SidekiqInfra() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold flex items-center gap-1.5">
-            <Activity size={14} className="text-accent" /> Sidecar & Infrastructure Relay
+            <Activity size={14} className="text-accent" /> Autonomous Backend Services & Infrastructure
           </div>
-          <div className="text-[11px] text-muted mt-0.5">Real-time Node.js runtime, Redis Pub/Sub broker & PostgreSQL pool metrics</div>
+          <div className="text-[11px] text-muted mt-0.5">Live Node.js service telemetry (market data, risk, autonomy, agent) & PostgreSQL/Redis health — runs with or without this UI</div>
         </div>
         <div className="flex items-center gap-2">
           <Button onClick={fetchStats} disabled={loading} className="text-xs py-1">
             <RefreshCw size={12} className={`mr-1.5 ${loading ? 'animate-spin' : ''}`} />
-            {loading ? 'Refreshing...' : 'Refresh Relay'}
+            {loading ? 'Refreshing...' : 'Refresh'}
           </Button>
         </div>
       </div>
@@ -76,14 +76,14 @@ export function SidekiqInfra() {
 
       <Card className="p-4 space-y-2.5">
         <div className="flex items-center justify-between">
-          <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Active Sidecar Workers & Channels</div>
-          <span className="text-[10px] font-mono text-accent font-semibold">{workers.activeWorkers?.length || 4} Running</span>
+          <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Active Backend Services (autonomous core)</div>
+          <span className="text-[10px] font-mono text-accent font-semibold">{workers.activeWorkers?.length || 0} Running</span>
         </div>
         <div className="overflow-x-auto">
           <table className="data-table w-full">
             <thead>
               <tr>
-                {['JID', 'Worker Service', 'Queue', 'Started', 'Payload & Args', 'Elapsed'].map(h => (
+                {['Service ID', 'Service', 'State', 'Started', 'Live Telemetry', 'Uptime'].map(h => (
                   <th key={h} className="text-left px-2.5 py-1.5 text-muted font-medium border-b border-border text-[9.5px] uppercase tracking-[0.5px]">{h}</th>
                 ))}
               </tr>
@@ -93,7 +93,7 @@ export function SidekiqInfra() {
                 <tr key={w.jid} className="hover:bg-surface-200/50">
                   <td className="px-2.5 py-1.5 border-b border-border/60 text-muted text-[9.5px] font-mono">{w.jid}</td>
                   <td className="px-2.5 py-1.5 border-b border-border/60 text-white font-semibold text-xs">{w.name}</td>
-                  <td className="px-2.5 py-1.5 border-b border-border/60"><Badge status={w.queue === 'critical' ? 'REJECTED' : w.queue === 'ticks' ? 'TRADED' : 'PENDING'} /></td>
+                  <td className="px-2.5 py-1.5 border-b border-border/60"><Badge status={w.queue === 'KILLED' ? 'REJECTED' : w.queue === 'ws' || w.queue === 'running' || w.queue === 'armed' || w.queue === 'ollama' ? 'TRADED' : 'PENDING'} /></td>
                   <td className="px-2.5 py-1.5 border-b border-border/60 text-muted text-xs font-mono">{w.started}</td>
                   <td className="px-2.5 py-1.5 border-b border-border/60 text-muted text-[9.5px] font-mono">{w.args}</td>
                   <td className="px-2.5 py-1.5 border-b border-border/60 text-accent font-mono text-xs">{w.elapsed}</td>
@@ -110,7 +110,7 @@ export function SidekiqInfra() {
             <span className="flex items-center gap-2"><Cpu size={14} className="text-accent" /> Node.js V8 Engine Runtime</span>
             <span className="text-[10px] text-accent font-normal">PID {node.pid || '-'}</span>
           </div>
-          <div className="flex justify-between border-b border-border/50 pb-1.5"><span className="text-muted">Node Version</span><span className="text-white">{node.nodeVersion || 'v20.x'}</span></div>
+          <div className="flex justify-between border-b border-border/50 pb-1.5"><span className="text-muted">Node Version</span><span className="text-white">{node.nodeVersion || '—'}</span></div>
           <div className="flex justify-between border-b border-border/50 pb-1.5"><span className="text-muted">V8 Heap Used</span><span className="text-accent">{node.heapUsedMb || 0} MB / {node.heapTotalMb || 0} MB</span></div>
           <div className="flex justify-between border-b border-border/50 pb-1.5"><span className="text-muted">RSS Memory</span><span className="text-white">{node.rssMb || 0} MB</span></div>
           <div className="flex justify-between border-b border-border/50 pb-1.5"><span className="text-muted">Host Platform</span><span className="text-white">{node.platform || 'linux'}</span></div>

@@ -1,51 +1,28 @@
 import type { AppState } from '../store/types';
 
+/**
+ * Neutral initial state — NO fabricated data.
+ *
+ * Every field starts empty/zero and is populated exclusively from the
+ * backend: REST snapshot at boot, then live WebSocket telemetry.
+ * The backend is the single source of truth; this UI is a control plane.
+ */
 export const initialAppState: AppState = {
-  live: true,
+  live: false,
   killed: false,
   uptimeSeconds: 0,
-  latency: 18,
-  indices: {
-    NIFTY: { ltp: 24248.5, change: 85.3, pct: 0.35, high: 24300, low: 24100, open: 24163.2, prevClose: 24163.2, spot: 24248.5 },
-    BANKNIFTY: { ltp: 51842.15, change: -120.45, pct: -0.23, high: 52000, low: 51700, open: 51962.6, prevClose: 51962.6, spot: 51842.15 },
-    FINNIFTY: { ltp: 23156.8, change: 42.1, pct: 0.18, high: 23200, low: 23000, open: 23114.7, prevClose: 23114.7, spot: 23156.8 },
-    INDIAVIX: { ltp: 13.42, change: -0.25, pct: -1.8, high: 13.8, low: 13.2, open: 13.67, prevClose: 13.67, spot: 13.42 },
-  },
+  latency: 0,
+  indices: {},
   strategies: [],
   recentFills: [],
   orders: [],
   positions: [],
-  funds: { availableMargin: 1000000, usedMargin: 0, realizedPnl: 0, totalBalance: 1000000 },
-  circuitBreakers: [
-    { rule: 'Daily Loss Limit', threshold: '50,000', current: '-12,400', state: 'OK', action: 'Close all positions, trigger Dhan P&L exit' },
-    { rule: 'Margin Utilization', threshold: '70%', current: '49%', state: 'OK', action: 'Block new position opens' },
-    { rule: 'Single Strategy Loss', threshold: '-20,000', current: '-3,800', state: 'OK', action: 'Close offending strategy' },
-    { rule: 'Consecutive Losses', threshold: '5 trades', current: '2 trades', state: 'OK', action: 'Pause strategy 15 min' },
-    { rule: 'Order Rejection Rate', threshold: '>10% in 5min', current: '1/9 (11%)', state: 'WARN', action: 'Throttle order placement to 5/sec' },
-    { rule: 'Stale Market Tick (>3s)', threshold: 'Any feed', current: 'All fresh', state: 'OK', action: 'Pause strategies using stale data' },
-    { rule: 'Physical Settlement Proximity', threshold: 'T-1 day', current: 'T-2', state: 'OK', action: 'Force close all positions / convert' },
-    { rule: 'Sidekiq Queue Depth', threshold: '>100 jobs', current: '12 jobs', state: 'OK', action: 'Alert ops team & auto-scale workers' },
-  ],
-  alerts: [
-    { id: 1, time: '11:40:22', level: 'WARN', msg: 'Order rejection rate elevated: 1 rejection in last 5 minutes (11%). Sidekiq throttle worker engaged.', read: false },
-    { id: 2, time: '11:35:18', level: 'WARN', msg: 'NIFTY Bull Put Spread approaching stop-loss (-3,800 / -5,000 limit). AASM transition to :paused.', read: false },
-    { id: 3, time: '11:20:05', level: 'ERROR', msg: 'OrderPlacementWorker raised Dhan::InsufficientMargin on ORD-240128-007. Moved to Sidekiq retry set (2/3).', read: false },
-    { id: 4, time: '10:55:33', level: 'INFO', msg: 'Iron Condor delta neutralized via AdjustDeltaWorker. Portfolio delta: +0.03.', read: true },
-    { id: 5, time: '10:30:00', level: 'INFO', msg: 'Morning risk check passed via RiskCheckWorker. All circuit breakers green. Margin: 49%.', read: true },
-  ],
-  skWorkers: [
-    { jid: 'jid_a1b2c3', w: 'OrderMonitorWorker', q: 'critical', started: '11:42:18', args: '{order_id: "ORD-001"}', el: '0.3s' },
-    { jid: 'jid_d4e5f6', w: 'TickProcessorWorker', q: 'ticks', started: '11:42:17', args: '{inst: "NIFTY", ltp: 24248.5}', el: '0.1s' },
-    { jid: 'jid_g7h8i9', w: 'PnlCalculationWorker', q: 'default', started: '11:42:15', args: '{strategy_ids: [1,2,3]}', el: '1.2s' },
-    { jid: 'jid_j0k1l2', w: 'PositionReconcileWorker', q: 'default', started: '11:42:00', args: '{}', el: '8.5s' },
-  ],
-  skRetries: [
-    { jid: 'jid_y5z6a7', w: 'OrderPlacementWorker', q: 'critical', err: 'Dhan::InsufficientMargin (Exceeds available limit)', ret: 2, next: '11:45:00' },
-  ],
-  mmRows: [
-    { seg: 'NSE_FNO', tx: 'SELL', sec: '49081', qty: 50, prod: 'MARGIN', px: '198.2' },
-    { seg: 'NSE_FNO', tx: 'BUY', sec: '49082', qty: 50, prod: 'MARGIN', px: '165.8' },
-  ],
+  funds: { availableMargin: 0, usedMargin: 0, realizedPnl: 0, totalBalance: 0 },
+  circuitBreakers: [],
+  alerts: [],
+  skWorkers: [],
+  skRetries: [],
+  mmRows: [],
   agentRunning: false,
   agentStepNum: 0,
   agentStartTime: 0,
@@ -61,12 +38,7 @@ export const initialAppState: AppState = {
     risk: { status: 'idle', steps: 0 },
     critic: { status: 'idle', steps: 0 },
   },
-  ltmMemories: [
-    { date: 'Jan 27', note: 'NIFTY IVR dropped below 25 → straddle unprofitable, switched to credit spreads', sim: 0.89 },
-    { date: 'Jan 24', note: 'BANKNIFTY expiry day gamma spike → risk agent hedged wing protection', sim: 0.92 },
-    { date: 'Jan 20', note: 'Iron Condor on NIFTY at IVR 55 → best trade of month +12,400', sim: 0.85 },
-    { date: 'Jan 15', note: 'Physical settlement proximity auto-converted at T-1, avoided 2L block', sim: 0.78 },
-  ],
+  ltmMemories: [],
   logs: [],
   logIdCounter: 0,
   pnlHistory: [],

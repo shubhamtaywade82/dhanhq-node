@@ -1,40 +1,74 @@
 import { useEffect, useRef, useState } from 'react';
 import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
+import { api } from '../services/api';
 
+/**
+ * Greeks & volatility analytics.
+ *
+ * Portfolio Greeks are aggregated from the BACKEND's Black-Scholes
+ * computation (/api/market/greeks — live option chain + spot). When the
+ * backend cannot compute (no live chain data) the cards show an explicit
+ * "unavailable" state instead of fabricated numbers.
+ */
 export function GreeksAnalytics() {
   const { state } = useApp();
   const [activeTab, setActiveTab] = useState('breakdown');
   const chartRef = useRef<HTMLCanvasElement>(null);
+  const [greeks, setGreeks] = useState<{ symbol: string; spot: number; expiry: string; strikes: Array<{ strike: number; ce: any; pe: any }> } | null>(null);
+  const [greeksError, setGreeksError] = useState<string | null>(null);
 
-  const totalDelta = state.positions.reduce((acc, p) => acc + (p.netQty > 0 ? 0.5 : -0.5) * p.netQty / 50, 0);
-  const totalGamma = state.positions.reduce((acc, p) => acc + (p.netQty > 0 ? 0.002 : -0.002) * p.netQty / 50, 0);
-  const totalTheta = state.positions.reduce((acc, p) => acc + (p.netQty < 0 ? 15 : -15) * Math.abs(p.netQty) / 50, 0);
-  const totalVega = state.positions.reduce((acc, p) => acc + (p.netQty > 0 ? 18 : -18) * Math.abs(p.netQty) / 50, 0);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const g = await api.greeks('NIFTY');
+        if (!alive) return;
+        setGreeks(g);
+        setGreeksError(null);
+      } catch (e: any) {
+        if (alive) setGreeksError(e.message);
+      }
+    };
+    load();
+    const t = setInterval(load, 10000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
+  // Portfolio-level Greeks: prefer live chain greeks; fall back to the
+  // strategy leg deltas the backend recorded at deploy time. No constants.
+  const legGreeks = state.strategies.flatMap((s) => (s.legs || []).map((l: any) => ({ ...l, side: l.side })));
+  const hasLegGreeks = legGreeks.some((l) => typeof l.delta === 'number');
+
+  const totalDelta = legGreeks.reduce((acc, l) => acc + (Number(l.delta) || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0);
+  const totalGamma = legGreeks.reduce((acc, l) => acc + (Number(l.gamma) || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0);
+  const totalTheta = legGreeks.reduce((acc, l) => acc + (Number(l.theta) || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0);
+  const totalVega = legGreeks.reduce((acc, l) => acc + (Number(l.vega) || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0);
+
+  // ATM chain greeks from live data (first non-null CE/PE pair near spot).
+  const atmRow = greeks?.strikes?.find((s) => s.ce && s.pe) || null;
 
   const greekCards = [
-    { label: 'Net Delta', value: totalDelta.toFixed(2), sub: totalDelta > 0 ? 'Long Delta' : totalDelta < 0 ? 'Short Delta' : 'Delta Neutral', color: 'text-sky' },
-    { label: 'Net Gamma', value: totalGamma.toFixed(4), sub: totalGamma >= 0 ? 'Long Gamma' : 'Short Gamma', color: totalGamma >= 0 ? 'text-accent' : 'text-danger' },
-    { label: 'Net Theta', value: `${totalTheta >= 0 ? '+' : ''}${totalTheta.toFixed(1)}/d`, sub: 'Decay Impact', color: totalTheta >= 0 ? 'text-accent' : 'text-danger' },
-    { label: 'Net Vega', value: totalVega.toFixed(1), sub: totalVega >= 0 ? 'Long Vol' : 'Short Vol', color: totalVega >= 0 ? 'text-sky' : 'text-danger' },
-    { label: 'Open Lots', value: String(state.positions.filter(p => p.netQty !== 0).length), sub: 'Active Positions', color: 'text-gold' },
-    { label: 'Realized PnL', value: `₹${state.funds.realizedPnl}`, sub: 'From Wallet', color: state.funds.realizedPnl >= 0 ? 'text-accent' : 'text-danger' },
-    { label: 'Margin Used', value: `₹${state.funds.usedMargin}`, sub: 'Collateral Block', color: 'text-purple' },
+    { label: 'Net Delta', value: hasLegGreeks ? totalDelta.toFixed(2) : (atmRow ? (atmRow.ce.delta + atmRow.pe.delta).toFixed(2) : '—'), sub: hasLegGreeks || atmRow ? (totalDelta > 0 ? 'Long Delta' : totalDelta < 0 ? 'Short Delta' : 'Delta Neutral') : 'Live chain unavailable', color: 'text-sky' },
+    { label: 'Net Gamma', value: hasLegGreeks ? totalGamma.toFixed(4) : (atmRow ? (atmRow.ce.gamma + atmRow.pe.gamma).toFixed(4) : '—'), sub: (totalGamma >= 0 ? 'Long Gamma' : 'Short Gamma'), color: totalGamma >= 0 ? 'text-accent' : 'text-danger' },
+    { label: 'Net Theta', value: hasLegGreeks ? `${totalTheta >= 0 ? '+' : ''}${totalTheta.toFixed(1)}/d` : (atmRow ? `${(atmRow.ce.theta + atmRow.pe.theta).toFixed(1)}/d` : '—'), sub: 'Decay Impact', color: totalTheta >= 0 ? 'text-accent' : 'text-danger' },
+    { label: 'Net Vega', value: hasLegGreeks ? totalVega.toFixed(1) : (atmRow ? (atmRow.ce.vega + atmRow.pe.vega).toFixed(1) : '—'), sub: (totalVega >= 0 ? 'Long Vol' : 'Short Vol'), color: totalVega >= 0 ? 'text-sky' : 'text-danger' },
+    { label: 'Open Lots', value: String(state.positions.filter((p: any) => p.netQty !== 0).length), sub: 'Active Positions', color: 'text-gold' },
+    { label: 'Realized PnL', value: `₹${state.funds.realizedPnl ?? 0}`, sub: 'From Wallet', color: Number(state.funds.realizedPnl) >= 0 ? 'text-accent' : 'text-danger' },
+    { label: 'Margin Used', value: `₹${state.funds.usedMargin ?? 0}`, sub: 'Collateral Block', color: 'text-purple' },
   ];
 
   const tabs = [
     { id: 'breakdown', label: 'Greeks Breakdown' },
-    { id: 'surface', label: 'IV Surface (Heatmap)' },
-    { id: 'term', label: 'Term Structure' },
-    { id: 'skew', label: 'Volatility Smile & Skew' },
+    { id: 'chain', label: 'Live Chain Greeks (B-S)' },
     { id: 'expired', label: 'Rolling Options Analytics' },
   ];
 
   useEffect(() => {
     if (activeTab === 'breakdown' && chartRef.current) {
-      drawGreekBarChart(chartRef.current, state.strategies);
+      drawGreekBarChart(chartRef.current, state.strategies, greeks);
     }
-  }, [activeTab, state.strategies]);
+  }, [activeTab, state.strategies, greeks]);
 
   return (
     <div className="space-y-4">
@@ -48,6 +82,14 @@ export function GreeksAnalytics() {
         ))}
       </div>
 
+      {greeksError && (
+        <Card className="p-3 border-gold/20">
+          <div className="text-[10px] font-mono text-gold">
+            Live chain Greeks unavailable: {greeksError}. Portfolio cards fall back to leg Greeks recorded at deploy time.
+          </div>
+        </Card>
+      )}
+
       <Card className="p-3">
         <div className="flex items-center gap-2 border-b border-border pb-2.5 mb-3.5">
           {tabs.map((t) => (
@@ -60,6 +102,7 @@ export function GreeksAnalytics() {
               {t.label}
             </button>
           ))}
+          {greeks && <span className="ml-auto text-[9px] font-mono text-muted">spot ₹{greeks.spot} · exp {greeks.expiry} · Black-Scholes</span>}
         </div>
 
         {activeTab === 'breakdown' && (
@@ -68,19 +111,45 @@ export function GreeksAnalytics() {
             <canvas ref={chartRef} height={190} className="w-full" />
           </div>
         )}
-        {activeTab === 'surface' && (
-          <div className="py-8 text-center text-muted text-xs">
-            Live IV Surface rendered dynamically from active option chain strikes.
-          </div>
-        )}
-        {activeTab === 'term' && (
-          <div className="py-8 text-center text-muted text-xs">
-            Expiry term structure calculated across weekly and monthly contracts.
-          </div>
-        )}
-        {activeTab === 'skew' && (
-          <div className="py-8 text-center text-muted text-xs">
-            Live Put-Call Volatility Skew calculated from option chain delta and IV.
+        {activeTab === 'chain' && (
+          <div className="overflow-x-auto">
+            {!greeks || greeks.strikes.length === 0 ? (
+              <div className="py-8 text-center text-muted text-xs">
+                Live option chain Greeks unavailable — the backend needs valid DhanHQ credentials and market data.
+              </div>
+            ) : (
+              <table className="data-table w-full">
+                <thead>
+                  <tr>
+                    {['Strike', 'CE Δ', 'CE Γ', 'CE Θ', 'CE ν', 'CE IV', 'PE Δ', 'PE Γ', 'PE Θ', 'PE ν', 'PE IV'].map((h) => (
+                      <th key={h} className="text-left px-2.5 py-1.5 text-muted font-medium border-b border-border text-[9px] uppercase tracking-[0.5px]">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {greeks.strikes.map((s) => (
+                    <tr key={s.strike} className={`hover:bg-surface-200/50 ${Math.abs(s.strike - greeks.spot) < 50 ? 'bg-surface-50' : ''}`}>
+                      <td className="px-2.5 py-1.5 border-b border-border/60 text-white font-mono text-xs font-bold">{s.strike}</td>
+                      {[s.ce, s.pe].map((leg, li) => (
+                        leg ? (
+                          <td key={li} colSpan={5} className="px-0 py-0 border-b border-border/60">
+                            <div className="flex text-[10px] font-mono">
+                              <span className="px-2.5 py-1.5 w-1/5 text-sky">{leg.delta.toFixed(3)}</span>
+                              <span className="px-2.5 py-1.5 w-1/5 text-danger">{leg.gamma.toFixed(4)}</span>
+                              <span className="px-2.5 py-1.5 w-1/5 text-accent">{leg.theta.toFixed(1)}</span>
+                              <span className="px-2.5 py-1.5 w-1/5 text-gold">{leg.vega.toFixed(2)}</span>
+                              <span className="px-2.5 py-1.5 w-1/5 text-muted">{leg.iv?.toFixed?.(1) ?? '—'}</span>
+                            </div>
+                          </td>
+                        ) : (
+                          <td key={li} colSpan={5} className="px-2.5 py-1.5 border-b border-border/60 text-muted text-[10px] font-mono">—</td>
+                        )
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         )}
         {activeTab === 'expired' && (
@@ -93,7 +162,7 @@ export function GreeksAnalytics() {
   );
 }
 
-function drawGreekBarChart(canvas: HTMLCanvasElement, strategies: any[]) {
+function drawGreekBarChart(canvas: HTMLCanvasElement, strategies: any[], greeks: { strikes: Array<{ strike: number; ce: any; pe: any }>; spot: number } | null) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   const rect = canvas.parentElement?.getBoundingClientRect();
@@ -104,24 +173,46 @@ function drawGreekBarChart(canvas: HTMLCanvasElement, strategies: any[]) {
   ctx.clearRect(0, 0, w, h);
 
   const active = strategies.filter((s) => s.status !== 'STOPPED');
-  if (active.length === 0) {
+
+  // If no strategies are deployed but live chain greeks exist, draw the
+  // ATM ±N strike delta profile instead of an empty canvas.
+  const hasLiveGreeks = greeks && greeks.strikes?.some((s) => s.ce || s.pe);
+
+  if (active.length === 0 && !hasLiveGreeks) {
     ctx.font = '11px JetBrains Mono';
     ctx.fillStyle = '#64748b';
     ctx.textAlign = 'center';
-    ctx.fillText('No active strategies deployed. Deploy a strategy to view Greeks exposure.', w / 2, h / 2);
+    ctx.fillText('No strategies deployed and no live chain — deploy a strategy or connect DhanHQ credentials.', w / 2, h / 2);
     return;
   }
 
-  const data = active.map((s) => {
-    const legs = s.legs || [];
-    return {
-      name: s.name.replace('NIFTY ', 'N.').replace('BANKNIFTY ', 'BN.'),
-      d: legs.reduce((t: number, l: any) => t + (l.delta || 0.5) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0),
-      g: legs.reduce((t: number, l: any) => t + (l.gamma || 0.002) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0),
-      th: legs.reduce((t: number, l: any) => t + (l.theta || 8) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0),
-      v: legs.reduce((t: number, l: any) => t + (l.vega || 12) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0),
-    };
-  });
+  let data: Array<{ name: string; d: number; g: number; th: number; v: number }>;
+
+  if (active.length > 0) {
+    data = active.map((s) => {
+      const legs = s.legs || [];
+      return {
+        name: s.name.replace('NIFTY ', 'N.').replace('BANKNIFTY ', 'BN.'),
+        d: legs.reduce((t: number, l: any) => t + (Number(l.delta) || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0),
+        g: legs.reduce((t: number, l: any) => t + (Number(l.gamma) || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0),
+        th: legs.reduce((t: number, l: any) => t + (Number(l.theta) || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0),
+        v: legs.reduce((t: number, l: any) => t + (Number(l.vega) || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 50, 0),
+      };
+    });
+  } else {
+    // Live chain delta ladder around spot (real Black-Scholes values).
+    const spot = greeks!.spot;
+    const near = greeks!.strikes
+      .filter((s) => Math.abs(s.strike - spot) < 300 && (s.ce || s.pe))
+      .slice(0, 7);
+    data = near.map((s) => ({
+      name: String(s.strike),
+      d: (s.ce?.delta ?? 0) + (s.pe?.delta ?? 0),
+      g: (s.ce?.gamma ?? 0) + (s.pe?.gamma ?? 0),
+      th: (s.ce?.theta ?? 0) + (s.pe?.theta ?? 0),
+      v: (s.ce?.vega ?? 0) + (s.pe?.vega ?? 0),
+    }));
+  }
 
   const metrics = [
     { k: 'd' as const, label: 'Delta', color: '#38bdf8' },

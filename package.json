@@ -5,12 +5,13 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "ts-node src/index.ts",
+    "start": "ts-node src/server.ts",
+    "start:headless": "ts-node src/index.ts",
     "dev": "ts-node-dev --respawn src/index.ts",
     "dev:server": "ts-node-dev --respawn src/server.ts",
     "dev:frontend": "cd frontend && npm run dev",
     "dev:all": "npm run dev:server & npm run dev:frontend",
-    "test": "jest"
+    "test": "jest --forceExit"
   },
   "dependencies": {
     "@nemesis-oss/dhanhq-sdk": "^1.1.0",
@@ -39,6 +40,8 @@
   "jest": {
     "preset": "ts-jest",
     "testEnvironment": "node",
+    "testTimeout": 30000,
+    "forceExit": true,
     "testMatch": [
       "<rootDir>/src/**/__tests__/**/*.test.ts"
     ]

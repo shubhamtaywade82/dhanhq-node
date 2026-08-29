@@ -67,7 +67,9 @@ export function MarginRisk() {
   }, [showToast]);
 
   const rejectedOrders = state.orders.filter((o) => o.status === 'REJECTED').length;
-  const circuitBreakers = [
+  // Prefer the backend risk engine's live breaker evaluation (streamed over
+  // the WS risk channel); compute locally only as a fallback view.
+  const circuitBreakers = state.circuitBreakers.length > 0 ? state.circuitBreakers : [
     { rule: 'Daily Loss Limit', threshold: '₹50,000', current: fmtINR(realized), state: realized < -50000 ? 'TRIPPED' : realized < -35000 ? 'WARN' : 'OK', action: 'Close all positions, trigger Dhan P&L exit' },
     { rule: 'Margin Utilization', threshold: '70%', current: `${fmt(utilPct)}%`, state: utilPct > 80 ? 'TRIPPED' : utilPct > 70 ? 'WARN' : 'OK', action: 'Block new position opens' },
     { rule: 'Open Position Count', threshold: '10 active', current: `${state.positions.length} active`, state: state.positions.length > 8 ? 'WARN' : 'OK', action: 'Limit concurrency' },

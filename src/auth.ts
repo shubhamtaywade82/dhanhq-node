@@ -1,17 +1,45 @@
 import { DhanClient, DhanAuth } from "@nemesis-oss/dhanhq-sdk";
 import Redis from "ioredis";
-import axios from "axios";
+
+/**
+ * DhanHQ client factory.
+ *
+ * Token resolution order:
+ *   1. DHAN_ACCESS_TOKEN (direct)
+ *   2. Rails token authority (DHAN_AUTH_PROVIDER_URL + token)
+ *   3. Dhan TOTP (DHAN_CLIENT_ID + DHAN_PIN + DHAN_TOTP_SECRET)
+ *   4. Redis-held rotating token (dhan:auth:access_token)
+ *
+ * Redis is OPTIONAL: when unreachable the system still boots and trades
+ * with the token from steps 1-3 (pub/sub events become no-ops).
+ * NOTE: uses native fetch — axios was never a declared dependency.
+ */
 
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379/0";
-export const redisSubscriber = new Redis(redisUrl);
-export const redisPublisher = new Redis(redisUrl);
+
+function lazyRedis(url: string): Redis {
+  const r = new Redis(url, {
+    lazyConnect: false,
+    maxRetriesPerRequest: 1,
+    retryStrategy: (times) => (times > 5 ? null : Math.min(times * 1000, 10000)),
+    enableOfflineQueue: false,
+  });
+  r.on('error', (e) => { /* swallow — Redis is optional */ });
+  return r;
+}
+
+export const redisPublisher: Pick<Redis, 'publish' | 'set' | 'get' | 'ping' | 'info' | 'ttl' | 'keys'> & { status?: string } = lazyRedis(redisUrl);
+export const redisSubscriber = lazyRedis(redisUrl);
+export const redisAvailable = () => (redisPublisher as any).status === 'ready';
 
 // Fetches a fresh token from the Rails token authority (Tier 2).
 async function fetchTokenFromRails(baseUrl: string, bearerToken: string): Promise<string> {
-  const { data } = await axios.get(`${baseUrl}/api/dhan_access_token`, {
+  const res = await fetch(`${baseUrl.replace(/\/$/, '')}/api/dhan_access_token`, {
     headers: { Authorization: `Bearer ${bearerToken}`, Accept: "application/json" },
-    timeout: 5000,
+    signal: AbortSignal.timeout(5000),
   });
+  if (!res.ok) throw new Error(`Rails authority HTTP ${res.status}`);
+  const data = await res.json();
   const token = data.dhan_access_token || data.dhanaccesstoken;
   if (!token) throw new Error(`[Auth] Rails returned no token. Keys: ${Object.keys(data).join(", ")}`);
   return token;
@@ -21,18 +49,20 @@ async function fetchTokenFromRails(baseUrl: string, bearerToken: string): Promis
 export async function generateTokenViaTotp(clientId: string, pin: string, totpSecret: string): Promise<string> {
   const totp = DhanAuth.generateTotp(totpSecret);
   const authBaseUrl = process.env.DHAN_AUTH_BASE_URL || process.env.DHANHQ_BASE_URL || "https://auth.dhan.co";
-  const axiosInstance = axios.create({ baseURL: authBaseUrl, timeout: 5000 });
-  const res = await DhanAuth.generateAccessToken({ clientId, pin, totp }, { axiosInstance });
+  const res = await DhanAuth.generateAccessToken({ clientId, pin, totp });
   const token = res.accessToken;
   if (!token) throw new Error("[Auth] TOTP response did not contain access token");
 
-  await redisPublisher.set("dhan:auth:access_token", token, "EX", 82800).catch(() => {});
-  await redisPublisher.set("dhan:auth:client_id", clientId).catch(() => {});
+  if (redisAvailable()) {
+    await redisPublisher.set("dhan:auth:access_token", token, "EX", 82800).catch(() => {});
+    await redisPublisher.set("dhan:auth:client_id", clientId).catch(() => {});
+  }
   return token;
 }
 
 export async function createDhanClient(): Promise<DhanClient> {
-  const clientId = (await redisPublisher.get("dhan:auth:client_id")) || process.env.DHAN_CLIENT_ID || process.env.CLIENT_ID || "";
+  const clientId = (redisAvailable() ? await redisPublisher.get("dhan:auth:client_id").catch(() => null) : null)
+    || process.env.DHAN_CLIENT_ID || process.env.CLIENT_ID || "";
   const accessToken = process.env.DHAN_ACCESS_TOKEN;
   const authProviderUrl = process.env.DHAN_AUTH_PROVIDER_URL || process.env.DHAN_TOKEN_ENDPOINT;
   const authProviderToken = process.env.DHAN_AUTH_PROVIDER_TOKEN || process.env.DHAN_TOKEN_ACCESS_TOKEN;
@@ -70,10 +100,12 @@ export async function createDhanClient(): Promise<DhanClient> {
   const client = new DhanClient({
     clientId,
     tokenProvider: async () => {
-      const token = await redisPublisher.get("dhan:auth:access_token");
-      if (token) return token;
+      if (redisAvailable()) {
+        const token = await redisPublisher.get("dhan:auth:access_token").catch(() => null);
+        if (token) return token;
+      }
       if (pin && totpSecret) return generateTokenViaTotp(clientId, pin, totpSecret);
-      throw new Error("[Sidecar] Token missing in Redis and no TOTP credentials configured.");
+      throw new Error("[Sidecar] No DhanHQ credentials configured (set DHAN_ACCESS_TOKEN, TOTP secrets, or Redis token).");
     },
   });
 
@@ -82,6 +114,7 @@ export async function createDhanClient(): Promise<DhanClient> {
 }
 
 function setupTokenRotationSubscriber() {
+  if (!redisAvailable()) return;
   redisSubscriber.subscribe("dhan:auth:rotated", (err) => {
     if (err) console.error("[Sidecar] Failed to subscribe to dhan:auth:rotated:", err);
     else console.log("[Sidecar] Subscribed to dhan:auth:rotated channel.");

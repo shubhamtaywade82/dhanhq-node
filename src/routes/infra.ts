@@ -1,26 +1,45 @@
 import { Router } from 'express';
-import { pool } from '../db';
-import { redisPublisher } from '../auth';
+import { pool, dbMode } from '../db';
+import { redisPublisher, redisAvailable } from '../auth';
 import type { MarketStreamManager } from '../ws/marketStream';
+import type { MarketDataService } from '../services/marketData';
+import type { RiskEngine } from '../services/riskEngine';
+import type { AutonomyEngine } from '../services/autonomy';
+import type { AgentOrchestrator } from '../services/agent';
+import { marketClock } from '../services/marketHours';
 
-export function infraRoutes(streamManager?: MarketStreamManager) {
+/**
+ * Infrastructure stats — REAL runtime state only.
+ *
+ * The previous version fabricated "Sidekiq worker" rows (a Rails relic).
+ * This version reports the actual Node services that make the system
+ * autonomous: market data feed, risk engine, autonomy loop, agent
+ * orchestrator, plus honest PostgreSQL/Redis connection state.
+ */
+export function infraRoutes(
+  _streamManager: MarketStreamManager,
+  deps: { market: MarketDataService; risk: RiskEngine; autonomy: AutonomyEngine; agent: AgentOrchestrator; stream: MarketStreamManager },
+): Router {
   const router = Router();
 
   router.get('/stats', async (_req, res) => {
     try {
-      const [nodeStats, redisStats, pgStats, workersStats] = await Promise.all([
+      const [nodeStats, redisStats, pgStats, servicesStats] = await Promise.all([
         getNodeStats(),
         getRedisStats(),
         getPgStats(),
-        getWorkersStats(streamManager),
+        getServicesStats(deps),
       ]);
 
       res.json({
         timestamp: new Date().toISOString(),
+        clock: marketClock(),
         node: nodeStats,
         redis: redisStats,
         postgres: pgStats,
-        workers: workersStats,
+        services: servicesStats,
+        // Back-compat aliases for older UI builds:
+        workers: servicesStats,
       });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -47,14 +66,17 @@ function getNodeStats() {
 }
 
 async function getRedisStats() {
+  if (!redisAvailable()) {
+    return { status: 'DISCONNECTED', error: 'Redis unreachable (optional component)', latencyMs: -1 };
+  }
   const t0 = Date.now();
   try {
     await redisPublisher.ping();
     const latencyMs = Date.now() - t0;
     const rawInfo = await redisPublisher.info();
-    const parsed = parseRedisInfo(rawInfo);
-    const tokenTtl = await redisPublisher.ttl('dhan:auth:access_token');
-    const keys = await redisPublisher.keys('dhan:*');
+    const parsed = parseRedisInfo(String(rawInfo));
+    const tokenTtl = await redisPublisher.ttl('dhan:auth:access_token').catch(() => -2);
+    const keys = await redisPublisher.keys('dhan:*').catch(() => []);
 
     return {
       status: 'CONNECTED',
@@ -74,6 +96,14 @@ async function getRedisStats() {
 }
 
 async function getPgStats() {
+  if (dbMode() === 'memory') {
+    return {
+      status: 'DISCONNECTED',
+      error: 'PostgreSQL unreachable — running on in-memory paper state',
+      latencyMs: -1,
+      mode: 'memory',
+    };
+  }
   const t0 = Date.now();
   try {
     const [verRes, tablesRes] = await Promise.all([
@@ -89,6 +119,7 @@ async function getPgStats() {
     return {
       status: 'CONNECTED',
       latencyMs,
+      mode: 'postgres',
       version: verRes.rows[0]?.version?.split(' ')?.[1] || '16.x',
       pool: {
         total: pool.totalCount,
@@ -103,23 +134,61 @@ async function getPgStats() {
       })),
     };
   } catch (e: any) {
-    return { status: 'DISCONNECTED', error: e.message, latencyMs: -1 };
+    return { status: 'DISCONNECTED', error: e.message, latencyMs: -1, mode: 'memory' };
   }
 }
 
-function getWorkersStats(streamManager?: MarketStreamManager) {
+/**
+ * Real service telemetry. Each "worker" row is a live Node service with
+ * its actual state — no fabricated job counts.
+ */
+async function getServicesStats(deps: { market: MarketDataService; risk: RiskEngine; autonomy: AutonomyEngine; agent: AgentOrchestrator; stream: MarketStreamManager }) {
+  const market = deps.market.stats();
+  const risk = deps.risk.snapshot();
+  const autonomy = deps.autonomy.stats();
+  const agent = deps.agent.status();
+  const stream = deps.stream.stats();
   const uptime = Math.floor(process.uptime());
+
+  const services = [
+    {
+      jid: 'svc_market_data', name: 'MarketDataService', queue: market.wsConnected ? 'ws' : 'rest',
+      started: 'boot', args: `source=${market.source} instruments=${market.trackedInstruments} tickAge=${market.tickAgeSec ?? '∞'}s`,
+      elapsed: formatUptime(uptime),
+      detail: market,
+    },
+    {
+      jid: 'svc_risk_engine', name: 'RiskEngine', queue: risk.killed ? 'KILLED' : 'armed',
+      started: 'boot', args: `breakers=${risk.breakers?.filter((b) => b.state !== 'OK').length || 0} tripped`,
+      elapsed: formatUptime(uptime),
+      detail: { killed: risk.killed, killedReason: risk.killedReason },
+    },
+    {
+      jid: 'svc_autonomy', name: 'AutonomyEngine', queue: autonomy.enabled ? 'running' : 'paused',
+      started: 'boot', args: `cycles=${autonomy.cycles} last=${autonomy.lastCycleAgoSec ?? '∞'}s ago eod=${autonomy.eodDone}`,
+      elapsed: formatUptime(uptime),
+      detail: { clock: autonomy.clock },
+    },
+    {
+      jid: 'svc_agent', name: 'AgentOrchestrator', queue: agent.llm,
+      started: 'boot', args: `running=${agent.running} steps=${agent.steps} tools=${agent.toolCalls}`,
+      elapsed: formatUptime(uptime),
+      detail: agent,
+    },
+    {
+      jid: 'svc_ws_hub', name: 'WebSocketHub', queue: `${stream.clients} client(s)`,
+      started: 'boot', args: `channels=${stream.channels.join(',')}`,
+      elapsed: formatUptime(uptime),
+      detail: stream,
+    },
+  ];
+
   return {
-    processedJobs: 1420 + Math.floor(uptime * 1.5),
-    failedJobs: 0,
-    activeWorkersCount: 4,
+    processedJobs: autonomy.cycles + agent.steps,
+    failedJobs: risk.killed ? 1 : 0,
+    activeWorkersCount: services.length,
     concurrencyLimit: 10,
-    activeWorkers: [
-      { jid: 'jid_' + (1001 + (uptime % 100)), name: 'Dhan::MarketDataStreamWorker', queue: 'ticks', started: '09:15:00', args: '["IDX_I:13,25,27"]', elapsed: formatUptime(uptime) },
-      { jid: 'jid_' + (1002 + (uptime % 100)), name: 'Dhan::TokenAutoRotationWorker', queue: 'critical', started: '08:45:00', args: '["dhan:auth:rotated"]', elapsed: formatUptime(uptime + 1800) },
-      { jid: 'jid_' + (1003 + (uptime % 100)), name: 'Paper::ExecutionEngineWorker', queue: 'orders', started: '09:15:00', args: '["PostgreSQL::paper_orders"]', elapsed: formatUptime(uptime) },
-      { jid: 'jid_' + (1004 + (uptime % 100)), name: 'Market::OptionsBehaviorWorker', queue: 'analytics', started: '09:15:00', args: '["1m_rolling_candles"]', elapsed: formatUptime(uptime) },
-    ],
+    activeWorkers: services,
     retrySet: [],
   };
 }

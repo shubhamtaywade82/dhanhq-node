@@ -1,109 +1,83 @@
 import { WebSocket } from 'ws';
-import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
+import { eventBus, type Envelope, type Channel } from '../services/eventBus';
+import { marketClock } from '../services/marketHours';
 
-interface TickData {
-  securityId: string;
-  ltp: number;
-  change: number;
-  pctChange: number;
-  volume: number;
-  oi: number;
-  timestamp: number;
-}
+/**
+ * WebSocket hub — the backend→frontend telemetry stream.
+ *
+ * Protocol (frontend is a pure consumer):
+ *   Server → Client: { channel, ts, payload } envelopes on channels:
+ *     tick | log | alert | telemetry | risk | portfolio | order | system
+ *   Client → Server:
+ *     { type: 'subscribe', channels: [...] }   — filter (default: all)
+ *     { type: 'unsubscribe' }
+ *     { type: 'ping' }                          — server replies pong
+ *
+ * On connect the client receives a hydration snapshot
+ * (recent logs, alerts, telemetry, risk state) so a late-attaching UI
+ * shows real history immediately — no fabricated seed data.
+ */
 
-function isIndianMarketOpen(): boolean {
-  const now = new Date();
-  const istStr = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
-  const istDate = new Date(istStr);
-  const day = istDate.getDay();
-  if (day < 1 || day > 5) return false;
-  const minutes = istDate.getHours() * 60 + istDate.getMinutes();
-  return minutes >= 555 && minutes <= 930;
-}
+const ALL_CHANNELS: Channel[] = ['tick', 'log', 'alert', 'telemetry', 'risk', 'portfolio', 'order', 'system'];
+const HYDRATION_CHANNELS: Channel[] = ['log', 'alert', 'telemetry'];
 
 export class MarketStreamManager {
-  private clients: Set<WebSocket> = new Set();
-  private instruments: Array<{ securityId: string; exchangeSegment: string }> = [];
-  private tickInterval: ReturnType<typeof setInterval> | null = null;
-  private client: DhanClient;
-
-  constructor(client: DhanClient) {
-    this.client = client;
-  }
+  private clients = new Map<WebSocket, { channels: Set<Channel>; send: (env: Envelope) => void }>();
 
   subscribe(ws: WebSocket): void {
-    this.clients.add(ws);
-    console.log(`[Stream] Client subscribed. Total: ${this.clients.size}`);
+    const entry = {
+      channels: new Set<Channel>(ALL_CHANNELS),
+      send: (env: Envelope) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(env));
+      },
+    };
+    this.clients.set(ws, entry);
+    console.log(`[WS] Client connected. Total: ${this.clients.size}`);
 
-    if (!this.tickInterval) {
-      this.startPolling();
+    // Hydrate with real recent history.
+    for (const env of eventBus.recent(undefined, HYDRATION_CHANNELS).slice(-60)) {
+      try { entry.send(env); } catch { /* ignore */ }
     }
+    ws.send(JSON.stringify({
+      channel: 'system', ts: Date.now(),
+      payload: { type: 'connected', channels: ALL_CHANNELS, clock: marketClock() },
+    }));
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(String(raw));
+        if (msg.type === 'subscribe' && Array.isArray(msg.channels)) {
+          entry.channels = new Set<Channel>(msg.channels.filter((c: any) => ALL_CHANNELS.includes(c)));
+          ws.send(JSON.stringify({ channel: 'system', ts: Date.now(), payload: { type: 'subscribed', channels: [...entry.channels] } }));
+        } else if (msg.type === 'unsubscribe') {
+          entry.channels = new Set();
+        } else if (msg.type === 'ping') {
+          ws.send(JSON.stringify({ channel: 'system', ts: Date.now(), payload: { type: 'pong' } }));
+        }
+      } catch { /* malformed — ignore */ }
+    });
   }
 
   unsubscribe(ws: WebSocket): void {
     this.clients.delete(ws);
-    console.log(`[Stream] Client unsubscribed. Total: ${this.clients.size}`);
-
-    if (this.clients.size === 0 && this.tickInterval) {
-      clearInterval(this.tickInterval);
-      this.tickInterval = null;
-    }
+    console.log(`[WS] Client disconnected. Total: ${this.clients.size}`);
   }
 
-  addInstruments(instruments: Array<{ securityId: string; exchangeSegment: string }>): void {
-    this.instruments = instruments;
-    console.log(`[Stream] Tracking ${instruments.length} instruments`);
-  }
-
-  private startPolling(): void {
-    const symMap: Record<string, string> = {
-      '13': 'NIFTY',
-      '25': 'BANKNIFTY',
-      '27': 'FINNIFTY',
-      '26': 'INDIAVIX',
-    };
-    const secIds = Object.keys(symMap);
-
-    this.tickInterval = setInterval(async () => {
-      if (this.clients.size === 0 || !isIndianMarketOpen()) return;
-
-      try {
-        const quote = await this.client.marketFeed.quote({ IDX_I: secIds });
-        const idxData = (quote.data as any)?.IDX_I || {};
-
-        for (const [secId, sym] of Object.entries(symMap)) {
-          const d = idxData[secId];
-          if (!d) continue;
-
-          const ltp = Number(d.lastTradedPrice || d.ltp || 0);
-          const prevClose = Number(d.close || d.prevClose || ltp);
-
-          this.broadcast({
-            type: 'tick',
-            symbol: sym,
-            data: {
-              securityId: secId,
-              ltp,
-              change: ltp - prevClose,
-              pctChange: prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0,
-              volume: Number(d.volume || 0),
-              oi: Number(d.oi || 0),
-              timestamp: Date.now(),
-            },
-          });
+  /** Attach the hub to the central bus (called once at boot). */
+  attach(): void {
+    eventBus.attachWsClient((env) => {
+      for (const entry of this.clients.values()) {
+        if (entry.channels.has(env.channel)) {
+          try { entry.send(env); } catch { /* dead socket cleaned on close */ }
         }
-      } catch {
-        // Silent backoff on polling error
       }
-    }, 3000);
+    });
   }
 
-  private broadcast(message: any): void {
-    const payload = JSON.stringify(message);
-    for (const ws of this.clients) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(payload);
-      }
-    }
+  stats() {
+    return {
+      clients: this.clients.size,
+      channels: ALL_CHANNELS,
+    };
   }
 }

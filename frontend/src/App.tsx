@@ -18,7 +18,7 @@ import { SidekiqInfra } from "./pages/SidekiqInfra";
 import { Alerts } from "./pages/Alerts";
 import { Logs } from "./pages/Logs";
 import { Config } from "./pages/Config";
-import { useSimulation } from "./hooks/useSimulation";
+import { api } from "./services/api";
 import { openDeployStrategyModal } from "./pages/DeployModal";
 
 const PAGE_TITLES: Record<string, [string, string]> = {
@@ -40,9 +40,8 @@ const PAGE_TITLES: Record<string, [string, string]> = {
 };
 
 function AppInner() {
-  const { setState, openModal, closeModal, showToast, addSystemLog, refreshPortfolio } = useApp();
+  const { setState, openModal, closeModal, showToast, addSystemLog, refreshPortfolio, refreshControlState } = useApp();
   const [page, setPage] = useState(() => location.hash.replace('#', '') || 'dashboard');
-  useSimulation();
 
   useEffect(() => {
     const onHash = () => setPage(location.hash.replace('#', '') || 'dashboard');
@@ -89,7 +88,7 @@ function AppInner() {
           </button>
           <button
             className="px-4 py-[7px] rounded-md text-xs font-semibold bg-danger text-white hover:bg-[#ff5c78] transition-all"
-            onClick={() => {
+            onClick={async () => {
               const input = document.getElementById(
                 "killSwitchInput",
               ) as HTMLInputElement;
@@ -98,22 +97,29 @@ function AppInner() {
                 return;
               }
               closeModal();
-              setState((prev) => ({
-                ...prev,
-                killed: true,
-                live: false,
-                strategies: prev.strategies.map((s) => ({
-                  ...s,
-                  status: "STOPPED" as const,
-                  pnl: 0,
-                })),
-              }));
-              addSystemLog(
-                "ERROR",
-                "*** EMERGENCY KILL SWITCH ACTIVATED ***",
-                "risk_engine",
-              );
-              showToast("EMERGENCY KILL SWITCH ACTIVATED", "error");
+              try {
+                // REAL kill switch — executed by the backend risk engine:
+                // squares off every open position and halts the system.
+                const result = await api.armKillSwitch("Manual kill switch from control plane UI");
+                setState((prev) => ({
+                  ...prev,
+                  killed: true,
+                  live: false,
+                  strategies: prev.strategies.map((s) => ({
+                    ...s,
+                    status: "STOPPED" as const,
+                  })),
+                }));
+                addSystemLog(
+                  "ERROR",
+                  `*** EMERGENCY KILL SWITCH ACTIVATED (backend confirmed: ${result.status}, ${result.details?.positionsClosed ?? 0} positions closed) ***`,
+                  "risk_engine",
+                );
+                showToast(`KILL SWITCH ENGAGED — ${(result.details?.positionsClosed ?? 0)} position(s) squared off`, "error");
+                await Promise.all([refreshPortfolio(), refreshControlState()]);
+              } catch (e: any) {
+                showToast(`Kill switch failed: ${e.message}`, "error");
+              }
             }}
           >
             Execute Kill Switch

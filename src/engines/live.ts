@@ -1,42 +1,68 @@
-import { DhanClient, OrderTracker, PositionMonitor } from "@nemesis-oss/dhanhq-sdk";
-import { redisPublisher } from "../auth";
+import type { DhanClient, OrderTracker, PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
+import { redisPublisher } from '../auth';
+import { eventBus } from '../services/eventBus';
+import type { MarketDataService } from '../services/marketData';
+import type { RiskEngine } from '../services/riskEngine';
 
+/**
+ * Live execution engine — places REAL orders through DhanHQ v2.
+ *
+ * Order settlement uses the SDK's OrderTracker, which is fed by the
+ * DhanHQ order-update WebSocket (connected once at boot by
+ * MarketDataService). The register-before-place pattern ensures fast
+ * fills are captured.
+ */
 export class LiveExecutionEngine {
   private client: DhanClient;
   private tracker: OrderTracker;
   private monitor: PositionMonitor;
+  private market: MarketDataService;
+  private risk: RiskEngine;
 
-  constructor(client: DhanClient, tracker: OrderTracker, monitor: PositionMonitor) {
+  constructor(client: DhanClient, tracker: OrderTracker, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine) {
     this.client = client;
     this.tracker = tracker;
     this.monitor = monitor;
+    this.market = market;
+    this.risk = risk;
   }
 
-  async placeOrder(intent: any): Promise<void> {
+  async placeOrder(intent: any): Promise<any> {
     const { correlation_id, intent_id, params, risk_limits } = intent;
-    const { security_id, quantity, transaction_type, order_type = "MARKET", exchange_segment = "NSE_FNO", price = 0 } = params;
+    const { security_id, quantity, transaction_type, order_type = 'MARKET', exchange_segment = 'NSE_FNO', price = 0 } = params;
 
-    console.log(`[LiveExecutionEngine] Placing live order for correlationId: ${correlation_id}`);
+    // Risk gate — kill switch blocks live orders too.
+    const gate = this.risk.canTrade();
+    if (!gate.allowed) {
+      eventBus.log('WARN', `Live order BLOCKED for ${correlation_id}: ${gate.reason}`, 'live_engine');
+      eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
+      return { status: 'REJECTED', reason: gate.reason };
+    }
 
-    // This can never resolve today: OrderTracker.onOrderUpdate was only ever fed by the
-    // client.ws.orders.on("order", ...) listener this branch deleted (WS collided with
-    // Rails' own Dhan WebSocket clients — see the other commits on this branch). Reviving
-    // this live-intent path requires sourcing fills another way (e.g. Rails'
-    // Live::OrderUpdateHub over Redis) instead of re-opening a WebSocket here.
+    eventBus.log('TRADE', `Placing LIVE order ${transaction_type} ${quantity} × ${security_id} (${correlation_id})`, 'live_engine');
+
+    // Register the waiter BEFORE placing — a fast fill can beat the HTTP response.
     const settled = this.tracker.waitFor(correlation_id, { timeoutMs: 30000 });
 
     await this.client.orders.place({
       correlationId: correlation_id,
-      securityId: security_id,
+      securityId: String(security_id),
       exchangeSegment: exchange_segment,
       transactionType: transaction_type,
       orderType: order_type,
-      quantity: quantity,
-      price: price,
-      productType: "INTRADAY"
+      quantity,
+      price,
+      productType: params.product_type || 'INTRADAY',
     });
 
-    const fill = await settled;
+    let fill: any = null;
+    try {
+      fill = await settled;
+    } catch (e: any) {
+      // Timeout is not fatal — the order lives at the broker. Report pending.
+      eventBus.log('WARN', `Order ${correlation_id} placed but settlement not observed yet (${e.message})`, 'live_engine');
+      fill = { status: 'PENDING', filledQuantity: 0, averagePrice: price };
+    }
 
     const fillPayload = {
       intent_id,
@@ -45,25 +71,25 @@ export class LiveExecutionEngine {
       fill_price: fill.averagePrice || price,
       quantity: fill.filledQuantity || quantity,
       security_id,
-      filled_at: new Date().toISOString()
+      filled_at: new Date().toISOString(),
     };
 
-    await redisPublisher.publish("dhan:execution:fills", JSON.stringify(fillPayload));
+    eventBus.emit('order', { kind: 'fill', ...fillPayload });
+    await redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
-    // Dead until ticks are re-sourced: PositionMonitor.onTick (the only path that ever
-    // emits "exit") has no caller now that the market WS is gone. Tracking a position here
-    // has no effect until ticks feed the monitor another way (e.g. Rails' Live::TickCache
-    // via Redis instead of a direct WS subscription).
-    if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop)) {
+    if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {
       this.monitor.track({
-        securityId: security_id,
-        exchangeSegment: exchange_segment as any,
+        securityId: String(security_id),
+        exchangeSegment: exchange_segment,
         quantity: fill.filledQuantity || quantity,
         entryPrice: fill.averagePrice || price,
         stopLoss: risk_limits.stop_loss,
         target: risk_limits.target,
-        trail: risk_limits.trailing_stop
+        trail: risk_limits.trailing_stop,
       });
     }
+
+    this.market.addInstruments([{ securityId: String(security_id), exchangeSegment: exchange_segment }]);
+    return fill;
   }
 }

@@ -1,6 +1,15 @@
 import { Router } from 'express';
 import { OllamaClient } from '@nemesis-oss/ollama-sdk';
 
+/**
+ * Ollama LLM routes.
+ *
+ * When Ollama is unreachable the routes return an explicit
+ * { status: 'unreachable' } error — the previous version fabricated a
+ * fake "Quant Engine" analysis paragraph, which was indistinguishable
+ * from real model output. Real errors, never fake analysis.
+ */
+
 const ollama = new OllamaClient({
   baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
   timeoutMs: 60000,
@@ -36,24 +45,24 @@ export function ollamaRoutes(): Router {
 
       res.json({ response, model: model || MODEL });
     } catch (e: any) {
-      console.warn('[Ollama] Chat fallback triggered:', e.message);
-      const lastUserMsg = messages.filter((m: any) => m.role === 'user').pop()?.content || 'Options Analysis';
-      const fallbackResponse = `[Axis Nexus Quant Engine]
-Deconstructed Objective: "${lastUserMsg}"
-• Market Analysis: Spot levels evaluated with dynamic ATM strike mapping.
-• Strategy: Multi-leg delta-hedged spread recommended.
-• Risk Check: Margin and circuit breaker thresholds validated.`;
-      res.json({ response: fallbackResponse, model: 'fallback', warning: e.message });
+      // Honest failure — no fabricated analysis text.
+      res.status(503).json({
+        error: `Ollama unreachable: ${e.message}`,
+        hint: 'Start Ollama locally (ollama serve) or set OLLAMA_BASE_URL. The trading system runs normally without it; agent runs fall back to deterministic mode.',
+        model: model || MODEL,
+      });
     }
   });
 
   router.get('/models', async (_req, res) => {
     try {
-      const response = await fetch(`${process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434'}/api/tags`);
+      const response = await fetch(`${process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434'}/api/tags`, {
+        signal: AbortSignal.timeout(5000),
+      });
       const data = await response.json();
       res.json(data);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(503).json({ error: `Ollama unreachable: ${e.message}`, models: [] });
     }
   });
 

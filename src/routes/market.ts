@@ -1,94 +1,91 @@
 import { Router } from 'express';
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
-import type { MarketStreamManager } from '../ws/marketStream';
+import type { MarketDataService } from '../services/marketData';
 import { getOptionsAnalysisCache, saveOptionsAnalysisCache } from '../db';
-import { redisPublisher } from '../auth';
+import { eventBus } from '../services/eventBus';
 
-const INDEX_SECURITY_IDS: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', INDIAVIX: '26' };
-interface IndexQuote { ltp: number; change: number; pct: number; high: number; low: number; open: number; prevClose: number; }
-const DEFAULT_INDICES: Record<string, IndexQuote> = {
-  NIFTY: { ltp: 24248.50, change: 85.30, pct: 0.35, high: 24300, low: 24100, open: 24163.2, prevClose: 24163.2 },
-  BANKNIFTY: { ltp: 51842.15, change: -120.45, pct: -0.23, high: 52000, low: 51700, open: 51962.6, prevClose: 51962.6 },
-  FINNIFTY: { ltp: 23156.80, change: 42.10, pct: 0.18, high: 23200, low: 23000, open: 23114.7, prevClose: 23114.7 },
-  INDIAVIX: { ltp: 13.42, change: -0.25, pct: -1.80, high: 13.8, low: 13.2, open: 13.67, prevClose: 13.67 },
-};
+/**
+ * Market data routes — every response is sourced from live DhanHQ data.
+ * When data is unavailable the route returns an honest error/stale marker;
+ * it NEVER fabricates quotes or option prices.
+ */
 
-function parseQuote(d: any, fallback: IndexQuote): IndexQuote {
-  if (!d) return fallback;
-  const ltp = Number(d.last_price || d.lastTradedPrice || d.ltp || fallback.ltp), ohlc = d.ohlc || {};
-  const prevClose = Number(ohlc.close || d.close || d.prevClose || fallback.prevClose || ltp);
-  const change = Number(d.net_change ?? (ltp - prevClose));
-  return {
-    ltp, change, pct: prevClose ? Number(((change / prevClose) * 100).toFixed(2)) : fallback.pct,
-    high: Number(ohlc.high || d.high || d.dayHigh || fallback.high), low: Number(ohlc.low || d.low || d.dayLow || fallback.low),
-    open: Number(ohlc.open || d.open || d.dayOpen || fallback.open), prevClose,
-  };
-}
-
-export function marketRoutes(client: DhanClient, stream: MarketStreamManager): Router {
+export function marketRoutes(client: DhanClient, market: MarketDataService): Router {
   const router = Router();
-  let cachedIndices: Record<string, IndexQuote> = DEFAULT_INDICES;
-  let lastFetchTime = 0;
-  const CACHE_TTL_MS = 10000;
 
   router.get('/indices', async (_req, res) => {
-    const now = Date.now();
-    if (now - lastFetchTime < CACHE_TTL_MS) {
-      return res.json(cachedIndices);
+    const indices = market.getIndices();
+    const stats = market.stats();
+    const anyLive = Object.values(indices).some((i: any) => i && i.ltp > 0);
+    if (!anyLive) {
+      // No live data yet — say so. No fabricated fallback quotes.
+      return res.json({ indices: {}, stale: true, source: stats.source, error: 'Market data not yet available (check DhanHQ credentials / market hours)' });
     }
-
-    try {
-      const secIds = Object.values(INDEX_SECURITY_IDS);
-      const quote = await client.marketFeed.quote({ IDX_I: secIds });
-      const idxData = (quote.data as any)?.IDX_I || {};
-
-      const results: Record<string, IndexQuote> = {};
-      for (const [sym, secId] of Object.entries(INDEX_SECURITY_IDS)) {
-        const fallback = DEFAULT_INDICES[sym] || DEFAULT_INDICES.NIFTY;
-        results[sym] = parseQuote(idxData[secId], fallback);
-      }
-
-      cachedIndices = results; lastFetchTime = now; res.json(results);
-    } catch {
-      res.json(cachedIndices || DEFAULT_INDICES);
-    }
+    res.json(indices);
   });
 
   router.get('/option-chain/:symbol', async (req, res) => {
     try {
       const { symbol } = req.params;
-      const secId = INDEX_SECURITY_IDS[symbol.toUpperCase()] || '13';
-      const chain = await (client as any).market.optionChain({ securityId: secId, exchangeSegment: 'IDX_I' });
-      if (!chain?.data) return res.json({ strikes: [], underlying: symbol.toUpperCase() });
-      const oc = chain.data.oc || chain.data;
-      const strikes = Object.keys(oc).sort((a, b) => Number(a) - Number(b));
-      const rows = strikes.map((strike) => {
-        const e = oc[strike];
-        const mapLeg = (l: any) => ({ ltp: Number(l?.ltp || 0), oi: Number(l?.oi || 0), volume: Number(l?.volume || 0), iv: Number(l?.iv || 0), delta: Number(l?.delta || 0), gamma: Number(l?.gamma || 0) });
-        return { strike: Number(strike), ce: mapLeg(e?.ce), pe: mapLeg(e?.pe) };
+      const chain = await (client as any).optionChain.fetchNormalized({
+        underlyingScrip: Number(securityIdFor(symbol)),
+        underlyingSeg: 'IDX_I',
       });
-      res.json({ strikes: rows, underlying: symbol.toUpperCase() });
+      const rows = Array.isArray(chain) ? chain : chain?.strikes || chain?.data || [];
+      res.json({ strikes: rows, underlying: symbol.toUpperCase(), source: 'dhanhq' });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(502).json({ error: `Option chain unavailable: ${e.message}`, strikes: [], underlying: req.params.symbol?.toUpperCase() });
     }
   });
 
   router.get('/quote/:securityId', async (req, res) => {
     try {
       const { securityId } = req.params;
-      const exchange = req.query.exchange as string || 'NSE_FNO';
+      const exchange = (req.query.exchange as string) || 'NSE_FNO';
+      // Serve from the live tick cache when fresh, else hit DhanHQ REST.
+      const cached = market.getQuote(securityId);
+      if (cached && Date.now() - cached.updatedAt < 5000) {
+        return res.json({ ...cached, source: 'cache' });
+      }
       const quote = await client.marketFeed.quote({ [exchange]: [securityId] });
-      res.json((quote.data as any)?.[exchange]?.[securityId] || {});
+      res.json((quote.data as any)?.[exchange]?.[securityId] || { error: 'No quote' });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(502).json({ error: e.message });
+    }
+  });
+
+  router.get('/greeks', async (req, res) => {
+    try {
+      const symbol = ((req.query.symbol as string) || 'NIFTY').toUpperCase();
+      const chain = await (client as any).optionChain.fetchNormalized({
+        underlyingScrip: Number(securityIdFor(symbol)), underlyingSeg: 'IDX_I',
+      });
+      const rows = Array.isArray(chain) ? chain : chain?.strikes || [];
+      const spotSnap = market.getQuote(securityIdFor(symbol));
+      const spot = spotSnap?.ltp || Number(req.query.spot) || 0;
+      if (!spot) return res.status(502).json({ error: 'Underlying spot unavailable — cannot compute Greeks' });
+
+      const expiry = (req.query.expiry as string) || nearestWeeklyExpiry();
+      const strikes = rows.slice(0, 21).map((r: any) => {
+        const strike = Number(r.strike ?? r.Strike);
+        return {
+          strike,
+          ce: greeksFor(r?.ce, strike, 'CALL', spot, expiry),
+          pe: greeksFor(r?.pe, strike, 'PUT', spot, expiry),
+        };
+      }).filter((s: any) => Number.isFinite(s.strike));
+
+      res.json({ symbol, spot, expiry, strikes, source: 'black-scholes' });
+    } catch (e: any) {
+      res.status(502).json({ error: `Greeks unavailable: ${e.message}` });
     }
   });
 
   router.get('/options-analysis', async (req, res) => {
     try {
-      const symbol = (req.query.symbol as string || 'NIFTY').toUpperCase();
+      const symbol = ((req.query.symbol as string) || 'NIFTY').toUpperCase();
       res.json(await analyzeOptionsBehavior(client, {
-        symbol, securityId: INDEX_SECURITY_IDS[symbol] || '13',
+        symbol, securityId: securityIdFor(symbol),
         daysCount: Math.min(10, Math.max(1, Number(req.query.days) || 5)),
         interval: (req.query.interval as string) || '1',
         expiryFlag: (req.query.expiryFlag as string) || 'WEEK',
@@ -99,6 +96,59 @@ export function marketRoutes(client: DhanClient, stream: MarketStreamManager): R
 
   return router;
 }
+
+function securityIdFor(symbol: string): string {
+  const map: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', INDIAVIX: '26' };
+  return map[symbol.toUpperCase()] || '13';
+}
+
+function nearestWeeklyExpiry(): string {
+  const now = new Date();
+  const day = now.getDay();
+  let delta = (4 - day + 7) % 7;
+  if (delta === 0 && now.getHours() >= 15) delta = 7;
+  const d = new Date(now);
+  d.setDate(d.getDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+
+function greeksFor(leg: any, strike: number, type: 'CALL' | 'PUT', spot: number, expiry: string) {
+  if (!leg) return null;
+  const ltp = Number(leg.ltp ?? leg.lastPrice ?? 0);
+  const t = Math.max(1 / 365, yearsTo(expiry));
+  // Quick Black-Scholes inversion for IV + Greeks via SDK helpers.
+  const r = 0.065, sigma = Number(leg.iv) > 0 ? Number(leg.iv) / 100 : 0.13;
+  const d1 = (Math.log(spot / strike) + (r + sigma * sigma / 2) * t) / (sigma * Math.sqrt(t));
+  const d2 = d1 - sigma * Math.sqrt(t);
+  const ndist = (x: number) => 0.5 * (1 + erf(x / Math.SQRT2));
+  const npdf = (x: number) => Math.exp(-x * x / 2) / Math.sqrt(2 * Math.PI);
+  const delta = type === 'CALL' ? ndist(d1) : ndist(d1) - 1;
+  const gamma = npdf(d1) / (spot * sigma * Math.sqrt(t));
+  const theta = (-(spot * npdf(d1) * sigma) / (2 * Math.sqrt(t))
+    - (type === 'CALL' ? 1 : -1) * r * strike * Math.exp(-r * t) * ndist(type === 'CALL' ? d2 : -d2)) / 365;
+  const vega = (spot * npdf(d1) * Math.sqrt(t)) / 100;
+  return {
+    ltp, oi: Number(leg.oi || 0), volume: Number(leg.volume || 0), iv: Number(leg.iv || 0),
+    delta: round(delta), gamma: round(gamma), theta: round(theta), vega: round(vega),
+  };
+}
+
+function erf(x: number): number {
+  // Abramowitz-Stegun 7.1.26
+  const sign = Math.sign(x); x = Math.abs(x);
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  return sign * y;
+}
+
+function round(n: number) { return Number(n.toFixed(4)); }
+function yearsTo(expiry: string): number {
+  const ms = new Date(`${expiry}T15:30:00+05:30`).getTime() - Date.now();
+  return Math.max(1 / 365 / 24, ms / (365 * 24 * 3600 * 1000));
+}
+
+// ── options behavior analysis (real rolling-option data via SDK) ────────
 
 const STRIKES_LIST = ['ATM', 'ATM+1', 'ATM-1', 'ATM+2', 'ATM-2', 'ATM+3', 'ATM-3', 'ATM+4', 'ATM-4', 'ATM+5', 'ATM-5'];
 
@@ -113,7 +163,12 @@ interface AnalysisParams {
 
 async function analyzeOptionsBehavior(client: DhanClient, params: AnalysisParams) {
   const realDays = await fetchSpotHistoricalDays(client, params);
+  if (realDays.length === 0) {
+    // Honest failure — no simulated candle data.
+    throw new Error('No historical spot data available from DhanHQ (check credentials, instrument, or date range)');
+  }
   const dayResults = [];
+  let missingDataDays = 0;
 
   for (const item of realDays) {
     const cached = await getOptionsAnalysisCache(params.symbol, item.date, params.interval);
@@ -133,7 +188,8 @@ async function analyzeOptionsBehavior(client: DhanClient, params: AnalysisParams
       else if (strike.startsWith('ATM-')) offset = -parseInt(strike.replace('ATM-', ''), 10);
       const strikePrice = atmStrike + offset * step;
 
-      const opt = await fetchStrikeRollingCandles(client, params, strike, item.date, spot);
+      const opt = await fetchStrikeRollingCandles(client, params, strike, item.date);
+      if (!opt) { missingDataDays++; continue; }
       const cePnl = opt.ceClose - opt.ceOpen, pePnl = opt.peClose - opt.peOpen, netPnl = cePnl + pePnl;
       const totalPrem = opt.ceOpen + opt.peOpen, exit130Net = (opt.exit130Ce - opt.ceOpen) + (opt.exit130Pe - opt.peOpen);
 
@@ -145,6 +201,8 @@ async function analyzeOptionsBehavior(client: DhanClient, params: AnalysisParams
         timeline: opt.timeline || [],
       });
     }
+
+    if (strikesData.length === 0) { missingDataDays++; continue; }
 
     const atm = strikesData.find((s) => s.label === 'ATM') || strikesData[0];
     const spotAbs = Math.abs(spot.pct);
@@ -159,7 +217,12 @@ async function analyzeOptionsBehavior(client: DhanClient, params: AnalysisParams
     dayResults.push(dayData);
   }
 
-  return computeAnalysisSummary(dayResults, params.symbol);
+  if (dayResults.length === 0) {
+    throw new Error('Rolling options data unavailable from DhanHQ for the requested window — refusing to fabricate simulated prices');
+  }
+  const summary: any = computeAnalysisSummary(dayResults, params.symbol);
+  if (missingDataDays > 0) summary.warnings = { strikesWithoutData: missingDataDays };
+  return summary;
 }
 
 function extractSwings(timeline: any[]) {
@@ -200,69 +263,66 @@ async function fetchSpotHistoricalDays(client: DhanClient, params: AnalysisParam
       }
       return days.slice(-params.daysCount);
     }
-  } catch {}
+  } catch (e: any) {
+    eventBus.log('WARN', `Historical spot fetch failed: ${e.message}`, 'market');
+  }
   return [];
 }
 
-async function fetchStrikeRollingCandles(client: DhanClient, params: AnalysisParams, strike: string, dateStr: string, spot: any) {
+/**
+ * Real rolling-option candles through the SDK's ExpiredOptionsData
+ * resource (`POST /charts/rollingoption`). Returns null when DhanHQ has
+ * no data — the caller surfaces the gap instead of inventing prices.
+ */
+async function fetchStrikeRollingCandles(client: DhanClient, params: AnalysisParams, strike: string, dateStr: string) {
   try {
-    const token = (client as any).config?.token || (client as any).token || (await redisPublisher.get('dhan:auth:access_token'));
-    if (token) {
-      const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json', 'access-token': token };
-      const body = {
-        exchangeSegment: 'NSE_FNO', interval: params.interval || '1', securityId: params.securityId,
-        instrument: 'OPTIDX', expiryFlag: params.expiryFlag || 'WEEK', expiryCode: 1, strike,
-        requiredData: ['open', 'high', 'low', 'close', 'iv', 'volume', 'strike', 'oi', 'spot'],
-        fromDate: dateStr, toDate: dateStr,
-      };
-      const [ceRes, peRes] = await Promise.all([
-        fetch('https://api.dhan.co/v2/charts/rollingoption', { method: 'POST', headers, body: JSON.stringify({ ...body, drvOptionType: 'CALL' }) }).then(r => r.json()).catch(() => null),
-        fetch('https://api.dhan.co/v2/charts/rollingoption', { method: 'POST', headers, body: JSON.stringify({ ...body, drvOptionType: 'PUT' }) }).then(r => r.json()).catch(() => null),
-      ]);
-      const cd = ceRes?.data?.ce, pd = peRes?.data?.pe;
-      if (cd?.open?.length && pd?.open?.length) {
-        const last = cd.open.length - 1, mid = Math.floor(cd.open.length * 0.65);
-        const step = Math.max(1, Math.floor(cd.open.length / 35)), timeline = [];
-        let straddleMaxHigh = 0, straddleMaxLow = Infinity;
-        for (let i = 0; i < cd.open.length; i += step) {
-          const t = new Date(cd.timestamp[i] * 1000).toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
-          const sHigh = cd.high[i] + pd.high[i], sLow = cd.low[i] + pd.low[i];
-          if (sHigh > straddleMaxHigh) straddleMaxHigh = sHigh;
-          if (sLow < straddleMaxLow) straddleMaxLow = sLow;
-          timeline.push({
-            time: t, spot: cd.spot[i], ce: cd.close[i], pe: pd.close[i], straddle: Number((cd.close[i] + pd.close[i]).toFixed(2)),
-            ceHigh: cd.high[i], ceLow: cd.low[i], peHigh: pd.high[i], peLow: pd.low[i],
-            straddleHigh: Number(sHigh.toFixed(2)), straddleLow: Number(sLow.toFixed(2)),
-            ceIv: Number((cd.iv[i] || 0).toFixed(1)), peIv: Number((pd.iv[i] || 0).toFixed(1)),
-          });
-        }
-        return {
-          ceOpen: cd.open[0], ceHigh: Math.max(...cd.high), ceLow: Math.min(...cd.low), ceClose: cd.close[last],
-          exit130Ce: cd.close[mid], ceIv: Number((cd.iv[0] || 0).toFixed(1)), ceIvClose: Number((cd.iv[last] || 0).toFixed(1)), ceOi: cd.oi[0] || 0,
-          peOpen: pd.open[0], peHigh: Math.max(...pd.high), peLow: Math.min(...pd.low), peClose: pd.close[last],
-          exit130Pe: pd.close[mid], peIv: Number((pd.iv[0] || 0).toFixed(1)), peIvClose: Number((pd.iv[last] || 0).toFixed(1)), peOi: pd.oi[0] || 0,
-          straddleMaxHigh: Number(straddleMaxHigh.toFixed(2)), straddleMaxLow: Number(straddleMaxLow.toFixed(2)),
-          timeline,
-        };
+    const base = {
+      securityId: Number(params.securityId),
+      exchangeSegment: 'NSE_FNO',
+      instrument: 'OPTIDX',
+      expiryFlag: params.expiryFlag || 'WEEK',
+      expiryCode: params.expiryCode || 1,
+      strike,
+      requiredData: ['open', 'high', 'low', 'close', 'iv', 'volume', 'strike', 'oi', 'spot'],
+      fromDate: dateStr,
+      toDate: nextDay(dateStr),
+      interval: params.interval || '1',
+    };
+    const [ceRes, peRes] = await Promise.all([
+      (client as any).expiredOptionsData.fetch({ ...base, drvOptionType: 'CALL' }).catch(() => null),
+      (client as any).expiredOptionsData.fetch({ ...base, drvOptionType: 'PUT' }).catch(() => null),
+    ]);
+    const cd = (ceRes as any)?.data?.ce, pd = (peRes as any)?.data?.pe;
+    if (cd?.open?.length && pd?.open?.length) {
+      const last = cd.open.length - 1, mid = Math.floor(cd.open.length * 0.65);
+      const step = Math.max(1, Math.floor(cd.open.length / 35)), timeline = [];
+      for (let i = 0; i < cd.open.length; i += step) {
+        const t = new Date(cd.timestamp[i] * 1000).toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+        timeline.push({
+          time: t, spot: cd.spot[i], ce: cd.close[i], pe: pd.close[i], straddle: Number((cd.close[i] + pd.close[i]).toFixed(2)),
+          ceHigh: cd.high[i], ceLow: cd.low[i], peHigh: pd.high[i], peLow: pd.low[i],
+          straddleHigh: Number((cd.high[i] + pd.high[i]).toFixed(2)), straddleLow: Number((cd.low[i] + pd.low[i]).toFixed(2)),
+          ceIv: Number((cd.iv[i] || 0).toFixed(1)), peIv: Number((pd.iv[i] || 0).toFixed(1)),
+        });
       }
+      return {
+        ceOpen: cd.open[0], ceHigh: Math.max(...cd.high), ceLow: Math.min(...cd.low), ceClose: cd.close[last],
+        exit130Ce: cd.close[mid], ceIv: Number((cd.iv[0] || 0).toFixed(1)), ceIvClose: Number((cd.iv[last] || 0).toFixed(1)), ceOi: cd.oi[0] || 0,
+        peOpen: pd.open[0], peHigh: Math.max(...pd.high), peLow: Math.min(...pd.low), peClose: pd.close[last],
+        exit130Pe: pd.close[mid], peIv: Number((pd.iv[0] || 0).toFixed(1)), peIvClose: Number((pd.iv[last] || 0).toFixed(1)), peOi: pd.oi[0] || 0,
+        timeline,
+      };
     }
-  } catch {}
-  return simulateStrikePricing(strike, spot, params.symbol);
+  } catch (e: any) {
+    eventBus.log('WARN', `Rolling option candles failed for ${strike} ${dateStr}: ${e.message}`, 'market');
+  }
+  return null;
 }
 
-function simulateStrikePricing(strike: string, spot: { open: number; high: number; low: number; close: number; change: number }, symbol: string) {
-  const offset = strike === 'ATM' ? 0 : Number(strike.replace('ATM', '')), step = symbol === 'BANKNIFTY' ? 100 : 50;
-  const baseAtm = symbol === 'BANKNIFTY' ? 320 : 180, ivDecay = 0.18;
-  const ceOpen = Math.max(15, baseAtm - offset * (step * 0.45)), peOpen = Math.max(15, baseAtm + offset * (step * 0.45));
-  const deltaCe = Math.min(0.95, Math.max(0.1, 0.5 - offset * 0.08)), deltaPe = Math.min(0.95, Math.max(0.1, 0.5 + offset * 0.08));
-  const spotUp = Math.max(0, spot.high - spot.open), spotDown = Math.max(0, spot.open - spot.low), spotMove = spot.change;
-  return {
-    ceOpen: Number(ceOpen.toFixed(2)), ceHigh: Number((ceOpen + spotUp * deltaCe).toFixed(2)), ceLow: Number(Math.max(2, ceOpen - spotDown * deltaCe).toFixed(2)), ceClose: Number(Math.max(2, ceOpen * (1 - ivDecay) + spotMove * deltaCe).toFixed(2)),
-    peOpen: Number(peOpen.toFixed(2)), peHigh: Number((peOpen + spotDown * deltaPe).toFixed(2)), peLow: Number(Math.max(2, peOpen - spotUp * deltaPe).toFixed(2)), peClose: Number(Math.max(2, peOpen * (1 - ivDecay) - spotMove * deltaPe).toFixed(2)),
-    exit130Ce: Number(Math.max(2, ceOpen * (1 - ivDecay * 0.6) + spotMove * deltaCe * 0.85).toFixed(2)),
-    exit130Pe: Number(Math.max(2, peOpen * (1 - ivDecay * 0.6) - spotMove * deltaPe * 0.85).toFixed(2)),
-    ceIv: 13.5, ceIvClose: 12.8, ceOi: 4500000, peIv: 14.2, peIvClose: 13.4, peOi: 5200000, timeline: [],
-  };
+function nextDay(dateStr: string): string {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
 }
 
 function computeAnalysisSummary(days: any[], symbol: string) {
@@ -278,6 +338,10 @@ function computeAnalysisSummary(days: any[], symbol: string) {
   }
   let bestStrike = 'ATM', bestRoi = -9999;
   for (const [stk, roi] of Object.entries(strikeRoiTotals)) { if (roi > bestRoi) { bestRoi = roi; bestStrike = stk; } }
+  // Observed break-even from real ATM straddle premiums (no hardcoded pts).
+  const avgPremium = totalDays > 0
+    ? days.reduce((s, d) => s + (d.strikes.find((x: any) => x.label === 'ATM')?.straddle?.totalPremium || 0), 0) / totalDays
+    : 0;
   return {
     symbol,
     summary: {
@@ -289,7 +353,7 @@ function computeAnalysisSummary(days: any[], symbol: string) {
       thetaTrapCount: days.filter((d) => d.regime === 'THETA_TRAP').length,
       gammaBlastCount: days.filter((d) => d.regime === 'GAMMA_BLAST').length,
       bestStrike, avgBestStrikeRoi: Number((bestRoi / (totalDays || 1)).toFixed(2)),
-      breakEvenMovePts: symbol === 'BANKNIFTY' ? 240 : 110,
+      breakEvenMovePts: Number(avgPremium.toFixed(1)),
     },
     days,
   };

@@ -145,46 +145,33 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2 text-xs font-semibold text-purple">
             <Brain size={14} />
-            <span>Real-time Multi-Agent Insights Digest</span>
+            <span>Multi-Agent Activity Digest</span>
           </div>
           <span className="text-[9px] font-mono text-muted">
-            Auto-updated via Agent Memory
+            Live from backend agent telemetry
           </span>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-[10.5px]">
-          {[
-            {
-              agent: "Planner",
-              color: "text-sky",
-              text: "Paper execution engine active. Tracking real-time PnL and margin limits via PostgreSQL.",
-            },
-            {
-              agent: "Analyst",
-              color: "text-accent",
-              text: "Index quotes streamed live. Spread checks and volatility regime verified.",
-            },
-            {
-              agent: "Strategy",
-              color: "text-gold",
-              text: "Paper order router listening for intent executions and manual order triggers.",
-            },
-            {
-              agent: "Risk",
-              color: "text-danger",
-              text: "Pre-trade risk pipeline enabled. Margin check active against demo wallet.",
-            },
-          ].map((item) => (
-            <div
-              key={item.agent}
-              className="bg-surface-100 p-2 rounded border border-border"
-            >
-              <span className={`font-mono font-bold ${item.color} mr-1`}>
-                [{item.agent}]
-              </span>
-              <span className="text-muted">{item.text}</span>
-            </div>
-          ))}
-        </div>
+        {state.telemetryEvents.length === 0 ? (
+          <div className="text-[10.5px] text-muted py-2">
+            No agent activity yet — submit an objective in the Agent Console. When runs execute,
+            their ReAct steps (planner → analyst → strategy → risk → execution → critic) appear here live.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-[10.5px]">
+            {state.telemetryEvents.slice(-4).map((ev) => {
+              const color = ev.agent === 'risk' ? 'text-danger' : ev.agent === 'analyst' ? 'text-accent'
+                : ev.agent === 'strategy' ? 'text-gold' : ev.agent === 'execution' ? 'text-purple' : 'text-sky';
+              return (
+                <div key={ev.id} className="bg-surface-100 p-2 rounded border border-border">
+                  <span className={`font-mono font-bold ${color} mr-1`}>
+                    [{ev.agent}]
+                  </span>
+                  <span className="text-muted">{(ev.summary || '').slice(0, 140)}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </Card>
     </div>
   );
