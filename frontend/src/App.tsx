@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { AppProvider, useApp } from "./store/AppContext";
 import { Header } from "./components/layout/Header";
 import { Sidebar } from "./components/layout/Sidebar";
@@ -12,6 +12,7 @@ import { AgentConsole } from "./pages/AgentConsole";
 import { AgentMonitor } from "./pages/AgentMonitor";
 import { AgentToolsMemory } from "./pages/AgentToolsMemory";
 import { GreeksAnalytics } from "./pages/GreeksAnalytics";
+import { OptionsAnalysis } from "./pages/OptionsAnalysis";
 import { MarginRisk } from "./pages/MarginRisk";
 import { SidekiqInfra } from "./pages/SidekiqInfra";
 import { Alerts } from "./pages/Alerts";
@@ -24,6 +25,7 @@ const PAGE_TITLES: Record<string, [string, string]> = {
   dashboard: ["Dashboard", "LIVE OVERVIEW"],
   strategies: ["Strategies", "AASM STATE MACHINE BACKED"],
   "options-chain": ["Option Chain", "LIVE DHAN /v2/optionchain"],
+  "options-analysis": ["Options Behavior", "DYNAMIC ATM & PARALLEL BUYING"],
   positions: ["Positions", "OPTIMISTIC LOCKING (AR)"],
   orders: ["Order Book", "FULL AUDIT TRAIL"],
   "agent-console": ["Agent Console", "REACT MULTI-AGENT LOOP"],
@@ -38,11 +40,20 @@ const PAGE_TITLES: Record<string, [string, string]> = {
 };
 
 function AppInner() {
-  const { setState, openModal, closeModal, showToast, addSystemLog } = useApp();
-  const [page, setPage] = useState("dashboard");
+  const { setState, openModal, closeModal, showToast, addSystemLog, refreshPortfolio } = useApp();
+  const [page, setPage] = useState(() => location.hash.replace('#', '') || 'dashboard');
   useSimulation();
 
-  const handleNavigate = useCallback((id: string) => setPage(id), []);
+  useEffect(() => {
+    const onHash = () => setPage(location.hash.replace('#', '') || 'dashboard');
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const handleNavigate = useCallback((id: string) => {
+    location.hash = id;
+    setPage(id);
+  }, []);
 
   const handleKillSwitch = useCallback(() => {
     openModal(
@@ -127,6 +138,7 @@ function AppInner() {
                 setState,
                 addSystemLog,
                 showToast,
+                refreshPortfolio,
               )
             }
           />
@@ -141,12 +153,15 @@ function AppInner() {
                 setState,
                 addSystemLog,
                 showToast,
+                refreshPortfolio,
               )
             }
           />
         );
       case "options-chain":
         return <OptionsChain />;
+      case "options-analysis":
+        return <OptionsAnalysis />;
       case "positions":
         return <Positions />;
       case "orders":

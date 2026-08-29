@@ -16,6 +16,15 @@ export const api = {
 
   optionChain: (symbol: string) => request<{ strikes: Array<{ strike: number; ce: any; pe: any }>; underlying: string }>(`/api/market/option-chain/${symbol}`),
 
+  optionsAnalysis: (params?: { symbol?: string; days?: number; interval?: string; expiryFlag?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.symbol) q.set('symbol', params.symbol);
+    if (params?.days) q.set('days', String(params.days));
+    if (params?.interval) q.set('interval', params.interval);
+    if (params?.expiryFlag) q.set('expiryFlag', params.expiryFlag);
+    return request<any>(`/api/market/options-analysis?${q.toString()}`);
+  },
+
   quote: (securityId: string, exchange = 'NSE_FNO') => request<any>(`/api/market/quote/${securityId}?exchange=${exchange}`),
 
   positions: () => request<any[]>('/api/portfolio/positions'),
@@ -24,6 +33,12 @@ export const api = {
   funds: () => request<any>('/api/portfolio/funds'),
   holdings: () => request<any[]>('/api/portfolio/holdings'),
   profile: () => request<any>('/api/portfolio/profile'),
+
+  strategies: () => request<any[]>('/api/portfolio/strategies'),
+  deployStrategy: (strat: any) => request<any>('/api/portfolio/paper/strategy/deploy', { method: 'POST', body: JSON.stringify(strat) }),
+  updateStrategyStatus: (id: string, status: string) => request<any>('/api/portfolio/paper/strategy/status', { method: 'POST', body: JSON.stringify({ id, status }) }),
+  closeStrategy: (id: string) => request<any>('/api/portfolio/paper/strategy/close', { method: 'POST', body: JSON.stringify({ id }) }),
+  calculateMargin: (items: any[]) => request<any>('/api/portfolio/margin/calculate', { method: 'POST', body: JSON.stringify({ items }) }),
 
   placePaperOrder: (order: { symbol: string; quantity: number; transactionType: 'BUY' | 'SELL'; price?: number; orderType?: string; productType?: string; securityId?: string }) =>
     request<any>('/api/portfolio/paper/order', {
@@ -51,4 +66,5 @@ export const api = {
 
   ollamaHealth: () => request<{ status: string }>('/api/ollama/health'),
   ollamaModels: () => request<any>('/api/ollama/models'),
+  infraStats: () => request<any>('/api/infra/stats'),
 };

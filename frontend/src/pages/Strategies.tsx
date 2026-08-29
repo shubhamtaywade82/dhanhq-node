@@ -6,6 +6,7 @@ import { StratBadge } from '../components/ui/Badge';
 import { Select } from '../components/ui/Select';
 import { fmt, fmtINR, pnlClass, sideClass } from '../utils/formatters';
 import { Plus, Pause, Play, Square, Sliders } from 'lucide-react';
+import { api } from '../services/api';
 import type { Strategy } from '../store/types';
 
 interface StrategiesProps {
@@ -13,61 +14,67 @@ interface StrategiesProps {
 }
 
 export function Strategies({ onDeploy }: StrategiesProps) {
-  const { state, setState, showToast, openModal, closeModal, addSystemLog } = useApp();
+  const { state, showToast, openModal, closeModal, addSystemLog, refreshPortfolio } = useApp();
   const [filterSym, setFilterSym] = useState('ALL');
 
   const filtered = filterSym === 'ALL'
     ? state.strategies
     : state.strategies.filter((s) => s.symbol === filterSym);
 
-  const pauseStrategy = useCallback((id: string) => {
-    setState((prev) => ({
-      ...prev,
-      strategies: prev.strategies.map((s) => s.id === id ? { ...s, status: 'PAUSED' as const } : s),
-    }));
-    const s = state.strategies.find((x) => x.id === id);
-    addSystemLog('WARN', `Strategy ${s?.name} PAUSED — AASM :running → :paused`, 'strategy_worker');
-    showToast(`${s?.name} paused`, 'warning');
-  }, [state.strategies, setState, showToast, addSystemLog]);
+  const pauseStrategy = useCallback(async (id: string) => {
+    try {
+      await api.updateStrategyStatus(id, 'PAUSED');
+      await refreshPortfolio();
+      const s = state.strategies.find((x) => x.id === id);
+      addSystemLog('WARN', `Strategy ${s?.name || id} PAUSED`, 'strategy_engine');
+      showToast(`${s?.name || 'Strategy'} paused`, 'warning');
+    } catch (e: any) {
+      showToast(`Pause failed: ${e.message}`, 'error');
+    }
+  }, [state.strategies, refreshPortfolio, showToast, addSystemLog]);
 
-  const resumeStrategy = useCallback((id: string) => {
-    setState((prev) => ({
-      ...prev,
-      strategies: prev.strategies.map((s) => s.id === id ? { ...s, status: 'RUNNING' as const } : s),
-    }));
-    const s = state.strategies.find((x) => x.id === id);
-    addSystemLog('INFO', `Strategy ${s?.name} RESUMED — AASM :paused → :running`, 'strategy_worker');
-    showToast(`${s?.name} resumed`, 'success');
-  }, [state.strategies, setState, showToast, addSystemLog]);
+  const resumeStrategy = useCallback(async (id: string) => {
+    try {
+      await api.updateStrategyStatus(id, 'RUNNING');
+      await refreshPortfolio();
+      const s = state.strategies.find((x) => x.id === id);
+      addSystemLog('INFO', `Strategy ${s?.name || id} RESUMED`, 'strategy_engine');
+      showToast(`${s?.name || 'Strategy'} resumed`, 'success');
+    } catch (e: any) {
+      showToast(`Resume failed: ${e.message}`, 'error');
+    }
+  }, [state.strategies, refreshPortfolio, showToast, addSystemLog]);
 
   const stopStrategy = useCallback((id: string) => {
     const s = state.strategies.find((x) => x.id === id);
     openModal(
       <div className="text-center">
         <div className="text-sm font-bold text-white mb-2">Stop Strategy & Exit Positions</div>
-        <div className="text-xs text-muted mb-4">This will enqueue ClosePositionWorker via Sidekiq and close all {s?.legs.length ?? 0} legs at market. Confirm?</div>
+        <div className="text-xs text-muted mb-4">This will close all {s?.legs?.length ?? 0} legs at market price. Confirm?</div>
         <div className="flex gap-2 justify-center">
           <Button variant="ghost" onClick={closeModal}>Cancel</Button>
-          <Button variant="danger" onClick={() => {
-            setState((prev) => ({
-              ...prev,
-              strategies: prev.strategies.map((x) => x.id === id ? { ...x, status: 'STOPPED' as const, pnl: 0 } : x),
-            }));
+          <Button variant="danger" onClick={async () => {
             closeModal();
-            addSystemLog('ERROR', `Strategy ${s?.name ?? id} STOPPED — all positions closed`, 'strategy_worker');
-            showToast('Strategy stopped and positions closed', 'error');
+            try {
+              await api.closeStrategy(id);
+              await refreshPortfolio();
+              addSystemLog('ERROR', `Strategy ${s?.name ?? id} STOPPED — positions closed`, 'strategy_engine');
+              showToast('Strategy stopped and positions closed', 'error');
+            } catch (e: any) {
+              showToast(`Failed to close strategy: ${e.message}`, 'error');
+            }
           }}>Stop & Close All</Button>
         </div>
-      </div>
+      </div>,
     );
-  }, [state.strategies, openModal, closeModal, setState, addSystemLog, showToast]);
+  }, [state.strategies, openModal, closeModal, refreshPortfolio, addSystemLog, showToast]);
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">Strategy Orchestrator</div>
-          <div className="text-xs text-muted mt-0.5">Sidekiq-backed lifecycle with AASM state machine transitions</div>
+          <div className="text-xs text-muted mt-0.5">PostgreSQL-backed multi-leg automated strategies</div>
         </div>
         <div className="flex gap-2">
           <Select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} className="text-xs">
@@ -80,18 +87,25 @@ export function Strategies({ onDeploy }: StrategiesProps) {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {filtered.map((s) => (
-          <StrategyCard key={s.id} strategy={s} onPause={pauseStrategy} onResume={resumeStrategy} onStop={stopStrategy} />
-        ))}
-      </div>
+      {filtered.length === 0 ? (
+        <Card className="p-8 text-center text-muted text-xs">
+          No strategies currently deployed. Click "Deploy Strategy" to launch a new multi-leg position.
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {filtered.map((s) => (
+            <StrategyCard key={s.id} strategy={s} onPause={pauseStrategy} onResume={resumeStrategy} onStop={stopStrategy} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 function StrategyCard({ strategy: s, onPause, onResume, onStop }: { strategy: Strategy; onPause: (id: string) => void; onResume: (id: string) => void; onStop: (id: string) => void }) {
-  const netDelta = s.legs.reduce((t, l) => t + l.delta * (l.side === 'SELL' ? -1 : 1) * l.qty / 100, 0);
-  const netTheta = s.legs.reduce((t, l) => t + l.theta * (l.side === 'SELL' ? -1 : 1) * l.qty / 100, 0);
+  const legs = s.legs || [];
+  const netDelta = legs.reduce((t, l) => t + (l.delta || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 100, 0);
+  const netTheta = legs.reduce((t, l) => t + (l.theta || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 100, 0);
 
   return (
     <Card className={`p-5 slide-in ${s.pnl >= 0 ? 'border-accent/20' : 'border-danger/20'}`}>
@@ -120,7 +134,7 @@ function StrategyCard({ strategy: s, onPause, onResume, onStop }: { strategy: St
 
       <div className="text-[9px] font-mono text-muted uppercase tracking-wider mb-1.5 font-semibold">Legs Breakdown</div>
       <div className="space-y-1 mb-4">
-        {s.legs.map((l, i) => {
+        {legs.map((l, i) => {
           const legPnl = (l.ltp - (l.bAvg || l.sAvg || l.ltp)) * l.qty * (l.side === 'SELL' ? -1 : 1);
           return (
             <div key={i} className="flex items-center justify-between text-[10px] font-mono p-1.5 rounded bg-surface-50 border border-border">
