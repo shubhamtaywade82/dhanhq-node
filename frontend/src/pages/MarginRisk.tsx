@@ -35,7 +35,7 @@ export function MarginRisk() {
   const [activeTab, setActiveTab] = useState('single');
   const [calcResult, setCalcResult] = useState<{ totalMargin: number; spanMargin: number; exposureMargin: number } | null>(null);
 
-  const avail = Number(state.funds.availableMargin || 1000000);
+  const avail = Number(state.funds.availableMargin || 100000);
   const used = Number(state.funds.usedMargin || 0);
   const total = Number(state.funds.totalBalance || (avail + used));
   const realized = Number(state.funds.realizedPnl || 0);
@@ -43,8 +43,8 @@ export function MarginRisk() {
 
   const handleResetWallet = async () => {
     try {
-      await api.resetPaperWallet(1000000);
-      showToast('Paper Wallet reset to ₹10,00,000 (10 Lakhs)', 'success');
+      await api.resetPaperWallet(100000);
+      showToast('Paper Wallet reset to ₹1,00,000 (1 Lakh)', 'success');
       addSystemLog('WARN', 'Paper wallet and positions reset to initial state', 'wallet_admin');
       await refreshPortfolio();
     } catch (e: any) {
@@ -66,13 +66,14 @@ export function MarginRisk() {
     }
   }, [showToast]);
 
+  const openPositionsCount = state.positions.filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0).length;
   const rejectedOrders = state.orders.filter((o) => o.status === 'REJECTED').length;
   // Prefer the backend risk engine's live breaker evaluation (streamed over
   // the WS risk channel); compute locally only as a fallback view.
   const circuitBreakers = state.circuitBreakers.length > 0 ? state.circuitBreakers : [
     { rule: 'Daily Loss Limit', threshold: '₹50,000', current: fmtINR(realized), state: realized < -50000 ? 'TRIPPED' : realized < -35000 ? 'WARN' : 'OK', action: 'Close all positions, trigger Dhan P&L exit' },
     { rule: 'Margin Utilization', threshold: '70%', current: `${fmt(utilPct)}%`, state: utilPct > 80 ? 'TRIPPED' : utilPct > 70 ? 'WARN' : 'OK', action: 'Block new position opens' },
-    { rule: 'Open Position Count', threshold: '10 active', current: `${state.positions.length} active`, state: state.positions.length > 8 ? 'WARN' : 'OK', action: 'Limit concurrency' },
+    { rule: 'Open Position Count', threshold: '10 active', current: `${openPositionsCount} active`, state: openPositionsCount > 8 ? 'WARN' : 'OK', action: 'Limit concurrency' },
     { rule: 'Order Rejections', threshold: '< 10%', current: `${rejectedOrders}/${state.orders.length || 1}`, state: rejectedOrders > 2 ? 'WARN' : 'OK', action: 'Throttle orders' },
   ];
 
@@ -84,15 +85,15 @@ export function MarginRisk() {
           <div className="text-xs text-muted mt-0.5">Real-time PostgreSQL demo account balance and margin governor</div>
         </div>
         <Button variant="danger" onClick={handleResetWallet}>
-          <RotateCcw size={12} className="mr-1" /> Reset Demo Account (₹10L)
+          <RotateCcw size={12} className="mr-1" /> Reset Demo Account (₹1L)
         </Button>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <GaugeRing value={Math.abs(realized)} max={50000} color={realized >= 0 ? "#00e5a0" : "#ff3b5c"} label="Realized P&L" sub={fmtINR(realized)} />
         <GaugeRing value={utilPct} max={100} color={utilPct > 70 ? "#ff3b5c" : "#f0b429"} label="Margin Utilization" sub={`${fmt(utilPct)}%`} />
-        <GaugeRing value={used} max={total || 1000000} color="#38bdf8" label="Margin Used" sub={fmtINR(used)} />
-        <GaugeRing value={avail} max={total || 1000000} color="#00e5a0" label="Available Margin" sub={fmtINR(avail)} />
+        <GaugeRing value={used} max={total || 100000} color="#38bdf8" label="Margin Used" sub={fmtINR(used)} />
+        <GaugeRing value={avail} max={total || 100000} color="#00e5a0" label="Available Margin" sub={fmtINR(avail)} />
       </div>
 
       <Card className="p-4">

@@ -8,6 +8,7 @@ import type { MarketDataService } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 import { eventBus } from '../services/eventBus';
 import { moduleLogger } from '../lib/logger';
+import { aggregatePortfolioGreeks } from '../services/optionsAnalytics';
 
 const log = moduleLogger('portfolio');
 
@@ -73,6 +74,22 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
     }
   });
 
+  router.get('/greeks', async (_req, res) => {
+    try {
+      const positions = await listPaperPositions();
+      const indices = market.getIndices();
+      const spotMap: Record<string, number> = {};
+      for (const [sym, data] of Object.entries(indices)) {
+        if (data?.ltp) spotMap[sym] = data.ltp;
+      }
+      const expiry = new Date().toISOString().slice(0, 10);
+      const agg = aggregatePortfolioGreeks(positions, spotMap, expiry);
+      res.json(agg);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   router.post('/paper/order', async (req, res) => {
     try {
       const { symbol, quantity, transactionType, price, orderType, productType, securityId, exchangeSegment } = req.body;
@@ -131,7 +148,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.post('/paper/wallet/reset', async (req, res) => {
     try {
-      const initialBalance = req.body.initialBalance ? Number(req.body.initialBalance) : 1000000;
+      const initialBalance = req.body.initialBalance ? Number(req.body.initialBalance) : 100000;
       const result = await resetPaperWallet(initialBalance);
       eventBus.log('WARN', `Paper wallet reset to ₹${initialBalance.toLocaleString('en-IN')} (positions cleared)`, 'wallet_admin');
       res.json(result);

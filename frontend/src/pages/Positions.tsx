@@ -8,7 +8,9 @@ import { api } from '../services/api';
 export function Positions() {
   const { state, showToast, openModal, closeModal, addSystemLog, refreshPortfolio } = useApp();
 
-  const realPositions = state.positions.map((p) => {
+  const realPositions = state.positions
+    .filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0)
+    .map((p) => {
     const net = Number(p.netQty ?? p.net_qty ?? 0);
     const buyAvg = Number(p.buyAvg ?? p.buy_avg ?? 0);
     const sellAvg = Number(p.sellAvg ?? p.sell_avg ?? 0);

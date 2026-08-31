@@ -30,7 +30,7 @@ export function dbMode(): 'postgres' | 'memory' {
 
 // ── in-memory fallback store ────────────────────────────────────────────
 const mem = {
-  wallet: { id: 'default', initial_balance: 1000000, available_margin: 1000000, used_margin: 0, realized_pnl: 0, updated_at: new Date() },
+  wallet: { id: 'default', initial_balance: 100000, available_margin: 100000, used_margin: 0, realized_pnl: 0, updated_at: new Date() },
   orders: [] as any[],
   positions: new Map<string, any>(),
   strategies: [] as any[],
@@ -43,8 +43,8 @@ const mem = {
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS paper_wallet (
-    id VARCHAR(32) PRIMARY KEY DEFAULT 'default', initial_balance NUMERIC(14, 2) NOT NULL DEFAULT 1000000.00,
-    available_margin NUMERIC(14, 2) NOT NULL DEFAULT 1000000.00, used_margin NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+    id VARCHAR(32) PRIMARY KEY DEFAULT 'default', initial_balance NUMERIC(14, 2) NOT NULL DEFAULT 100000.00,
+    available_margin NUMERIC(14, 2) NOT NULL DEFAULT 100000.00, used_margin NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
     realized_pnl NUMERIC(14, 2) NOT NULL DEFAULT 0.00, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
   CREATE TABLE IF NOT EXISTS paper_orders (
@@ -90,7 +90,7 @@ const SCHEMA_SQL = `
     consecutive_losses INTEGER NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
   INSERT INTO paper_wallet (id, initial_balance, available_margin, used_margin, realized_pnl)
-  VALUES ('default', 1000000.00, 1000000.00, 0.00, 0.00)
+  VALUES ('default', 100000.00, 100000.00, 0.00, 0.00)
   ON CONFLICT (id) DO NOTHING;
   INSERT INTO risk_state (id, killed, limits) VALUES ('default', FALSE, '{}')
   ON CONFLICT (id) DO NOTHING;
@@ -294,7 +294,7 @@ export async function getPaperWallet() {
     ? (await pool.query('SELECT * FROM paper_wallet WHERE id = $1', ['default']).catch(() => ({ rows: [] }))).rows[0]
     : (mem.wallet as any);
   if (!w) {
-    return { availableMargin: 1000000, usedMargin: 0, realizedPnl: 0, totalBalance: 1000000, spanMargin: 0, exposureMargin: 0 };
+    return { availableMargin: 100000, usedMargin: 0, realizedPnl: 0, totalBalance: 100000, spanMargin: 0, exposureMargin: 0 };
   }
   const availableMargin = Number(w.available_margin);
   const usedMargin = Number(w.used_margin);
@@ -307,7 +307,7 @@ export async function getPaperWallet() {
   };
 }
 
-export async function resetPaperWallet(initialBalance = 1000000) {
+export async function resetPaperWallet(initialBalance = 100000) {
   if (mode === 'postgres') {
     const client = await pool.connect();
     try {
@@ -318,6 +318,10 @@ export async function resetPaperWallet(initialBalance = 1000000) {
       );
       await client.query('DELETE FROM paper_positions');
       await client.query('DELETE FROM paper_orders');
+      await client.query('DELETE FROM paper_strategies');
+      await client.query('DELETE FROM alerts');
+      await client.query('DELETE FROM agent_events');
+      await client.query(`UPDATE risk_state SET killed = FALSE, killed_reason = NULL, limits = '{}', consecutive_losses = 0, updated_at = NOW() WHERE id = 'default'`);
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK');
@@ -329,6 +333,10 @@ export async function resetPaperWallet(initialBalance = 1000000) {
     mem.wallet = { ...mem.wallet, initial_balance: initialBalance, available_margin: initialBalance, used_margin: 0, realized_pnl: 0, updated_at: new Date() };
     mem.orders = [];
     mem.positions.clear();
+    mem.strategies = [];
+    mem.alerts = [];
+    mem.agentEvents = [];
+    mem.riskState = { killed: false, killedReason: null, limits: {}, consecutiveLosses: 0 };
   }
   return { status: 'ok', initialBalance };
 }

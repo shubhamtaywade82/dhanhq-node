@@ -97,7 +97,7 @@ export const api = {
       body: JSON.stringify({ symbol, ltp }),
     }),
 
-  resetPaperWallet: (initialBalance = 1000000) =>
+  resetPaperWallet: (initialBalance = 100000) =>
     request<any>('/api/portfolio/paper/wallet/reset', {
       method: 'POST',
       body: JSON.stringify({ initialBalance }),

@@ -8,6 +8,7 @@ import { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import {
   initDatabase, dbMode, executePaperOrder, getPaperWallet,
   listPaperPositions, closeAllPaperPositions, markPositionsToMarket,
+  resetPaperWallet, pool,
 } from '../db';
 
 /**
@@ -99,7 +100,7 @@ describe('RiskEngine — real-state circuit breakers', () => {
 
   it('arms the kill switch when the daily loss limit is breached', async () => {
     const { risk } = await stubEngines(100);
-    risk.setLimits({ dailyLossLimit: 1 }); // trivially breachable
+    await risk.setLimits({ dailyLossLimit: 1 }); // trivially breachable
     // Create a realized loss directly through the paper DB layer.
     await executePaperOrder({ symbol: 'RISKTEST', quantity: 50, transactionType: 'BUY', price: 100 });
     await executePaperOrder({ symbol: 'RISKTEST', quantity: 50, transactionType: 'SELL', price: 90 }); // -500 realized
@@ -109,14 +110,17 @@ describe('RiskEngine — real-state circuit breakers', () => {
     expect(snap.killed).toBe(true);
     expect(String(snap.killedReason)).toMatch(/daily loss limit/i);
     await risk.disarmKillSwitch();
+    risk.stop();
   });
 
   it('persists limits so a restart keeps configuration', async () => {
     const { risk } = await stubEngines(100);
-    risk.setLimits({ maxMarginUtilPct: 42 });
+    await risk.setLimits({ maxMarginUtilPct: 42 });
     const risk2 = new RiskEngine(stubClient(), stubMarket(100));
     await risk2.start();
     expect(risk2.getLimits().maxMarginUtilPct).toBe(42);
+    risk.stop();
+    risk2.stop();
   });
 
   it('defaults are sane', () => {
@@ -202,6 +206,11 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
 });
 
 describe('Database layer — fallback mode honesty', () => {
+  afterAll(async () => {
+    await resetPaperWallet(100000);
+    await pool.end();
+  });
+
   it('reports which persistence mode is active', () => {
     expect(['postgres', 'memory']).toContain(dbMode());
   });

@@ -6,6 +6,7 @@ describe("DhanHQ-TS Node.js Sidecar & Paper Trading", () => {
   });
 
   afterAll(async () => {
+    await resetPaperWallet(100000);
     await pool.end();
   });
 
@@ -15,12 +16,12 @@ describe("DhanHQ-TS Node.js Sidecar & Paper Trading", () => {
   });
 
   it("resets paper wallet to initial balance", async () => {
-    const res = await resetPaperWallet(1000000);
+    const res = await resetPaperWallet(100000);
     expect(res.status).toBe("ok");
-    expect(res.initialBalance).toBe(1000000);
+    expect(res.initialBalance).toBe(100000);
 
     const wallet = await getPaperWallet();
-    expect(wallet.availableMargin).toBe(1000000);
+    expect(wallet.availableMargin).toBe(100000);
     expect(wallet.usedMargin).toBe(0);
     expect(wallet.realizedPnl).toBe(0);
   });

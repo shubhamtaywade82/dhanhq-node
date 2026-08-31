@@ -41,6 +41,7 @@ export const initialAppState: AppState = {
   ltmMemories: [],
   logs: [],
   logIdCounter: 0,
+  alertIdCounter: 0,
   pnlHistory: [],
   rateLimitHistory: [],
   logFilter: 'all',

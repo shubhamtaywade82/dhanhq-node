@@ -45,6 +45,7 @@ export async function startCore(): Promise<Core> {
   const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
   const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk);
   const agent = new AgentOrchestrator(client, market, risk, paper, live);
+  autonomy.setAgent(agent);
 
   // Bridge core events into Redis pub/sub (Rails sidecar compat) when up.
   if (redisAvailable()) {

@@ -78,9 +78,9 @@ export class RiskEngine {
     return { ...this.limits };
   }
 
-  setLimits(patch: Partial<RiskLimits>): RiskLimits {
+  async setLimits(patch: Partial<RiskLimits>): Promise<RiskLimits> {
     this.limits = { ...this.limits, ...patch };
-    void saveRiskState({ killed: this.killed, killedReason: this.killedReason, limits: this.limits });
+    await saveRiskState({ killed: this.killed, killedReason: this.killedReason, limits: this.limits });
     eventBus.log('INFO', `Risk limits updated: ${JSON.stringify(this.limits)}`, 'risk_engine');
     return this.getLimits();
   }

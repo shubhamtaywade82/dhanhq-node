@@ -75,6 +75,12 @@ export function controlRoutes(
     res.json({ status: 'ok', enabled: autonomy.isEnabled(), stats: autonomy.stats() });
   });
 
+  router.post('/scanner', (req, res) => {
+    const { enabled } = req.body || {};
+    autonomy.setScanEnabled(!!enabled);
+    res.json({ status: 'ok', stats: autonomy.stats() });
+  });
+
   router.post('/square-off', async (req, res) => {
     try {
       const closed = await autonomy.squareOffAll(req.body?.reason || 'Manual square-off from control plane');
@@ -89,7 +95,7 @@ export function controlRoutes(
     res.json(risk.getLimits());
   });
 
-  router.post('/risk-limits', (req, res) => {
+  router.post('/risk-limits', async (req, res) => {
     const patch = req.body || {};
     const clean: any = {};
     if (patch.dailyLossLimit != null) clean.dailyLossLimit = Math.max(1000, Number(patch.dailyLossLimit));
@@ -98,7 +104,7 @@ export function controlRoutes(
     if (patch.maxConsecutiveLosses != null) clean.maxConsecutiveLosses = Math.max(1, Number(patch.maxConsecutiveLosses));
     if (patch.maxRejectionRatePct != null) clean.maxRejectionRatePct = Math.max(1, Number(patch.maxRejectionRatePct));
     if (patch.staleTickSec != null) clean.staleTickSec = Math.max(3, Number(patch.staleTickSec));
-    res.json(risk.setLimits(clean));
+    res.json(await risk.setLimits(clean));
   });
 
   // ── agent ───────────────────────────────────────────────────────────

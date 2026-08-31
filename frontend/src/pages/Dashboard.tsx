@@ -190,7 +190,7 @@ function MetricsGrid({
   };
   totalPnl: number;
 }) {
-  const avail = Number(state.funds.availableMargin || 1000000);
+  const avail = Number(state.funds.availableMargin || 100000);
   const used = Number(state.funds.usedMargin || 0);
   const total = Number(state.funds.totalBalance || (avail + used));
   const utilPct = total > 0 ? (used / total) * 100 : 0;
@@ -198,6 +198,7 @@ function MetricsGrid({
   const unrealized = totalPnl - realized;
   const totalOrders = state.orders.length;
   const filledOrders = state.orders.filter((o) => o.status === "TRADED").length;
+  const openPositions = state.positions.filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0);
 
   return (
     <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -229,7 +230,7 @@ function MetricsGrid({
         <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">
           Open Positions
         </div>
-        <div className="text-xl font-bold font-mono text-sky">{state.positions.length}</div>
+        <div className="text-xl font-bold font-mono text-sky">{openPositions.length}</div>
         <div className="text-[10px] font-mono text-muted mt-1">
           Status: <span className="text-sky font-semibold">Active Tracker</span>
         </div>
@@ -240,7 +241,7 @@ function MetricsGrid({
         </div>
         <div className="text-xl font-bold font-mono text-gold">{fmtINR(total)}</div>
         <div className="text-[10px] font-mono text-muted mt-1">
-          Initial: <span className="text-muted">₹10,00,000</span>
+          Initial: <span className="text-muted">₹1,00,000</span>
         </div>
       </Card>
       <Card className="p-3.5">

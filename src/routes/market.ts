@@ -3,6 +3,7 @@ import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import type { MarketDataService } from '../services/marketData';
 import { getOptionsAnalysisCache, saveOptionsAnalysisCache } from '../db';
 import { eventBus } from '../services/eventBus';
+import { analyzeOptionChain } from '../services/optionsAnalytics';
 
 /**
  * Market data routes — every response is sourced from live DhanHQ data.
@@ -78,6 +79,27 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
       res.json({ symbol, spot, expiry, strikes, source: 'black-scholes' });
     } catch (e: any) {
       res.status(502).json({ error: `Greeks unavailable: ${e.message}` });
+    }
+  });
+
+  router.get('/analytics/:symbol', async (req, res) => {
+    try {
+      const symbol = (req.params.symbol || 'NIFTY').toUpperCase();
+      const secId = securityIdFor(symbol);
+      const expiry = (req.query.expiry as string) || nearestWeeklyExpiry();
+      const chain = await (client as any).optionChain.fetchNormalized({
+        underlyingScrip: Number(secId), underlyingSeg: 'IDX_I', expiry,
+      });
+      const rows = Array.isArray(chain) ? chain : chain?.strikes || chain?.data || [];
+      const spotSnap = market.getQuote(secId);
+      const spot = spotSnap?.ltp || Number(req.query.spot) || 0;
+      const vixSnap = market.getQuote('26');
+      const vix = vixSnap?.ltp || 14;
+
+      const analytics = analyzeOptionChain(symbol, rows, spot, expiry, vix);
+      res.json(analytics);
+    } catch (e: any) {
+      res.status(502).json({ error: `Option analytics unavailable: ${e.message}` });
     }
   });
 

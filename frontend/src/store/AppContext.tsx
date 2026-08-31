@@ -215,9 +215,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       case 'alert': {
         const p = env.payload || {};
         setState((prev) => {
-          const alert = { id: env.ts, time: new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', msg: p.msg || p.message || '', read: false };
+          const alert = { id: env.ts + prev.alertIdCounter, time: new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', msg: p.msg || p.message || '', read: false };
           const alerts = [...prev.alerts, alert];
-          return { ...prev, alerts: alerts.length > 200 ? alerts.slice(-200) : alerts };
+          return { ...prev, alerts: alerts.length > 200 ? alerts.slice(-200) : alerts, alertIdCounter: prev.alertIdCounter + 1 };
         });
         break;
       }

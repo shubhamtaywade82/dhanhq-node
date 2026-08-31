@@ -175,6 +175,7 @@ export interface AppState {
   ltmMemories: LongTermMemory[];
   logs: LogEntry[];
   logIdCounter: number;
+  alertIdCounter: number;
   pnlHistory: number[];
   rateLimitHistory: { orders: number; data: number }[];
   logFilter: string;
