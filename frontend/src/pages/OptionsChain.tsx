@@ -27,8 +27,8 @@ export function OptionsChain() {
   const step = symbol === 'BANKNIFTY' ? 100 : 50;
   const atm = Math.round(spot / step) * step;
 
-  const loadChain = useCallback(async () => {
-    setLoading(true);
+  const loadChain = useCallback(async (isBackground = false) => {
+    if (!isBackground) setLoading(true);
     try {
       const res = await api.optionChain(symbol);
       if (res?.strikes && res.strikes.length > 0) {
@@ -39,12 +39,14 @@ export function OptionsChain() {
     } catch {
       setChainRows(generateRealisticChain(spot, step, atm));
     } finally {
-      setLoading(false);
+      if (!isBackground) setLoading(false);
     }
   }, [symbol, spot, step, atm]);
 
   useEffect(() => {
-    loadChain();
+    loadChain(false);
+    const interval = setInterval(() => loadChain(true), 5000);
+    return () => clearInterval(interval);
   }, [loadChain]);
 
   useEffect(() => {

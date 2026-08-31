@@ -1,6 +1,6 @@
 import { DhanClient, OrderTracker } from '@nemesis-oss/dhanhq-sdk';
 import { createDhanClient, redisPublisher, redisAvailable } from './auth';
-import { initDatabase } from './db';
+import { initDatabase, listPaperPositions } from './db';
 import { MarketDataService } from './services/marketData';
 import { RiskEngine } from './services/riskEngine';
 import { AutonomyEngine } from './services/autonomy';
@@ -55,6 +55,7 @@ export async function startCore(): Promise<Core> {
   }
 
   await market.start();
+  await seedExistingPositions(market);
   await risk.start();
   await autonomy.start();
 
@@ -62,4 +63,14 @@ export async function startCore(): Promise<Core> {
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
   return { client, market, risk, autonomy, agent, paper, live, tracker };
+}
+
+async function seedExistingPositions(market: MarketDataService): Promise<void> {
+  try {
+    const positions = await listPaperPositions();
+    const active = positions
+      .filter((p) => p.netQty !== 0 && p.securityId && p.securityId !== '0')
+      .map((p) => ({ securityId: String(p.securityId), exchangeSegment: p.exchangeSegment || 'NSE_FNO' }));
+    if (active.length > 0) market.addInstruments(active);
+  } catch { /* non-fatal */ }
 }

@@ -55,6 +55,7 @@ export class MarketDataService {
   private wsTickCount = 0;
   private restTickCount = 0;
   private lastTickAt = 0;
+  private lastWsTickAt = 0;
   private source: 'ws' | 'rest' | 'none' = 'none';
   private extraSubscriptions = new Set<string>();        // 'SEG:SECID' keys
   private unsubEventBus: (() => void) | null = null;
@@ -104,6 +105,7 @@ export class MarketDataService {
       ws.market?.on?.('tick', (tick: any) => {
         this.wsTickCount++;
         this.lastTickAt = Date.now();
+        this.lastWsTickAt = Date.now();
         this.source = 'ws';
         this.ingestTick(tick);
       });
@@ -115,7 +117,6 @@ export class MarketDataService {
           INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
         );
         this.wsStarted = true;
-        this.source = 'ws';
         eventBus.log('INFO', 'DhanHQ binary WebSocket connected — real-time tick stream live', 'market_data');
       }).catch((e: any) => {
         eventBus.log('WARN', `DhanHQ WebSocket unavailable (${e?.message || e}) — falling back to REST polling`, 'market_data');
@@ -128,14 +129,10 @@ export class MarketDataService {
   private schedulePolling(): void {
     const tick = async () => {
       const clock = marketClock();
-      // WS healthy and inside market hours → light refresh only.
-      const wsFresh = this.source === 'ws' && Date.now() - this.lastTickAt < 10_000;
-      const interval = wsFresh ? 30_000 : clock.isMarketOpen ? 3_000 : 60_000;
+      const wsFresh = this.wsTickCount > 0 && Date.now() - this.lastWsTickAt < 10_000;
+      const interval = wsFresh ? 15_000 : clock.isMarketOpen ? 3_000 : 30_000;
       if (this.pollTimer) clearTimeout(this.pollTimer);
       this.pollTimer = setTimeout(tick, interval);
-      if (!clock.isMarketOpen && !clock.isPreOpen) {
-        // Off-hours: one quote per cycle keeps the UI honest without hammering.
-      }
       await this.pollIndices();
       await this.pollExtraInstruments();
     };
@@ -153,7 +150,13 @@ export class MarketDataService {
         touched = true;
         this.ingestRestQuote(secId, symbol, d);
       }
-      if (touched) { this.restTickCount++; this.lastTickAt = Date.now(); if (this.source !== 'ws') this.source = 'rest'; }
+      if (touched) {
+        this.restTickCount++;
+        this.lastTickAt = Date.now();
+        if (this.wsTickCount === 0 || Date.now() - this.lastWsTickAt >= 10_000) {
+          this.source = 'rest';
+        }
+      }
     } catch (e: any) {
       eventBus.log('WARN', `Index quote poll failed: ${e?.message || e}`, 'market_data');
     }
@@ -271,9 +274,10 @@ export class MarketDataService {
       } as any);
     } catch { /* monitor defensive */ }
 
-    if (this.source !== 'ws') {
-      if (symbol) eventBus.emit('tick', { symbol, data: this.toTickPayload(snap) });
-      else eventBus.emit('tick', { securityId: secId, data: this.toTickPayload(snap) });
+    if (symbol) {
+      eventBus.emit('tick', { symbol, data: this.toTickPayload(snap) });
+    } else {
+      eventBus.emit('tick', { securityId: secId, data: this.toTickPayload(snap) });
     }
   }
 
@@ -326,9 +330,10 @@ export class MarketDataService {
   }
 
   stats() {
+    const wsFresh = this.wsTickCount > 0 && Date.now() - this.lastWsTickAt < 10_000;
     return {
       source: this.source,
-      wsConnected: this.wsStarted && this.source === 'ws',
+      wsConnected: this.wsStarted && wsFresh,
       wsTicks: this.wsTickCount,
       restTicks: this.restTickCount,
       trackedInstruments: this.quotes.size,

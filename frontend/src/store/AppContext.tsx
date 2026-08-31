@@ -134,15 +134,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     boot();
 
-    // REST polling ONLY as a fallback while the WS stream is down.
+    // Continuous background sync keeps orders, strategies, and control state fresh.
     const interval = setInterval(async () => {
-      if (!streamConnectedRef.current) {
-        try {
-          setConnected(true);
-        } catch { /* noop */ }
-        await Promise.all([refreshIndices(), refreshPortfolio(), refreshControlState()]);
+      try {
+        if (!streamConnectedRef.current) {
+          await refreshIndices();
+        }
+        await Promise.all([refreshPortfolio(), refreshControlState()]);
+      } catch {
+        /* noop */
       }
-    }, 5000);
+    }, 4000);
 
     // Uptime ticker — sourced from backend health (real process uptime).
     const uptimeInterval = setInterval(async () => {

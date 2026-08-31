@@ -37,7 +37,8 @@ export function useBackendStream(
   onEnvelopeRef.current = onEnvelope;
 
   const connect = useCallback(() => {
-    const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3003/ws';
+    const defaultHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+    const WS_URL = import.meta.env.VITE_WS_URL || `ws://${defaultHost}:3003/ws`;
 
     try {
       const ws = new WebSocket(WS_URL);

@@ -1,6 +1,7 @@
 import { log } from './logger';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3003';
+const defaultHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+const API_BASE = import.meta.env.VITE_API_URL || `http://${defaultHost}:3003`;
 
 /**
  * Central API client.
