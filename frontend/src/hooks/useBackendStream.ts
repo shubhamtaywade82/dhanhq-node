@@ -35,8 +35,14 @@ export function useBackendStream(
   const retriesRef = useRef(0);
   const onEnvelopeRef = useRef(onEnvelope);
   onEnvelopeRef.current = onEnvelope;
+  const isMountedRef = useRef(true);
 
   const connect = useCallback(() => {
+    if (!isMountedRef.current) return;
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
     const defaultHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
     const WS_URL = import.meta.env.VITE_WS_URL || `ws://${defaultHost}:3003/ws`;
 
@@ -45,11 +51,17 @@ export function useBackendStream(
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (!isMountedRef.current) {
+          ws.close();
+          return;
+        }
         retriesRef.current = 0;
         setState((s) => ({ ...s, connected: true }));
         log.info('Telemetry stream connected', { source: 'ws' });
-        // Subscribe to telemetry channels (server default is all, but be explicit).
-        ws.send(JSON.stringify({ type: 'subscribe', channels: channels ?? ['tick', 'log', 'alert', 'telemetry', 'risk', 'portfolio', 'order', 'system'] }));
+        ws.send(JSON.stringify({
+          type: 'subscribe',
+          channels: channels ?? ['tick', 'log', 'alert', 'telemetry', 'risk', 'portfolio', 'order', 'system'],
+        }));
       };
 
       ws.onmessage = (event) => {
@@ -66,28 +78,44 @@ export function useBackendStream(
 
       ws.onclose = () => {
         setState((s) => ({ ...s, connected: false }));
+        if (!isMountedRef.current) return;
         const delay = Math.min(30000, 3000 * Math.pow(1.6, retriesRef.current++));
         log.warn('Telemetry stream disconnected — reconnecting', {
           source: 'ws',
           attempt: retriesRef.current,
           nextRetryMs: delay,
         });
+        if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
         reconnectTimer.current = setTimeout(connect, delay);
       };
 
       ws.onerror = () => {
-        ws.close();
+        // Spec automatically triggers onclose — avoid manual close on connecting socket
       };
     } catch {
-      reconnectTimer.current = setTimeout(connect, 3000);
+      if (isMountedRef.current) {
+        if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = setTimeout(connect, 3000);
+      }
     }
   }, [channels]);
 
   useEffect(() => {
+    isMountedRef.current = true;
     connect();
     return () => {
+      isMountedRef.current = false;
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      wsRef.current?.close();
+      if (wsRef.current) {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onclose = null;
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.close();
+        }
+        wsRef.current = null;
+      }
     };
   }, [connect]);
 

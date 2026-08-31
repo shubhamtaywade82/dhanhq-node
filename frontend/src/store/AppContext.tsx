@@ -185,24 +185,36 @@ export function AppProvider({ children }: { children: ReactNode }) {
     switch (env.channel) {
       case 'tick': {
         const p = env.payload || {};
-        if (p.symbol) {
-          setState((prev) => ({
-            ...prev,
-            indices: {
-              ...prev.indices,
-              [p.symbol]: p.data?.ltp != null ? {
-                ltp: p.data.ltp,
-                change: p.data.change ?? 0,
-                pct: p.data.pctChange ?? 0,
-                high: p.data.high ?? 0,
-                low: p.data.low ?? 0,
-                open: p.data.open ?? 0,
-                prevClose: p.data.prevClose ?? 0,
-                spot: p.data.ltp,
-              } : prev.indices[p.symbol],
+        const ltp = p.data?.ltp;
+        if (ltp == null) break;
+
+        setState((prev) => {
+          const nextIndices = p.symbol ? {
+            ...prev.indices,
+            [p.symbol]: {
+              ltp,
+              change: p.data.change ?? 0,
+              pct: p.data.pctChange ?? 0,
+              high: p.data.high ?? 0,
+              low: p.data.low ?? 0,
+              open: p.data.open ?? 0,
+              prevClose: p.data.prevClose ?? 0,
+              spot: ltp,
             },
-          }));
-        }
+          } : prev.indices;
+
+          const nextPositions = p.securityId ? prev.positions.map((pos) => {
+            if (String(pos.securityId) === String(p.securityId)) {
+              const avg = Number(pos.buyAvg || pos.avgPrice || pos.sAvg || ltp);
+              const qty = Number(pos.netQty || pos.qty || 0);
+              const pnl = Number(((ltp - avg) * qty).toFixed(2));
+              return { ...pos, ltp, pnl };
+            }
+            return pos;
+          }) : prev.positions;
+
+          return { ...prev, indices: nextIndices, positions: nextPositions };
+        });
         break;
       }
       case 'log': {

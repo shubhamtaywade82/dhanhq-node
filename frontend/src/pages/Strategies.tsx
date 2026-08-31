@@ -82,6 +82,7 @@ export function Strategies({ onDeploy }: StrategiesProps) {
             <option value="NIFTY">NIFTY</option>
             <option value="BANKNIFTY">BANKNIFTY</option>
             <option value="FINNIFTY">FINNIFTY</option>
+            <option value="SENSEX">SENSEX</option>
           </Select>
           <Button onClick={onDeploy}><Plus size={14} /> Deploy Strategy</Button>
         </div>

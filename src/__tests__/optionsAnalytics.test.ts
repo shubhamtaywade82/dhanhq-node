@@ -2,7 +2,7 @@ import {
   calculateGreeks, analyzeOptionChain, selectStrikeByDelta, aggregatePortfolioGreeks,
 } from '../services/optionsAnalytics';
 import {
-  buildIronCondor, buildCreditSpread, buildStraddle, buildStrangle,
+  buildIronCondor, buildCreditSpread, buildStraddle, buildStrangle, evaluateStrategyBacktest,
 } from '../services/strategyConstructor';
 
 describe('Options & Volatility Analytics Core', () => {
@@ -108,5 +108,47 @@ describe('Multi-Leg Strategy Constructors', () => {
     const strangle = buildStrangle('NIFTY', 24500, sampleChain, expiry, 1, 'SELL');
     expect(strangle).not.toBeNull();
     expect(strangle?.legs.length).toBe(2);
+  });
+});
+
+describe('Strategy Backtest Evaluation Engine', () => {
+  const sampleDays = [
+    {
+      date: '2026-08-27',
+      spot: { open: 24500, high: 24600, low: 24450, close: 24520 },
+      strikes: [{ label: 'ATM', strike: 24500, call: { open: 150, close: 110 }, put: { open: 140, close: 100 } }],
+      timeline: [
+        { time: '09:15', spot: 24500, ce: 150, pe: 140, straddle: 290 },
+        { time: '11:00', spot: 24550, ce: 140, pe: 110, straddle: 250 },
+        { time: '13:30', spot: 24520, ce: 120, pe: 105, straddle: 225 },
+        { time: '15:20', spot: 24510, ce: 110, pe: 100, straddle: 210 },
+      ],
+    },
+    {
+      date: '2026-08-28',
+      spot: { open: 24500, high: 24800, low: 24480, close: 24780 },
+      strikes: [{ label: 'ATM', strike: 24500, call: { open: 150, close: 320 }, put: { open: 140, close: 20 } }],
+      timeline: [
+        { time: '09:15', spot: 24500, ce: 150, pe: 140, straddle: 290 },
+        { time: '10:30', spot: 24700, ce: 280, pe: 35, straddle: 315 },
+        { time: '13:30', spot: 24750, ce: 300, pe: 25, straddle: 325 },
+        { time: '15:20', spot: 24780, ce: 320, pe: 20, straddle: 340 },
+      ],
+    },
+  ];
+
+  it('evaluates Short Straddle backtest accurately across historical days', () => {
+    const report = evaluateStrategyBacktest('NIFTY', 'STRADDLE', sampleDays, {
+      targetPct: 20, slPct: 15, side: 'SELL', lots: 1,
+    });
+
+    expect(report.symbol).toBe('NIFTY');
+    expect(report.totalDays).toBe(2);
+    expect(report.days.length).toBe(2);
+    // Day 1 premium decays 290 -> 225 at 13:30 (Target +20% reached since 290-225 = 65 pts gain >= 58 pts)
+    expect(report.days[0].pnl).toBeGreaterThan(0);
+    // Day 2 big expansion 290 -> 340 (Short loss)
+    expect(report.days[1].pnl).toBeLessThan(0);
+    expect(report.winRate).toBe(50);
   });
 });

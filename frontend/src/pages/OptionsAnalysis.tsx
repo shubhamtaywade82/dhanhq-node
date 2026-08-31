@@ -57,7 +57,7 @@ export function OptionsAnalysis() {
         </div>
         <div className="flex items-center gap-2">
           <Select value={symbol} onChange={(e) => setSymbol(e.target.value)} className="text-xs">
-            <option value="NIFTY">NIFTY 50 (13)</option><option value="BANKNIFTY">BANK NIFTY (25)</option><option value="FINNIFTY">FIN NIFTY (27)</option>
+            <option value="NIFTY">NIFTY 50 (13)</option><option value="BANKNIFTY">BANK NIFTY (25)</option><option value="FINNIFTY">FIN NIFTY (27)</option><option value="SENSEX">BSE SENSEX (51)</option>
           </Select>
           <Select value={days} onChange={(e) => setDays(Number(e.target.value))} className="text-xs">
             <option value={3}>Last 3 Days</option><option value={5}>Last 5 Days</option><option value={10}>Last 10 Days</option>

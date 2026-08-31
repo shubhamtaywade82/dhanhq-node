@@ -24,7 +24,7 @@ export function OptionsChain() {
 
   const idx = state.indices[symbol] ?? state.indices.NIFTY;
   const spot = (idx as IndexData)?.ltp || 24500;
-  const step = symbol === 'BANKNIFTY' ? 100 : 50;
+  const step = symbol === 'SENSEX' || symbol === 'BANKNIFTY' ? 100 : 50;
   const atm = Math.round(spot / step) * step;
 
   const loadChain = useCallback(async (isBackground = false) => {
@@ -66,6 +66,7 @@ export function OptionsChain() {
             <option value="NIFTY">NIFTY 50</option>
             <option value="BANKNIFTY">BANK NIFTY</option>
             <option value="FINNIFTY">FIN NIFTY</option>
+            <option value="SENSEX">BSE SENSEX</option>
           </Select>
           <div className="text-xs font-mono text-muted pl-2 border-l border-border">
             ATM: <span className="text-gold font-bold">{fmt(atm, 0)}</span>

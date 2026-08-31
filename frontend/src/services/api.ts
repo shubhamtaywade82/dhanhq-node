@@ -144,6 +144,12 @@ export const api = {
       body: JSON.stringify({ messages, model }),
     }),
 
+  backtestStrategy: (params: { symbol?: string; type?: string; days?: number; entryType?: string; targetPct?: number; slPct?: number; timeExit?: string; lots?: number; side?: string }) =>
+    request<any>('/api/control/strategy/backtest', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }),
+
   ollamaHealth: () => request<{ status: string }>('/api/ollama/health'),
   ollamaModels: () => request<any>('/api/ollama/models'),
 };

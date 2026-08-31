@@ -67,49 +67,61 @@ export async function createDhanClient(): Promise<DhanClient> {
   const clientId = (redisAvailable() ? await redisPublisher.get("dhan:auth:client_id").catch(() => null) : null)
     || process.env.DHAN_CLIENT_ID || process.env.CLIENT_ID || "";
   const accessToken = process.env.DHAN_ACCESS_TOKEN;
-  const authProviderUrl = process.env.DHAN_AUTH_PROVIDER_URL || process.env.DHAN_TOKEN_ENDPOINT;
-  const authProviderToken = process.env.DHAN_AUTH_PROVIDER_TOKEN || process.env.DHAN_TOKEN_ACCESS_TOKEN;
   const pin = process.env.DHAN_PIN;
   const totpSecret = process.env.DHAN_TOTP_SECRET;
+  const authProviderUrl = process.env.DHAN_AUTH_PROVIDER_URL || process.env.DHAN_TOKEN_ENDPOINT;
+  const authProviderToken = process.env.DHAN_AUTH_PROVIDER_TOKEN || process.env.DHAN_TOKEN_ACCESS_TOKEN;
 
-  if (accessToken && accessToken !== "your_access_token") {
-    return new DhanClient({ clientId, token: accessToken });
-  }
+  let memoryToken = (accessToken && accessToken !== "your_access_token") ? accessToken : null;
+  let memoryTokenAt = memoryToken ? Date.now() : 0;
 
-  if (authProviderUrl && authProviderToken) {
-    try {
-      const token = await fetchTokenFromRails(authProviderUrl, authProviderToken);
-      log.info("DhanHQ token fetched from Rails authority");
-      return new DhanClient({ clientId, token });
-    } catch (e: any) {
-      log.warn({ err: { message: e.message }, tier: "rails-authority" }, "Token authority unreachable — falling back to TOTP/Redis");
+  const resolveToken = async (): Promise<string> => {
+    // 1. Check in-memory token (valid for up to 12 hours)
+    if (memoryToken && Date.now() - memoryTokenAt < 12 * 3600 * 1000) {
+      return memoryToken;
     }
-  }
-
-  if (pin && totpSecret) {
+    // 2. Check Redis cached rotating token
     try {
-      const token = await generateTokenViaTotp(clientId, pin, totpSecret);
-      log.info("DhanHQ token generated via TOTP");
-      return new DhanClient({
-        clientId,
-        token,
-        tokenProvider: () => generateTokenViaTotp(clientId, pin, totpSecret),
-      });
-    } catch (e: any) {
-      log.warn({ err: { message: e.message }, tier: "totp" }, "TOTP generation failed — falling back to Redis token");
+      const rToken = await redisPublisher.get("dhan:auth:access_token").catch(() => null);
+      if (rToken) {
+        memoryToken = rToken;
+        memoryTokenAt = Date.now();
+        return rToken;
+      }
+    } catch { /* Redis optional */ }
+    // 3. Fallback to Rails authority if configured
+    if (authProviderUrl && authProviderToken) {
+      try {
+        const rToken = await fetchTokenFromRails(authProviderUrl, authProviderToken);
+        memoryToken = rToken;
+        memoryTokenAt = Date.now();
+        log.info("DhanHQ token fetched from Rails authority");
+        return rToken;
+      } catch (e: any) {
+        log.warn({ err: { message: e.message }, tier: "rails-authority" }, "Token authority unreachable — falling back to TOTP");
+      }
     }
-  }
+    // 4. Fallback to TOTP generation
+    if (pin && totpSecret) {
+      try {
+        const tToken = await generateTokenViaTotp(clientId, pin, totpSecret);
+        memoryToken = tToken;
+        memoryTokenAt = Date.now();
+        log.info("DhanHQ token generated via TOTP");
+        return tToken;
+      } catch (e: any) {
+        log.warn({ err: { message: e.message }, tier: "totp" }, "TOTP generation failed");
+      }
+    }
+    if (memoryToken) return memoryToken;
+    throw new Error("[Sidecar] No DhanHQ credentials configured (set DHAN_ACCESS_TOKEN, TOTP secrets, or Redis token).");
+  };
 
+  const initialToken = await resolveToken().catch(() => "");
   const client = new DhanClient({
     clientId,
-    tokenProvider: async () => {
-      if (redisAvailable()) {
-        const token = await redisPublisher.get("dhan:auth:access_token").catch(() => null);
-        if (token) return token;
-      }
-      if (pin && totpSecret) return generateTokenViaTotp(clientId, pin, totpSecret);
-      throw new Error("[Sidecar] No DhanHQ credentials configured (set DHAN_ACCESS_TOKEN, TOTP secrets, or Redis token).");
-    },
+    token: initialToken || undefined,
+    tokenProvider: resolveToken,
   });
 
   setupTokenRotationSubscriber();

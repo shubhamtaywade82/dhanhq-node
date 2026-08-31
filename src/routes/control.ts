@@ -6,6 +6,8 @@ import type { AgentOrchestrator } from '../services/agent';
 import type { MarketDataService } from '../services/marketData';
 import { eventBus } from '../services/eventBus';
 import { listAlerts, pushAlert } from '../db';
+import { evaluateStrategyBacktest } from '../services/strategyConstructor';
+import { analyzeOptionsBehavior } from './market';
 
 /**
  * Control-plane routes.
@@ -145,6 +147,35 @@ export function controlRoutes(
     await pushAlert(level || 'INFO', 'control_plane', message || 'Manual test alert');
     eventBus.emit('alert', { level: level || 'INFO', source: 'control_plane', msg: message || 'Manual test alert' });
     res.json({ status: 'ok' });
+  });
+
+  // ── strategy backtest ───────────────────────────────────────────────
+  router.post('/strategy/backtest', async (req, res) => {
+    try {
+      const { symbol = 'NIFTY', type = 'STRADDLE', days = 5, entryType, targetPct, slPct, timeExit, lots, side } = req.body || {};
+      const secMap: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442' };
+      const sym = symbol.toUpperCase();
+      const secId = secMap[sym] || '13';
+      const histData = await analyzeOptionsBehavior(client, {
+        symbol: sym,
+        securityId: secId,
+        daysCount: Math.min(10, Math.max(1, Number(days) || 5)),
+        interval: '1',
+        expiryFlag: 'WEEK',
+        expiryCode: 1,
+      });
+      const report = evaluateStrategyBacktest(sym, type, histData.days || [], {
+        entryType,
+        targetPct: Number(targetPct) || 20,
+        slPct: Number(slPct) || 15,
+        timeExit: timeExit || '13:30',
+        lots: Number(lots) || 1,
+        side,
+      });
+      res.json(report);
+    } catch (e: any) {
+      res.status(500).json({ error: `Strategy backtest failed: ${e.message}` });
+    }
   });
 
   return router;

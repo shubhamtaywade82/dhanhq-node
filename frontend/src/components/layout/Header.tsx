@@ -26,11 +26,13 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
 
   const defaultIdx = { ltp: 24248.5, change: 85.3, pct: 0.35, high: 24300, low: 24100, open: 24163.2, prevClose: 24163.2 };
   const defaultBnf = { ltp: 51842.15, change: -120.45, pct: -0.23, high: 52000, low: 51700, open: 51962.6, prevClose: 51962.6 };
+  const defaultSensex = { ltp: 79800.0, change: -150.0, pct: -0.19, high: 80100, low: 79650, open: 79950, prevClose: 79950 };
   const defaultVix = { ltp: 13.42, change: -0.25, pct: -1.8, high: 13.8, low: 13.2, open: 13.67, prevClose: 13.67 };
 
   const indices = state.indices || {};
   const nifty = indices.NIFTY?.ltp ? indices.NIFTY : defaultIdx;
   const bnf = indices.BANKNIFTY?.ltp ? indices.BANKNIFTY : defaultBnf;
+  const sensex = indices.SENSEX?.ltp ? indices.SENSEX : defaultSensex;
   const vix = indices.INDIAVIX?.ltp ? indices.INDIAVIX : defaultVix;
 
   return (
@@ -81,6 +83,16 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
             >
               {bnf.change >= 0 ? "+" : ""}
               {fmt(bnf.pct)}%
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-muted text-[10px]">SENSEX</span>
+            <span className="text-white font-semibold">{fmt(sensex.ltp)}</span>
+            <span
+              className={`text-[10px] ${sensex.change >= 0 ? "text-accent" : "text-danger"}`}
+            >
+              {sensex.change >= 0 ? "+" : ""}
+              {fmt(sensex.pct)}%
             </span>
           </div>
           <div className="flex items-center gap-1.5">

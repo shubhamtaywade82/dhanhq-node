@@ -37,6 +37,10 @@ async function stubEngines(ltp: number | null = 100) {
   const market = stubMarket(ltp);
   const risk = new RiskEngine(client, market);
   await risk.start();
+  // Hermetic mock: decouple pricing and execution tests from the host's wall-clock EOD window
+  jest.spyOn(risk, 'canTrade').mockImplementation(() =>
+    risk.isKilled() ? { allowed: false, reason: 'Kill switch engaged' } : { allowed: true }
+  );
   const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
   const live = new LiveExecutionEngine(client, (client as any).tracker ?? ({} as any), market.monitor, market, risk);
   const agent = new AgentOrchestrator(client, market, risk, paper, live);

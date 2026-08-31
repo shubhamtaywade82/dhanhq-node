@@ -120,7 +120,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
 }
 
 function securityIdFor(symbol: string): string {
-  const map: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', INDIAVIX: '26' };
+  const map: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', SENSEX: '51', INDIAVIX: '26' };
   return map[symbol.toUpperCase()] || '13';
 }
 
@@ -174,7 +174,7 @@ function yearsTo(expiry: string): number {
 
 const STRIKES_LIST = ['ATM', 'ATM+1', 'ATM-1', 'ATM+2', 'ATM-2', 'ATM+3', 'ATM-3', 'ATM+4', 'ATM-4', 'ATM+5', 'ATM-5'];
 
-interface AnalysisParams {
+export interface AnalysisParams {
   symbol: string;
   securityId: string;
   daysCount: number;
@@ -183,7 +183,7 @@ interface AnalysisParams {
   expiryCode: number;
 }
 
-async function analyzeOptionsBehavior(client: DhanClient, params: AnalysisParams) {
+export async function analyzeOptionsBehavior(client: DhanClient, params: AnalysisParams) {
   const realDays = await fetchSpotHistoricalDays(client, params);
   if (realDays.length === 0) {
     // Honest failure — no simulated candle data.

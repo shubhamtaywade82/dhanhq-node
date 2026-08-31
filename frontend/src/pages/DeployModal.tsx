@@ -23,7 +23,7 @@ export function openDeployStrategyModal(
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="text-[9px] font-mono text-muted uppercase block mb-1">Symbol</label>
-            <Select id="newStratSymbol" className="w-full"><option>NIFTY</option><option>BANKNIFTY</option><option>FINNIFTY</option></Select>
+            <Select id="newStratSymbol" className="w-full"><option>NIFTY</option><option>BANKNIFTY</option><option>FINNIFTY</option><option>SENSEX</option></Select>
           </div>
           <div>
             <label className="text-[9px] font-mono text-muted uppercase block mb-1">Strategy Type</label>
@@ -48,14 +48,15 @@ export function openDeployStrategyModal(
           const sym = (document.getElementById('newStratSymbol') as HTMLSelectElement)?.value || 'NIFTY';
           const type = (document.getElementById('newStratType') as HTMLSelectElement)?.value || 'STRADDLE';
           const lots = parseInt((document.getElementById('newStratLots') as HTMLInputElement)?.value || '2', 10);
-          const lotSize = sym === 'BANKNIFTY' ? 15 : 25;
+          const lotSize = sym === 'SENSEX' ? 10 : sym === 'BANKNIFTY' ? 15 : 25;
           const qty = lots * lotSize;
 
           closeModal();
           try {
+            const strike = sym === 'SENSEX' ? '79800' : sym === 'BANKNIFTY' ? '51500' : '24500';
             const legs = [
-              { instrument: `${sym}24JAN${sym === 'BANKNIFTY' ? '51500' : '24500'}CE`, side: 'SELL' as const, qty, bAvg: 0, sAvg: 195, ltp: 195, delta: -0.5, gamma: -0.003, theta: 8.2, vega: -12.4 },
-              { instrument: `${sym}24JAN${sym === 'BANKNIFTY' ? '51500' : '24500'}PE`, side: 'SELL' as const, qty, bAvg: 0, sAvg: 170, ltp: 170, delta: 0.5, gamma: -0.003, theta: 7.8, vega: -11.9 },
+              { instrument: `${sym}24JAN${strike}CE`, side: 'SELL' as const, qty, bAvg: 0, sAvg: 195, ltp: 195, delta: -0.5, gamma: -0.003, theta: 8.2, vega: -12.4 },
+              { instrument: `${sym}24JAN${strike}PE`, side: 'SELL' as const, qty, bAvg: 0, sAvg: 170, ltp: 170, delta: 0.5, gamma: -0.003, theta: 7.8, vega: -11.9 },
             ];
             await api.deployStrategy({ name, symbol: sym, type, lots, legs });
             if (refreshPortfolio) await refreshPortfolio();

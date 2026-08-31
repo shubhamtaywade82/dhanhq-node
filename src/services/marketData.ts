@@ -24,6 +24,7 @@ export const INDEX_INSTRUMENTS: Record<string, { securityId: string; label: stri
   BANKNIFTY: { securityId: '25', label: 'NIFTY BANK' },
   FINNIFTY: { securityId: '27', label: 'NIFTY FIN SERVICE' },
   MIDCPNIFTY: { securityId: '442', label: 'NIFTY MID SELECT' },
+  SENSEX: { securityId: '51', label: 'BSE SENSEX' },
   INDIAVIX: { securityId: '26', label: 'INDIA VIX' },
 };
 
