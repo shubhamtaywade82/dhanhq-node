@@ -109,6 +109,14 @@ export class MarketDataService {
     try {
       patchOrderWsSafety();
       const ws: any = (this.client as any).ws;
+      if (ws.market) {
+        // Index instruments (IDX_I) require ticker mode (RequestCode 15) as they lack order depth
+        ws.market.mode = 'ticker';
+        // Register subscriptions upfront so onOpen automatically transmits them
+        ws.market.subscribe(
+          INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
+        );
+      }
       if (!this.wsListenersAttached) {
         this.wsListenersAttached = true;
         ws.market?.on?.('tick', (tick: any) => {
@@ -122,10 +130,10 @@ export class MarketDataService {
           eventBus.emit('order', { kind: 'order_update', order });
         });
       }
-      ws.connect?.().then(() => {
-        ws.market?.subscribe?.(
-          INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
-        );
+      const connects: Promise<any>[] = [];
+      if (ws.market?.connect) connects.push(ws.market.connect());
+      if (ws.orders?.connect) connects.push(ws.orders.connect().catch(() => {}));
+      Promise.allSettled(connects).then(() => {
         this.wsStarted = true;
         this.wsRetryAttempts = 0;
         eventBus.log('INFO', 'DhanHQ binary WebSocket connected — real-time tick stream live', 'market_data');
@@ -246,7 +254,23 @@ export class MarketDataService {
     if (!secId) return;
     const symbol = SEC_TO_SYMBOL[secId];
     const prev = this.quotes.get(secId);
+
+    // Prev-close packets update baseline without overwriting LTP with zero
+    if (tick.type === 'prev-close' && typeof tick.previousClose === 'number') {
+      if (prev) {
+        prev.prevClose = tick.previousClose;
+        prev.change = prev.ltp ? prev.ltp - prev.prevClose : 0;
+        prev.pctChange = prev.prevClose ? (prev.change / prev.prevClose) * 100 : 0;
+        prev.updatedAt = Date.now();
+        if (symbol && prev.ltp > 0) {
+          eventBus.emit('tick', { symbol, data: this.toTickPayload(prev) });
+        }
+      }
+      return;
+    }
+
     const ltp = Number(tick.ltp ?? tick.lastTradedPrice ?? prev?.ltp ?? 0);
+    if (!ltp) return;
     const prevClose = Number(tick.close ?? prev?.prevClose ?? ltp);
     const snap: QuoteSnapshot = {
       securityId: secId,
