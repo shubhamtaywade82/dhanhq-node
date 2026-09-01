@@ -1,6 +1,7 @@
 import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
+import { LerpNumber } from '../components/ui/LerpNumber';
 import { fmt, fmtINR, pnlClass, sideClass } from '../utils/formatters';
 import { RotateCcw, Power } from 'lucide-react';
 import { api } from '../services/api';
@@ -27,6 +28,9 @@ export function Positions() {
       sAvg: sellAvg,
       ltp,
       pnl,
+      stopLoss: p.stopLoss ?? p.stop_loss ?? null,
+      target: p.target ?? null,
+      trailingStop: p.trailingStop ?? p.trailing_stop ?? null,
       delta: '0.00',
       theta: '0',
       product: p.productType || p.product_type || 'INTRADAY',
@@ -73,7 +77,7 @@ export function Positions() {
       <div className="flex items-center justify-between">
         <div>
           <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">Active Positions & MTM</div>
-          <div className="text-xs text-muted mt-0.5">PostgreSQL persistent paper positions with real-time P&L tracking</div>
+          <div className="text-xs text-muted mt-0.5">PostgreSQL persistent paper positions with automated SL/TP & Trailing monitoring</div>
         </div>
         <div className="flex gap-2">
           <Button variant="ghost" onClick={async () => { await refreshPortfolio(); showToast('Portfolio synced with database', 'success'); }}><RotateCcw size={12} className="mr-1" /> Refresh Positions</Button>
@@ -82,10 +86,10 @@ export function Positions() {
       </div>
 
       <Card className="overflow-x-auto">
-        <table className="data-table">
+        <table className="data-table w-full">
           <thead>
             <tr>
-              {['Strategy', 'Instrument', 'Side', 'Net Qty', 'Buy Avg', 'Sell Avg', 'LTP', 'P&L', 'Product', 'Actions'].map(h => (
+              {['Strategy', 'Instrument', 'Side', 'Net Qty', 'Avg Price', 'LTP', 'Stop Loss', 'Target (TP)', 'Trailing SL', 'P&L', 'Product', 'Actions'].map(h => (
                 <th key={h} className="text-left px-2.5 py-2 text-muted font-medium border-b border-border text-[9.5px] uppercase tracking-[0.5px]">{h}</th>
               ))}
             </tr>
@@ -93,7 +97,7 @@ export function Positions() {
           <tbody>
             {realPositions.length === 0 ? (
               <tr>
-                <td colSpan={10} className="text-center py-8 text-muted text-xs">No open positions. Place a paper trade to start!</td>
+                <td colSpan={12} className="text-center py-8 text-muted text-xs">No open positions. Place a paper trade to start!</td>
               </tr>
             ) : (
               realPositions.map((p, i) => (
@@ -102,11 +106,19 @@ export function Positions() {
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-white font-semibold">{p.instrument}</td>
                   <td className={`px-2.5 py-[7px] border-b border-border/60 font-bold ${sideClass(p.side)}`}>{p.side}</td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-white font-mono">{p.qty}</td>
-                  <td className="px-2.5 py-[7px] border-b border-border/60 text-white">{p.bAvg ? fmt(p.bAvg) : '-'}</td>
-                  <td className="px-2.5 py-[7px] border-b border-border/60 text-white">{p.sAvg ? fmt(p.sAvg) : '-'}</td>
-                  <td className="px-2.5 py-[7px] border-b border-border/60 text-white font-semibold">{fmt(p.ltp)}</td>
-                  <td className={`px-2.5 py-[7px] border-b border-border/60 font-bold ${pnlClass(p.pnl)}`}>{fmtINR(p.pnl)}</td>
-                  <td className="px-2.5 py-[7px] border-b border-border/60 text-muted">{p.product}</td>
+                  <td className="px-2.5 py-[7px] border-b border-border/60 text-white font-mono">{p.bAvg ? fmt(p.bAvg) : (p.sAvg ? fmt(p.sAvg) : '-')}</td>
+                  <td className="px-2.5 py-[7px] border-b border-border/60 text-white font-semibold font-mono"><LerpNumber value={p.ltp} /></td>
+                  <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-danger font-semibold">
+                    {p.stopLoss ? `₹${fmt(p.stopLoss)}` : <span className="text-muted font-normal text-[10px]">Auto (Risk)</span>}
+                  </td>
+                  <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-accent font-semibold">
+                    {p.target ? `₹${fmt(p.target)}` : <span className="text-muted font-normal text-[10px]">15:20 EOD</span>}
+                  </td>
+                  <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-sky text-[10px]">
+                    {p.trailingStop ? `±₹${p.trailingStop}` : <span className="text-muted font-normal">Active</span>}
+                  </td>
+                  <td className={`px-2.5 py-[7px] border-b border-border/60 font-bold font-mono ${pnlClass(p.pnl)}`}><LerpNumber value={p.pnl} format={fmtINR} /></td>
+                  <td className="px-2.5 py-[7px] border-b border-border/60 text-muted text-[10px]">{p.product}</td>
                   <td className="px-2.5 py-[7px] border-b border-border/60">
                     <Button variant="danger" className="text-[9px] px-2 py-0.5" onClick={() => handleClose(p.instrument, p.ltp)}>Close</Button>
                   </td>

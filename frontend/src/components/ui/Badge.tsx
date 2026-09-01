@@ -19,6 +19,8 @@ export function Badge({ status, className = '' }: { status: string; className?: 
 export function StratBadge({ status }: { status: string }) {
   const map: Record<string, { dot: string; cls: string; pulse: boolean }> = {
     RUNNING: { dot: 'bg-accent shadow-[0_0_6px_var(--color-accent)]', cls: 'text-accent', pulse: true },
+    MONITORING: { dot: 'bg-sky shadow-[0_0_6px_var(--color-sky)]', cls: 'text-sky', pulse: true },
+    READY: { dot: 'bg-sky shadow-[0_0_6px_var(--color-sky)]', cls: 'text-sky', pulse: true },
     PAUSED: { dot: 'bg-gold shadow-[0_0_6px_var(--color-gold)]', cls: 'text-gold', pulse: false },
     STOPPED: { dot: 'bg-muted', cls: 'text-muted', pulse: false },
   };

@@ -108,9 +108,16 @@ const SCHEMA_SQL = `
   ON CONFLICT (id) DO NOTHING;
   ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS latency_ms INTEGER;
   ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
+  ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS stop_loss NUMERIC(12, 2);
+  ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS target NUMERIC(12, 2);
+  ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS trailing_stop NUMERIC(12, 2);
 `;
 
 export async function initDatabase(): Promise<void> {
+  if (process.env.NODE_ENV === 'test' && !process.env.TEST_DATABASE_URL) {
+    mode = 'memory';
+    return;
+  }
   const client = await pool.connect().catch(() => null);
   if (!client) {
     mode = 'memory';
@@ -328,18 +335,20 @@ export async function listPaperStrategies() {
   }));
 }
 
-export async function createPaperStrategy(s: { id?: string; name: string; symbol: string; type: string; lots: number; legs: any[] }) {
+export async function createPaperStrategy(s: { id?: string; name: string; symbol: string; type: string; lots: number; legs: any[]; status?: string }) {
   const id = s.id || `strat_${Date.now().toString(36)}`;
+  const status = s.status || 'RUNNING';
   if (mode === 'postgres') {
     await pool.query(
       `INSERT INTO paper_strategies (id, name, symbol, strategy_type, status, lots, legs, updated_at)
-       VALUES ($1, $2, $3, $4, 'RUNNING', $5, $6, NOW())`,
-      [id, s.name, s.symbol, s.type, s.lots, JSON.stringify(s.legs)],
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (id) DO UPDATE SET name = $2, symbol = $3, strategy_type = $4, status = $5, lots = $6, legs = $7, updated_at = NOW()`,
+      [id, s.name, s.symbol, s.type, status, s.lots, JSON.stringify(s.legs)],
     );
   } else {
-    mem.strategies.unshift({ id, name: s.name, symbol: s.symbol, strategy_type: s.type, status: 'RUNNING', lots: s.lots, legs: s.legs, entry_time: new Date(), updated_at: new Date() });
+    mem.strategies.unshift({ id, name: s.name, symbol: s.symbol, strategy_type: s.type, status, lots: s.lots, legs: s.legs, entry_time: new Date(), updated_at: new Date() });
   }
-  return { id, status: 'RUNNING' };
+  return { id, status };
 }
 
 export async function updatePaperStrategyStatus(id: string, status: string) {
@@ -467,6 +476,9 @@ export interface PaperOrderInput {
   price?: number;
   correlationId?: string;
   realizedPnl?: number;
+  stopLoss?: number;
+  target?: number;
+  trailingStop?: number;
 }
 
 function calculateBuyUpdate(pos: any, qty: number, price: number) {
@@ -539,10 +551,10 @@ export async function executePaperOrder(input: PaperOrderInput) {
       );
 
       await client.query(
-        `INSERT INTO paper_positions (id, symbol, security_id, exchange_segment, product_type, buy_qty, buy_avg, sell_qty, sell_avg, net_qty, realized_pnl, ltp, updated_at)
-         VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-         ON CONFLICT (id) DO UPDATE SET buy_qty = $5, buy_avg = $6, sell_qty = $7, sell_avg = $8, net_qty = $9, realized_pnl = $10, ltp = $11, updated_at = NOW()`,
-        [sym, input.securityId || '0', input.exchangeSegment || 'NSE_FNO', input.productType || 'INTRADAY', u.buyQty, u.buyAvg, u.sellQty, u.sellAvg, u.netQty, newRealized, fillPrice],
+        `INSERT INTO paper_positions (id, symbol, security_id, exchange_segment, product_type, buy_qty, buy_avg, sell_qty, sell_avg, net_qty, realized_pnl, ltp, stop_loss, target, trailing_stop, updated_at)
+         VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+         ON CONFLICT (id) DO UPDATE SET buy_qty = $5, buy_avg = $6, sell_qty = $7, sell_avg = $8, net_qty = $9, realized_pnl = $10, ltp = $11, stop_loss = COALESCE($12, paper_positions.stop_loss), target = COALESCE($13, paper_positions.target), trailing_stop = COALESCE($14, paper_positions.trailing_stop), updated_at = NOW()`,
+        [sym, input.securityId || '0', input.exchangeSegment || 'NSE_FNO', input.productType || 'INTRADAY', u.buyQty, u.buyAvg, u.sellQty, u.sellAvg, u.netQty, newRealized, fillPrice, input.stopLoss ?? null, input.target ?? null, input.trailingStop ?? null],
       );
 
       const marginReq = u.netQty !== 0 ? Math.abs(u.netQty) * fillPrice * 0.15 : 0;
@@ -576,7 +588,11 @@ export async function executePaperOrder(input: PaperOrderInput) {
       id: sym, symbol: sym, security_id: input.securityId || '0', exchange_segment: input.exchangeSegment || 'NSE_FNO',
       product_type: input.productType || 'INTRADAY', buy_qty: u.buyQty, buy_avg: u.buyAvg,
       sell_qty: u.sellQty, sell_avg: u.sellAvg, net_qty: u.netQty,
-      realized_pnl: Number(curPos?.realized_pnl || 0) + u.realized, ltp: fillPrice, updated_at: new Date(),
+      realized_pnl: Number(curPos?.realized_pnl || 0) + u.realized, ltp: fillPrice,
+      stop_loss: input.stopLoss ?? curPos?.stop_loss,
+      target: input.target ?? curPos?.target,
+      trailing_stop: input.trailingStop ?? curPos?.trailing_stop,
+      updated_at: new Date(),
     });
     const marginReq = u.netQty !== 0 ? Math.abs(u.netQty) * fillPrice * 0.15 : 0;
     mem.wallet.realized_pnl = Number(mem.wallet.realized_pnl) + u.realized;
@@ -655,6 +671,9 @@ export async function listPaperPositions() {
       productType: r.product_type, buyQty: Number(r.buy_qty), buyAvg, sellQty: Number(r.sell_qty), sellAvg,
       netQty, realizedProfit: realized, unrealizedProfit: unrealized, rnl: realized, unrealizedPnl: unrealized,
       pnl: realized + unrealized, costPrice: cost, ltp, positionType: r.product_type, crossCurrency: false,
+      stopLoss: r.stop_loss ? Number(r.stop_loss) : null,
+      target: r.target ? Number(r.target) : null,
+      trailingStop: r.trailing_stop ? Number(r.trailing_stop) : null,
     };
   });
 }

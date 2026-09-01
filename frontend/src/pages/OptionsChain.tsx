@@ -3,6 +3,7 @@ import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Select } from '../components/ui/Select';
+import { LerpNumber } from '../components/ui/LerpNumber';
 import { fmt } from '../utils/formatters';
 import { RefreshCw } from 'lucide-react';
 import { api } from '../services/api';
@@ -236,11 +237,11 @@ function ChainRow({ row, isATM, maxOi, rowRef }: { row: OptionStrikeRow; isATM: 
       <td className="text-right px-2.5 py-[7px] border-b border-border/60 text-accent/80 font-mono text-[10px]">{fmt(row.ce.volume, 0)}</td>
       <td className="text-right px-2.5 py-[7px] border-b border-border/60 text-accent/80 font-mono text-[10px]">{row.ce.iv ? `${fmt(row.ce.iv, 1)}%` : '—'}</td>
       <td className="text-right px-2.5 py-[7px] border-b border-border/60 text-accent/80 font-mono text-[10px]">{row.ce.delta || '—'}</td>
-      <td className="text-right px-2.5 py-[7px] border-b border-border/60 text-accent font-semibold font-mono text-[10px]">{fmt(row.ce.ltp)}</td>
+      <td className="text-right px-2.5 py-[7px] border-b border-border/60 text-accent font-semibold font-mono text-[10px]"><LerpNumber value={row.ce.ltp} /></td>
       <td className={`text-center px-3 py-[7px] border-b border-border/60 font-bold font-mono text-[10.5px] bg-gold/5 ${isATM ? 'text-gold' : 'text-white'}`}>
         {fmt(row.strike, 0)}
       </td>
-      <td className="text-left px-2.5 py-[7px] border-b border-border/60 text-danger font-semibold font-mono text-[10px]">{fmt(row.pe.ltp)}</td>
+      <td className="text-left px-2.5 py-[7px] border-b border-border/60 text-danger font-semibold font-mono text-[10px]"><LerpNumber value={row.pe.ltp} /></td>
       <td className="text-left px-2.5 py-[7px] border-b border-border/60 text-danger/80 font-mono text-[10px]">{row.pe.delta || '—'}</td>
       <td className="text-left px-2.5 py-[7px] border-b border-border/60 text-danger/80 font-mono text-[10px]">{row.pe.iv ? `${fmt(row.pe.iv, 1)}%` : '—'}</td>
       <td className="text-left px-2.5 py-[7px] border-b border-border/60 text-danger/80 font-mono text-[10px]">{fmt(row.pe.volume, 0)}</td>
@@ -259,7 +260,7 @@ function SpotMarkerRow({ spot, rowRef }: { spot: number; rowRef?: RefObject<HTML
         <div className="relative h-5 flex items-center">
           <div className="absolute inset-x-0 h-px bg-sky/50" />
           <div className="mx-auto px-2 py-0.5 rounded bg-sky text-surface-50 text-[9.5px] font-mono font-bold z-10">
-            {fmt(spot)} SPOT
+            <LerpNumber value={spot} /> SPOT
           </div>
         </div>
       </td>

@@ -1,4 +1,8 @@
 import { selectStrikeByDelta, selectStrikeByPremiumTarget } from './optionsAnalytics';
+import { listPaperStrategies, createPaperStrategy } from '../db';
+import { INDEX_INSTRUMENTS } from './marketData';
+import { nearestIndexExpiry } from './marketHours';
+import { eventBus } from './eventBus';
 
 export interface StrategyLeg {
   instrument: string;
@@ -9,14 +13,25 @@ export interface StrategyLeg {
   optionType: 'CE' | 'PE';
   price: number;
   exchangeSegment: string;
+  stopLoss?: number;
+  target?: number;
+  trailingStop?: { distance: number };
 }
 
 export type StrategyType =
   | 'IRON_CONDOR'
+  | 'IRON_BUTTERFLY'
   | 'BULL_PUT_SPREAD'
   | 'BEAR_CALL_SPREAD'
+  | 'BULL_CALL_SPREAD'
+  | 'BEAR_PUT_SPREAD'
   | 'STRADDLE'
+  | 'SHORT_STRADDLE'
+  | 'LONG_STRADDLE'
   | 'STRANGLE'
+  | 'SHORT_STRANGLE'
+  | 'LONG_STRANGLE'
+  | 'RATIO_SPREAD'
   | 'ORB_15M'
   | 'ORB_30M'
   | 'ORB_PREMIUM_200'
@@ -376,6 +391,178 @@ export function buildStrangle(
   };
 }
 
+/**
+ * Builds an Iron Butterfly:
+ * - Buy OTM Put (wing hedge, delta ~0.15) [BUY FIRST for margin relief]
+ * - Buy OTM Call (wing hedge, delta ~0.15) [BUY FIRST for margin relief]
+ * - Sell ATM Put (delta ~0.50)
+ * - Sell ATM Call (delta ~0.50)
+ */
+export function buildIronButterfly(
+  symbol: string,
+  spot: number,
+  chainRows: any[],
+  expiry: string,
+  lots = 1
+): ConstructedStrategy | null {
+  const lotSize = getLotSize(symbol);
+  const qty = lots * lotSize;
+
+  const atmCall = selectStrikeByDelta(chainRows, 0.50, 'CALL', spot, expiry);
+  const atmPut = selectStrikeByDelta(chainRows, 0.50, 'PUT', spot, expiry);
+  const otmCall = selectStrikeByDelta(chainRows, 0.15, 'CALL', spot, expiry);
+  const otmPut = selectStrikeByDelta(chainRows, 0.15, 'PUT', spot, expiry);
+
+  if (!atmCall || !atmPut || !otmCall || !otmPut) return null;
+
+  const legs: StrategyLeg[] = [
+    toLeg(otmPut, 'PUT', 'BUY', qty, symbol),
+    toLeg(otmCall, 'CALL', 'BUY', qty, symbol),
+    toLeg(atmPut, 'PUT', 'SELL', qty, symbol),
+    toLeg(atmCall, 'CALL', 'SELL', qty, symbol),
+  ];
+
+  const netCredit = (atmCall.targetLeg?.ltp || 0) + (atmPut.targetLeg?.ltp || 0)
+    - (otmCall.targetLeg?.ltp || 0) - (otmPut.targetLeg?.ltp || 0);
+
+  return {
+    id: `strat_ib_${Date.now().toString(36)}`,
+    name: `${symbol} Iron Butterfly (${atmCall.strike})`,
+    symbol,
+    type: 'IRON_BUTTERFLY',
+    lots,
+    legs,
+    estimatedNetPremium: Number((netCredit * qty).toFixed(2)),
+    lotSize,
+  };
+}
+
+/**
+ * Builds a Vertical Debit Spread:
+ * - Bull Call Spread (Bullish): Buy ATM Call (Delta 0.50) + Sell OTM Call (Delta 0.25)
+ * - Bear Put Spread (Bearish): Buy ATM Put (Delta 0.50) + Sell OTM Put (Delta 0.25)
+ */
+export function buildDebitSpread(
+  symbol: string,
+  direction: 'BULLISH' | 'BEARISH',
+  spot: number,
+  chainRows: any[],
+  expiry: string,
+  lots = 1
+): ConstructedStrategy | null {
+  const lotSize = getLotSize(symbol);
+  const qty = lots * lotSize;
+  const optType = direction === 'BULLISH' ? 'CALL' : 'PUT';
+
+  const longLeg = selectStrikeByDelta(chainRows, 0.50, optType, spot, expiry);
+  const shortLeg = selectStrikeByDelta(chainRows, 0.25, optType, spot, expiry);
+  if (!longLeg || !shortLeg) return null;
+
+  const legs: StrategyLeg[] = [
+    toLeg(longLeg, optType, 'BUY', qty, symbol),
+    toLeg(shortLeg, optType, 'SELL', qty, symbol),
+  ];
+
+  const netDebit = (longLeg.targetLeg?.ltp || 0) - (shortLeg.targetLeg?.ltp || 0);
+
+  return {
+    id: `strat_ds_${Date.now().toString(36)}`,
+    name: `${symbol} ${direction === 'BULLISH' ? 'Bull Call' : 'Bear Put'} Debit Spread`,
+    symbol,
+    type: direction === 'BULLISH' ? 'BULL_CALL_SPREAD' : 'BEAR_PUT_SPREAD',
+    lots,
+    legs,
+    estimatedNetPremium: Number((-(netDebit * qty)).toFixed(2)),
+    lotSize,
+  };
+}
+
+/**
+ * Builds a 1x2 Ratio Spread:
+ * - Buy 1 ATM contract + Sell 2 OTM contracts for low debit or net credit.
+ */
+export function buildRatioSpread(
+  symbol: string,
+  direction: 'BULLISH' | 'BEARISH',
+  spot: number,
+  chainRows: any[],
+  expiry: string,
+  lots = 1
+): ConstructedStrategy | null {
+  const lotSize = getLotSize(symbol);
+  const optType = direction === 'BULLISH' ? 'CALL' : 'PUT';
+
+  const longLeg = selectStrikeByDelta(chainRows, 0.50, optType, spot, expiry);
+  const shortLeg = selectStrikeByDelta(chainRows, 0.20, optType, spot, expiry);
+  if (!longLeg || !shortLeg) return null;
+
+  const legs: StrategyLeg[] = [
+    toLeg(longLeg, optType, 'BUY', lots * lotSize, symbol),
+    toLeg(shortLeg, optType, 'SELL', lots * lotSize * 2, symbol),
+  ];
+
+  const netPrem = (shortLeg.targetLeg?.ltp || 0) * 2 - (longLeg.targetLeg?.ltp || 0);
+
+  return {
+    id: `strat_ratio_${Date.now().toString(36)}`,
+    name: `${symbol} ${direction} 1x2 Ratio Spread`,
+    symbol,
+    type: 'RATIO_SPREAD',
+    lots,
+    legs,
+    estimatedNetPremium: Number((netPrem * lots * lotSize).toFixed(2)),
+    lotSize,
+  };
+}
+
+/**
+ * Builds a 30-Minute Opening Range Breakout (ORB 30M) strategy.
+ */
+export function buildOrb30mStrategy(
+  symbol: string,
+  spot: number,
+  chainRows: any[],
+  expiry: string,
+  lots = 1,
+  direction: 'BULLISH' | 'BEARISH' = 'BULLISH'
+): ConstructedStrategy | null {
+  const strat = buildOrbBuyingStrategy(symbol, spot, chainRows, expiry, lots, direction);
+  if (!strat) return null;
+  strat.type = 'ORB_30M';
+  strat.name = `${symbol} 30m ORB Buy ${direction === 'BULLISH' ? 'Call' : 'Put'} (${strat.legs[0]?.strike})`;
+  return strat;
+}
+
+/**
+ * Builds an EMA 9/21 Crossover Trend-Following buying strategy.
+ */
+export function buildEmaCrossoverStrategy(
+  symbol: string,
+  spot: number,
+  chainRows: any[],
+  expiry: string,
+  lots = 1,
+  direction: 'BULLISH' | 'BEARISH' = 'BULLISH'
+): ConstructedStrategy | null {
+  const lotSize = getLotSize(symbol);
+  const qty = lots * lotSize;
+  const optType = direction === 'BULLISH' ? 'CALL' : 'PUT';
+  const strikeRow = selectStrikeByDelta(chainRows, 0.55, optType, spot, expiry);
+  if (!strikeRow) return null;
+
+  const leg = toLeg(strikeRow, optType, 'BUY', qty, symbol);
+  return {
+    id: `strat_ema_${Date.now().toString(36)}`,
+    name: `${symbol} EMA Crossover ${direction === 'BULLISH' ? 'CE' : 'PE'} (${leg.strike})`,
+    symbol,
+    type: 'EMA_CROSSOVER',
+    lots,
+    legs: [leg],
+    estimatedNetPremium: Number((-(leg.price * qty)).toFixed(2)),
+    lotSize,
+  };
+}
+
 // ── Helpers ───────────────────────────────────────────────────────
 
 function toLeg(row: any, type: 'CALL' | 'PUT', side: 'BUY' | 'SELL', qty: number, symbol: string): StrategyLeg {
@@ -383,6 +570,15 @@ function toLeg(row: any, type: 'CALL' | 'PUT', side: 'BUY' | 'SELL', qty: number
   const strike = row.strike;
   const optSuffix = type === 'CALL' ? 'CE' : 'PE';
   const sym = leg.tradingSymbol || leg.symbol || `${symbol}${strike}${optSuffix}`;
+  const price = Number(leg.ltp || leg.lastPrice || leg.last_price || 0);
+
+  // Dynamic SL / TP / Trailing calculation based on trade side:
+  // Long Options (debit): 25% SL, 50% TP (2:1 R:R), 10% Trailing distance
+  // Short Options (credit): 60% SL on sold premium, 70% theta decay capture TP, 15% Trailing distance
+  const isBuy = side === 'BUY';
+  const stopLoss = price > 0 ? Number((isBuy ? price * 0.75 : price * 1.60).toFixed(2)) : undefined;
+  const target = price > 0 ? Number((isBuy ? price * 1.50 : price * 0.30).toFixed(2)) : undefined;
+  const trailDist = price > 0 ? Number((price * (isBuy ? 0.10 : 0.15)).toFixed(2)) : undefined;
 
   return {
     instrument: sym,
@@ -391,8 +587,11 @@ function toLeg(row: any, type: 'CALL' | 'PUT', side: 'BUY' | 'SELL', qty: number
     qty,
     strike,
     optionType: optSuffix,
-    price: Number(leg.ltp || leg.lastPrice || leg.last_price || 0),
+    price,
     exchangeSegment: 'NSE_FNO',
+    stopLoss,
+    target,
+    trailingStop: trailDist && trailDist > 0 ? { distance: trailDist } : undefined,
   };
 }
 
@@ -531,4 +730,133 @@ function trackTradeProgression(timeline: any[], entryIdx: number, entryBase: num
     if (cfg.timeExit && pt.time >= cfg.timeExit) { exitIdx = i; reason = `Time Exit ${cfg.timeExit}`; status = 'TIME_EXIT'; break; }
   }
   return { exitIdx, reason, status, maxGain, maxDrop };
+}
+
+/**
+ * Seeds well-known option trading strategies across NIFTY and BANKNIFTY
+ * so standard setups are immediately active and visible in the UI.
+ */
+export async function seedStandardStrategies(
+  client: any,
+  market: any,
+  paper: any
+): Promise<number> {
+  try {
+    const existing = await listPaperStrategies();
+    if (existing && existing.length >= 4) return 0;
+
+    let count = 0;
+    const niftyExpiry = nearestIndexExpiry('NIFTY');
+    const niftySecId = Number(INDEX_INSTRUMENTS.NIFTY.securityId);
+    let niftyRows: any[] = [];
+    try {
+      const chain = await client.optionChain?.fetchNormalized?.({ underlyingScrip: niftySecId, underlyingSeg: 'IDX_I', expiry: niftyExpiry });
+      niftyRows = chain?.strikes || chain || [];
+    } catch { /* non-fatal */ }
+
+    const niftySpot = market.getLtp(niftySecId) || 24000;
+    if (niftyRows.length > 0) {
+      const ic = buildIronCondor('NIFTY', niftySpot, niftyRows, niftyExpiry, 1);
+      if (ic) { await deploySeeded(ic, paper, market); count++; }
+
+      const bps = buildCreditSpread('NIFTY', 'BULLISH', niftySpot, niftyRows, niftyExpiry, 1);
+      if (bps) { await deploySeeded(bps, paper, market); count++; }
+
+      const orb = buildOrbBuyingStrategy('NIFTY', niftySpot, niftyRows, niftyExpiry, 1, 'BULLISH');
+      if (orb) { await deploySeeded(orb, paper, market); count++; }
+
+      const vwap = buildVwapPullbackStrategy('NIFTY', niftySpot, niftyRows, niftyExpiry, 1, 'BULLISH');
+      if (vwap) { await deploySeeded(vwap, paper, market); count++; }
+    }
+
+    const bnfExpiry = nearestIndexExpiry('BANKNIFTY');
+    const bnfSecId = Number(INDEX_INSTRUMENTS.BANKNIFTY.securityId);
+    let bnfRows: any[] = [];
+    try {
+      const chain = await client.optionChain?.fetchNormalized?.({ underlyingScrip: bnfSecId, underlyingSeg: 'IDX_I', expiry: bnfExpiry });
+      bnfRows = chain?.strikes || chain || [];
+    } catch { /* non-fatal */ }
+
+    const bnfSpot = market.getLtp(bnfSecId) || 57200;
+    if (bnfRows.length > 0) {
+      const ib = buildIronButterfly('BANKNIFTY', bnfSpot, bnfRows, bnfExpiry, 1);
+      if (ib) { await deploySeeded(ib, paper, market); count++; }
+
+      const bcs = buildCreditSpread('BANKNIFTY', 'BEARISH', bnfSpot, bnfRows, bnfExpiry, 1);
+      if (bcs) { await deploySeeded(bcs, paper, market); count++; }
+    }
+
+    // 3. FINNIFTY Strategies
+    const finExpiry = nearestIndexExpiry('FINNIFTY');
+    const finSecId = Number(INDEX_INSTRUMENTS.FINNIFTY?.securityId || '27');
+    let finRows: any[] = [];
+    try {
+      const chain = await client.optionChain?.fetchNormalized?.({ underlyingScrip: finSecId, underlyingSeg: 'IDX_I', expiry: finExpiry });
+      finRows = chain?.strikes || chain || [];
+    } catch { /* non-fatal */ }
+
+    const finSpot = market.getLtp(finSecId) || 25900;
+    if (finRows.length > 0) {
+      const strad = buildStraddle('FINNIFTY', finSpot, finRows, finExpiry, 1, 'SELL');
+      if (strad) { await deploySeeded(strad, paper, market); count++; }
+
+      const ds = buildDebitSpread('FINNIFTY', 'BULLISH', finSpot, finRows, finExpiry, 1);
+      if (ds) { await deploySeeded(ds, paper, market); count++; }
+    }
+
+    // 4. SENSEX Strategies (BSE F&O)
+    const snxExpiry = nearestIndexExpiry('SENSEX');
+    const snxSecId = Number(INDEX_INSTRUMENTS.SENSEX?.securityId || '51');
+    let snxRows: any[] = [];
+    try {
+      const chain = await client.optionChain?.fetchNormalized?.({ underlyingScrip: snxSecId, underlyingSeg: 'IDX_I', expiry: snxExpiry });
+      snxRows = chain?.strikes || chain || [];
+    } catch { /* non-fatal */ }
+
+    const snxSpot = market.getLtp(snxSecId) || 76900;
+    if (snxRows.length > 0) {
+      const ic = buildIronCondor('SENSEX', snxSpot, snxRows, snxExpiry, 1);
+      if (ic) { await deploySeeded(ic, paper, market); count++; }
+
+      const orb = buildOrbBuyingStrategy('SENSEX', snxSpot, snxRows, snxExpiry, 1, 'BEARISH');
+      if (orb) { await deploySeeded(orb, paper, market); count++; }
+    }
+
+    // 5. MIDCPNIFTY Strategies
+    const midExpiry = nearestIndexExpiry('MIDCPNIFTY');
+    const midSecId = Number(INDEX_INSTRUMENTS.MIDCPNIFTY?.securityId || '442');
+    let midRows: any[] = [];
+    try {
+      const chain = await client.optionChain?.fetchNormalized?.({ underlyingScrip: midSecId, underlyingSeg: 'IDX_I', expiry: midExpiry });
+      midRows = chain?.strikes || chain || [];
+    } catch { /* non-fatal */ }
+
+    const midSpot = market.getLtp(midSecId) || 12800;
+    if (midRows.length > 0) {
+      const bps = buildCreditSpread('MIDCPNIFTY', 'BULLISH', midSpot, midRows, midExpiry, 1);
+      if (bps) { await deploySeeded(bps, paper, market); count++; }
+    }
+
+    eventBus.log('SYSTEM', `Seeded ${count} standard option trading strategies across all watchlist indices`, 'strategy_engine');
+    return count;
+  } catch (e: any) {
+    eventBus.log('WARN', `Strategy seeding notice: ${e.message}`, 'strategy_engine');
+    return 0;
+  }
+}
+
+async function deploySeeded(strat: ConstructedStrategy, _paper: any, market: any): Promise<void> {
+  try {
+    market.addInstruments(strat.legs.map((l) => ({ securityId: l.securityId, exchangeSegment: l.exchangeSegment || 'NSE_FNO' })));
+    await createPaperStrategy({
+      id: strat.id,
+      name: strat.name,
+      symbol: strat.symbol,
+      type: strat.type,
+      lots: strat.lots,
+      legs: strat.legs,
+      status: 'MONITORING',
+    });
+    eventBus.log('SYSTEM', `Strategy ${strat.name} [MONITORING] — subscribed & waiting for entry signal / AI trigger`, 'strategy_engine');
+  } catch { /* non-fatal */ }
 }

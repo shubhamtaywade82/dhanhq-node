@@ -65,6 +65,10 @@ export class PaperExecutionEngine {
       ? referencePrice + this.slippageTicks * this.tickSize
       : referencePrice - this.slippageTicks * this.tickSize;
 
+    const trailDist = typeof risk_limits?.trailing_stop === 'object'
+      ? Number(risk_limits.trailing_stop.distance)
+      : (risk_limits?.trailing_stop ? Number(risk_limits.trailing_stop) : undefined);
+
     const result = await executePaperOrder({
       symbol,
       securityId: String(security_id),
@@ -75,6 +79,9 @@ export class PaperExecutionEngine {
       quantity,
       price: Number(fillPrice.toFixed(2)),
       correlationId: correlation_id,
+      stopLoss: risk_limits?.stop_loss ? Number(risk_limits.stop_loss) : undefined,
+      target: risk_limits?.target ? Number(risk_limits.target) : undefined,
+      trailingStop: trailDist,
     });
 
     const fillPayload = {

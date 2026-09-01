@@ -45,6 +45,18 @@ export function Strategies({ onDeploy }: StrategiesProps) {
     }
   }, [state.strategies, refreshPortfolio, showToast, addSystemLog]);
 
+  const executeStrategy = useCallback(async (id: string) => {
+    try {
+      const s = state.strategies.find((x) => x.id === id);
+      showToast(`Triggering execution for ${s?.name || id}...`, 'success');
+      await api.executeStrategy(id);
+      await refreshPortfolio();
+      addSystemLog('TRADE', `Manual AI trigger executed for strategy ${s?.name || id}`, 'agent');
+    } catch (e: any) {
+      showToast(`Execute failed: ${e.message}`, 'error');
+    }
+  }, [state.strategies, refreshPortfolio, showToast, addSystemLog]);
+
   const stopStrategy = useCallback((id: string) => {
     const s = state.strategies.find((x) => x.id === id);
     openModal(
@@ -83,6 +95,7 @@ export function Strategies({ onDeploy }: StrategiesProps) {
             <option value="BANKNIFTY">BANKNIFTY</option>
             <option value="FINNIFTY">FINNIFTY</option>
             <option value="SENSEX">SENSEX</option>
+            <option value="MIDCPNIFTY">MIDCPNIFTY</option>
           </Select>
           <Button onClick={onDeploy}><Plus size={14} /> Deploy Strategy</Button>
         </div>
@@ -95,7 +108,7 @@ export function Strategies({ onDeploy }: StrategiesProps) {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {filtered.map((s) => (
-            <StrategyCard key={s.id} strategy={s} onPause={pauseStrategy} onResume={resumeStrategy} onStop={stopStrategy} />
+            <StrategyCard key={s.id} strategy={s} onExecute={executeStrategy} onPause={pauseStrategy} onResume={resumeStrategy} onStop={stopStrategy} />
           ))}
         </div>
       )}
@@ -103,7 +116,7 @@ export function Strategies({ onDeploy }: StrategiesProps) {
   );
 }
 
-function StrategyCard({ strategy: s, onPause, onResume, onStop }: { strategy: Strategy; onPause: (id: string) => void; onResume: (id: string) => void; onStop: (id: string) => void }) {
+function StrategyCard({ strategy: s, onExecute, onPause, onResume, onStop }: { strategy: Strategy; onExecute: (id: string) => void; onPause: (id: string) => void; onResume: (id: string) => void; onStop: (id: string) => void }) {
   const legs = s.legs || [];
   const netDelta = legs.reduce((t, l) => t + (l.delta || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 100, 0);
   const netTheta = legs.reduce((t, l) => t + (l.theta || 0) * (l.side === 'SELL' ? -1 : 1) * l.qty / 100, 0);
@@ -113,7 +126,9 @@ function StrategyCard({ strategy: s, onPause, onResume, onStop }: { strategy: St
       <div className="flex items-center justify-between mb-3">
         <div>
           <div className="text-sm font-bold text-white">{s.name}</div>
-          <div className="text-[9.5px] font-mono text-muted mt-0.5">{s.id} · {s.symbol} · {s.type} · Entry: {s.entryTime}</div>
+          <div className="text-[9.5px] font-mono text-muted mt-0.5">
+            {s.id} · {s.symbol} · {s.type} {s.status === 'MONITORING' ? '· 📡 Waiting for live signal' : `· Entry: ${s.entryTime}`}
+          </div>
         </div>
         <StratBadge status={s.status} />
       </div>
@@ -154,6 +169,11 @@ function StrategyCard({ strategy: s, onPause, onResume, onStop }: { strategy: St
       </div>
 
       <div className="flex gap-2">
+        {s.status === 'MONITORING' && (
+          <Button variant="primary" className="flex-1 bg-sky hover:bg-sky/80 text-black font-semibold" onClick={() => onExecute(s.id)}>
+            <Play size={12} className="mr-1 fill-black" /> Execute Now (AI)
+          </Button>
+        )}
         {s.status === 'RUNNING' && <Button variant="ghost" className="flex-1" onClick={() => onPause(s.id)}><Pause size={12} /> Pause</Button>}
         {s.status === 'PAUSED' && <Button variant="ghost" className="flex-1 border-accent/30 text-accent" onClick={() => onResume(s.id)}><Play size={12} /> Resume</Button>}
         <Button variant="ghost" className="flex-1"><Sliders size={12} /> Adjust SL/TP</Button>

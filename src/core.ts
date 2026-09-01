@@ -27,6 +27,8 @@ export interface Core {
   selfHealing: SelfHealingService;
 }
 
+import { seedStandardStrategies } from './services/strategyConstructor';
+
 export async function startCore(): Promise<Core> {
   await initDatabase();
   const client = await createDhanClient();
@@ -61,6 +63,7 @@ export async function startCore(): Promise<Core> {
 
   await market.start();
   await seedExistingPositions(market);
+  await seedStandardStrategies(client, market, paper);
   await risk.start();
   await autonomy.start();
 

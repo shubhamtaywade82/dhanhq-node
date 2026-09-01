@@ -140,7 +140,7 @@ export class AutonomyEngine {
 
     this.lastScanAt = Date.now();
     try {
-      await this.agent.run('Autonomous options scan and execute for NIFTY and BANKNIFTY', 'autonomous_scanner');
+      await this.agent.run('Autonomous options scan and execute across all watchlist indices (NIFTY, BANKNIFTY, FINNIFTY, SENSEX, MIDCPNIFTY)', 'autonomous_scanner');
     } catch { /* agent busy or skipped */ }
   }
 

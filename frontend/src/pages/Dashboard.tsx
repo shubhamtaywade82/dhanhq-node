@@ -2,6 +2,7 @@ import { useApp } from "../store/AppContext";
 import { Card } from "../components/ui/Card";
 import { Badge, StratBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
+import { LerpNumber } from "../components/ui/LerpNumber";
 import { fmt, fmtINR, pnlClass, sideClass } from "../utils/formatters";
 import { usePnlChart } from "../hooks/usePnlChart";
 import { Plus, Brain } from "lucide-react";
@@ -42,21 +43,27 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
           <div>
             <div className="flex items-center justify-between mb-3 gap-2">
               <span className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Active Strategies</span>
-              <button className="text-[10px] font-mono text-accent hover:underline whitespace-nowrap" onClick={() => onNavigate("strategies")}>View All →</button>
+              <button className="text-[10px] font-mono text-accent hover:underline whitespace-nowrap" onClick={() => onNavigate("strategies")}>
+                View All ({state.strategies.filter((s) => s.status !== "STOPPED").length}) →
+              </button>
             </div>
-            <div className="space-y-2.5">
-              {state.strategies.filter((s) => s.status !== "STOPPED").map((s) => (
-                <div key={s.id} className="p-2.5 rounded-lg bg-surface-50 border border-border hover:border-[#2a3d5e] transition-all cursor-pointer" onClick={() => onNavigate("strategies")}>
-                  <div className="flex items-center justify-between mb-1 gap-2">
-                    <span className="text-[11px] font-semibold text-white truncate min-w-0">{s.name}</span>
-                    <StratBadge status={s.status} />
+            <div className="max-h-[320px] overflow-y-auto pr-1 space-y-2 scrollbar-thin scrollbar-thumb-border hover:scrollbar-thumb-muted/30">
+              {state.strategies.filter((s) => s.status !== "STOPPED").length === 0 ? (
+                <div className="text-center py-6 text-muted text-xs">No active strategies.</div>
+              ) : (
+                state.strategies.filter((s) => s.status !== "STOPPED").map((s) => (
+                  <div key={s.id} className="p-2.5 rounded-lg bg-surface-50 border border-border hover:border-[#2a3d5e] transition-all cursor-pointer" onClick={() => onNavigate("strategies")}>
+                    <div className="flex items-center justify-between mb-1 gap-2">
+                      <span className="text-[11px] font-semibold text-white truncate min-w-0">{s.name}</span>
+                      <StratBadge status={s.status} />
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[9px] font-mono text-muted shrink-0">{s.symbol} · {s.type} · {s.lots}L</span>
+                      <span className={`text-[11px] font-mono font-bold whitespace-nowrap ${pnlClass(s.pnl)}`}>{fmtINR(s.pnl)}</span>
+                    </div>
                   </div>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[9px] font-mono text-muted shrink-0">{s.symbol} · {s.type} · {s.lots}L</span>
-                    <span className={`text-[11px] font-mono font-bold whitespace-nowrap ${pnlClass(s.pnl)}`}>{fmtINR(s.pnl)}</span>
-                  </div>
-                </div>
-              ))}
+                ))
+              )}
             </div>
           </div>
           <Button className="w-full mt-3" onClick={onDeploy}><Plus size={14} /> Deploy New Strategy</Button>
@@ -76,9 +83,9 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
                     <div className="text-[9px] font-mono text-muted">SPOT</div>
                   </div>
                   <div className="text-right">
-                    <div className="text-xs font-mono font-bold text-white">{fmt(d.ltp)}</div>
+                    <div className="text-xs font-mono font-bold text-white"><LerpNumber value={d.ltp} /></div>
                     <div className={`${d.change >= 0 ? "text-accent" : "text-danger"} text-[10px] font-mono`}>
-                      {d.change >= 0 ? "▲" : "▼"}{fmt(Math.abs(d.change))} ({fmt(Math.abs(d.pct))}%)
+                      {d.change >= 0 ? "▲" : "▼"}<LerpNumber value={Math.abs(d.change)} /> (<LerpNumber value={Math.abs(d.pct)} suffix="%" />)
                     </div>
                   </div>
                 </div>
@@ -93,7 +100,7 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
             <button className="text-[10px] font-mono text-accent hover:underline" onClick={() => onNavigate("orders")}>Full Order Book →</button>
           </div>
           <div className="overflow-x-auto">
-            <table className="data-table">
+            <table className="data-table w-full">
               <thead>
                 <tr>
                   {["Time", "Instrument", "Side", "Qty", "Price", "Strategy / Corr ID", "Status"].map((h) => (
@@ -127,7 +134,7 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
                         {fmt(f.price)}
                       </td>
                       <td className="px-2.5 py-[7px] border-b border-border/60 text-sky text-[9.5px] font-mono">
-                        {f.corr ? f.corr.substring(0, 12) : f.id}
+                        {f.corr || f.id}
                       </td>
                       <td className="px-2.5 py-[7px] border-b border-border/60">
                         <Badge status={f.status} />
@@ -207,23 +214,23 @@ function MetricsGrid({
           Day P&L
         </div>
         <div className={`text-xl font-bold font-mono ${pnlClass(totalPnl)}`}>
-          {fmtINR(totalPnl)}
+          <LerpNumber value={totalPnl} format={fmtINR} />
         </div>
         <div className="text-[10px] font-mono text-muted mt-1">
-          Realized <span className={realized >= 0 ? "text-accent" : "text-danger"}>{fmtINR(realized)}</span> · Unr{" "}
-          <span className={unrealized >= 0 ? "text-accent" : "text-danger"}>{fmtINR(unrealized)}</span>
+          Realized <span className={realized >= 0 ? "text-accent" : "text-danger"}><LerpNumber value={realized} format={fmtINR} /></span> · Unr{" "}
+          <span className={unrealized >= 0 ? "text-accent" : "text-danger"}><LerpNumber value={unrealized} format={fmtINR} /></span>
         </div>
       </Card>
       <Card className="p-3.5">
         <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">
           Margin Used
         </div>
-        <div className="text-xl font-bold font-mono text-white">{fmtINR(used)}</div>
+        <div className="text-xl font-bold font-mono text-white"><LerpNumber value={used} format={fmtINR} /></div>
         <div className="h-1 bg-border rounded mt-2">
           <div className="h-full bg-gold rounded" style={{ width: `${Math.min(100, utilPct)}%` }} />
         </div>
         <div className="text-[10px] font-mono text-muted mt-1">
-          {fmt(utilPct)}% · Avail: <span className="text-accent">{fmtINR(avail)}</span>
+          <LerpNumber value={utilPct} decimals={1} suffix="%" /> · Avail: <span className="text-accent"><LerpNumber value={avail} format={fmtINR} /></span>
         </div>
       </Card>
       <Card className="p-3.5">

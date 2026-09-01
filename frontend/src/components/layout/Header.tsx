@@ -1,9 +1,11 @@
 import { useState, useEffect } from "react";
 import { useApp } from "../../store/AppContext";
-import { fmt } from "../../utils/formatters";
+import { fmt, fmtINR, pnlClass } from "../../utils/formatters";
 import { Button } from "../ui/Button";
 import { StatusDot } from "../ui/StatusDot";
 import { Bolt, Power } from "lucide-react";
+import { useLerpNumber } from "../../hooks/useLerpNumber";
+import { LerpNumber } from "../ui/LerpNumber";
 
 interface HeaderProps {
   pageTitle: string;
@@ -18,15 +20,18 @@ interface TickerData {
 }
 
 function Ticker({ label, data, valueClass = "text-white" }: { label: string; data: TickerData | null; valueClass?: string }) {
+  const lerpLtp = useLerpNumber(data?.ltp ?? null, 0.18, 0.05);
+  const lerpPct = useLerpNumber(data?.pct ?? null, 0.18, 0.01);
+
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex items-center gap-1.5 tabular-nums">
       <span className="text-muted text-[10px]">{label}</span>
       {data ? (
         <>
-          <span className={`${valueClass} font-semibold`}>{fmt(data.ltp)}</span>
+          <span className={`${valueClass} font-semibold`}>{fmt(lerpLtp)}</span>
           <span className={`text-[10px] ${data.change >= 0 ? "text-accent" : "text-danger"}`}>
             {data.change >= 0 ? "+" : ""}
-            {fmt(data.pct)}%
+            {fmt(lerpPct)}%
           </span>
         </>
       ) : (
@@ -56,6 +61,19 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
   const sensex = indices.SENSEX?.ltp ? indices.SENSEX : null;
   const vix = indices.INDIAVIX?.ltp ? indices.INDIAVIX : null;
 
+  // Real-time Day P&L and Total Equity calculation from live state
+  const realizedPnl = Number(state.funds.realizedPnl || 0);
+  const unrealizedPnl = state.positions.reduce((acc, p) => {
+    const un = p.unrealizedProfit ?? p.unrealizedPnl ?? (Number(p.pnl || 0) - Number(p.realizedProfit || p.realized_pnl || 0));
+    return acc + Number(un || 0);
+  }, 0);
+  const totalPnl = realizedPnl + unrealizedPnl;
+  const avail = Number(state.funds.availableMargin || 100000);
+  const used = Number(state.funds.usedMargin || 0);
+  const baseBalance = Number(state.funds.totalBalance || (avail + used));
+  const totalEquity = baseBalance + unrealizedPnl;
+  const pnlPct = baseBalance > 0 ? (totalPnl / baseBalance) * 100 : 0;
+
   return (
     <header className="app-header h-14 min-h-[56px] bg-surface-100 border-b border-border flex items-center justify-between px-5 z-20">
       <div className="flex items-center gap-4">
@@ -84,15 +102,42 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
         </div>
       </div>
 
-      <div className="flex items-center gap-5">
-        <div className="hidden lg:flex items-center gap-4 font-mono text-xs">
+      <div className="flex items-center gap-4">
+        <div className="hidden xl:flex items-center gap-4 font-mono text-xs">
           <Ticker label="NIFTY" data={nifty} />
           <Ticker label="BANKNIFTY" data={bnf} />
           <Ticker label="SENSEX" data={sensex} />
           <Ticker label="INDIA VIX" data={vix} valueClass="text-gold" />
         </div>
+
+        {/* Live Equity & Day P&L Capsule (Fixed Width, Smooth LERP) */}
+        <div className="flex items-center justify-between w-[250px] shrink-0 px-3 py-1.5 rounded-lg bg-surface-50 border border-border/80 font-mono shadow-sm tabular-nums">
+          <div className="flex flex-col w-[95px] shrink-0">
+            <span className="text-[8.5px] font-mono text-muted uppercase tracking-wider leading-none">
+              Equity
+            </span>
+            <span className="text-xs font-bold text-white leading-tight truncate">
+              <LerpNumber value={totalEquity} decimals={0} prefix="₹" />
+            </span>
+          </div>
+          <div className="h-5 w-px bg-border shrink-0" />
+          <div className="flex flex-col w-[130px] shrink-0 pl-1">
+            <span className="text-[8.5px] font-mono text-muted uppercase tracking-wider leading-none">
+              Day P&amp;L
+            </span>
+            <div className="flex items-center justify-between leading-tight">
+              <span className={`text-xs font-bold ${pnlClass(totalPnl)} truncate`}>
+                <LerpNumber value={totalPnl} format={fmtINR} />
+              </span>
+              <span className={`text-[9.5px] ${pnlClass(totalPnl)} shrink-0`}>
+                (<LerpNumber value={pnlPct} decimals={2} prefix={totalPnl >= 0 ? "+" : ""} suffix="%" />)
+              </span>
+            </div>
+          </div>
+        </div>
+
         <div className="flex items-center gap-3 border-l border-border pl-4">
-          <div className="font-mono text-xs text-muted">{timeStr}</div>
+          <div className="font-mono text-xs text-muted hidden sm:block">{timeStr}</div>
           <div className="flex items-center gap-1.5">
             <StatusDot status={connected ? "live" : "error"} pulse={connected} />
             <span

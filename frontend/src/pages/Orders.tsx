@@ -106,7 +106,7 @@ export function Orders() {
       </div>
 
       <Card className="overflow-x-auto">
-        <table className="data-table">
+        <table className="data-table w-full">
           <thead>
             <tr>
               {['Order ID', 'Correlation ID', 'Time', 'Instrument', 'Type', 'Side', 'Qty', 'Price', 'Filled', 'Avg Price', 'Status', 'Latency'].map(h => (

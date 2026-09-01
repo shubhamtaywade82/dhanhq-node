@@ -197,26 +197,10 @@ export class AgentOrchestrator {
       await this.reason(runId, 'planner', `Decompose objective into concrete steps.${rulesText}`, objective,
         () => 'Plan: 1. Pull market quotes & chain 2. Analyze IV & PCR 3. Formulate strategy 4. Check risk 5. Execute 6. Critique');
 
-      // 2. ANALYST
-      const target = Object.keys(INDEX_INSTRUMENTS).find((s) => objective.toUpperCase().includes(s)) || 'NIFTY';
-      const inst = INDEX_INSTRUMENTS[target];
-      // Post-Sept-2025 SEBI rule: NIFTY/BANKNIFTY weeklies expire Tuesday, SENSEX Thursday
-      // (BANKNIFTY is monthly-only). A stale Thursday-only calc here made every option-chain
-      // fetch below 400 on non-Thursday symbols, so no strategy could ever be built.
-      const expiry = nearestIndexExpiry(target);
-      const [ltpRes, chainRes, vixRes] = await Promise.all([
-        this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
-        this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),
-        this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } }),
-      ]);
-
-      const spot = extractLtp(ltpRes, inst.securityId) || this.market.getLtp(inst.securityId) || 0;
-      const vix = extractLtp(vixRes, INDEX_INSTRUMENTS.INDIAVIX.securityId) || 14;
-      const rows = chainRes?.strikes || chainRes?.data || [];
-      const analytics = analyzeOptionChain(target, rows, spot, expiry, vix);
-
-      await this.reason(runId, 'analyst', 'Summarize market conditions.', JSON.stringify(analytics),
-        () => `Analyst (deterministic): ${target} ₹${spot}, PCR: ${analytics.pcrOi}, MaxPain: ${analytics.maxPainStrike}, Regime: ${analytics.regime}`);
+      // 2. ANALYST & MULTI-INDEX WATCHLIST SCANNER
+      const watchlist = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY'];
+      const explicitTarget = watchlist.find((s) => new RegExp(`\\b${s}\\b`, 'i').test(objective) && !objective.toLowerCase().includes('and') && !objective.toLowerCase().includes('across') && !objective.toLowerCase().includes('all'));
+      const targets = explicitTarget ? [explicitTarget] : watchlist;
 
       // 2b. Capital allocation (30% of total available capital)
       let availableCapital = 1_000_000;
@@ -231,14 +215,50 @@ export class AgentOrchestrator {
         }
       } catch { /* default 10L */ }
 
-      // 3. STRATEGY (sized targeting 30% capital deployment)
-      const strategy = this.synthesizeStrategy(objective, target, spot, rows, expiry, analytics, availableCapital);
-      await this.reason(runId, 'strategy', 'Review option strategy setup with 30% capital allocation.', JSON.stringify({ strategy: strategy?.name, lots: strategy?.lots, legs: strategy?.legs.length }),
-        () => strategy ? `Strategy (deterministic): ${strategy.name} (${strategy.lots} lots, 30% capital allocation)` : 'Strategy (deterministic): NO TRADE');
+      const vixRes = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } });
+      const vix = extractLtp(vixRes, INDEX_INSTRUMENTS.INDIAVIX.securityId) || 14;
 
-      // 3b. BACKTEST VALIDATION
-      const bt = await this.backtestCandidate(target, inst.securityId, strategy);
-      this.step(runId, 'strategy', 'ACT', `Backtest: ${bt.winRate}% win rate across ${bt.totalDays}d (₹${bt.totalPnlInr} PnL, PF: ${bt.profitFactor})`, {
+      interface Candidate {
+        target: string;
+        spot: number;
+        analytics: any;
+        strategy: ConstructedStrategy;
+        bt: any;
+        score: number;
+      }
+      const candidates: Candidate[] = [];
+
+      for (const target of targets) {
+        const inst = INDEX_INSTRUMENTS[target];
+        if (!inst) continue;
+        const expiry = nearestIndexExpiry(target);
+        const [ltpRes, chainRes] = await Promise.all([
+          this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
+          this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),
+        ]);
+
+        const spot = extractLtp(ltpRes, inst.securityId) || this.market.getLtp(inst.securityId) || 0;
+        const rows = chainRes?.strikes || chainRes?.data || [];
+        if (rows.length === 0) continue;
+
+        const analytics = analyzeOptionChain(target, rows, spot, expiry, vix);
+        const strat = this.synthesizeStrategy(objective, target, spot, rows, expiry, analytics, availableCapital);
+        if (!strat) continue;
+
+        const bt = await this.backtestCandidate(target, inst.securityId, strat);
+        const score = (bt.winRate || 50) * (bt.profitFactor || 1.2);
+        candidates.push({ target, spot, analytics, strategy: strat, bt, score });
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      const best = candidates[0];
+
+      await this.reason(runId, 'analyst', 'Summarize multi-index market conditions.', JSON.stringify(candidates.map((c) => ({ target: c.target, spot: c.spot, regime: c.analytics.regime, score: c.score }))),
+        () => best ? `Analyst: Scanned ${candidates.length} watchlist indices. Top candidate: ${best.strategy.name} on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${best.bt.winRate}%, PF: ${best.bt.profitFactor})` : 'Analyst: No actionable setups across watchlist');
+
+      const strategy = best?.strategy || null;
+      const bt = best?.bt || { winRate: 0, totalDays: 0, totalPnlInr: 0, profitFactor: 0, passedValidation: false };
+      this.step(runId, 'strategy', 'ACT', `Selected Strategy: ${strategy?.name || 'NONE'} (${strategy?.lots || 0} lots) | Backtest: ${bt.winRate}% win rate across ${bt.totalDays}d (PF: ${bt.profitFactor})`, {
         tool: 'strategy.backtest', response: JSON.stringify({ winRate: bt.winRate, pnl: bt.totalPnlInr, pf: bt.profitFactor, pass: bt.passedValidation }),
       });
 
@@ -322,7 +342,13 @@ export class AgentOrchestrator {
           security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
           transaction_type: leg.side, order_type: 'MARKET', exchange_segment: leg.exchangeSegment || 'NSE_FNO',
           product_type: 'INTRADAY', price: leg.price,
-        } });
+        },
+        risk_limits: {
+          stop_loss: leg.stopLoss,
+          target: leg.target,
+          trailing_stop: leg.trailingStop,
+        },
+      });
       if (res && (res.status === 'TRADED' || res.orderId)) filledCount++;
     }
 

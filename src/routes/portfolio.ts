@@ -10,18 +10,12 @@ import { eventBus } from '../services/eventBus';
 import { moduleLogger } from '../lib/logger';
 import { aggregatePortfolioGreeks } from '../services/optionsAnalytics';
 
+import type { PaperExecutionEngine } from '../engines/paper';
+import type { AgentOrchestrator } from '../services/agent';
+
 const log = moduleLogger('portfolio');
 
-/**
- * Portfolio & paper-trading routes.
- *
- * Paper orders are priced from LIVE market LTP (MarketDataService).
- * When no live price is available the order is rejected — it is never
- * silently filled at a made-up price. Every write path (manual orders,
- * strategy deploy/close) passes through the risk engine's gate, so the
- * kill switch halts even control-plane-initiated trades.
- */
-export function portfolioRoutes(client: DhanClient, market: MarketDataService, risk?: RiskEngine): Router {
+export function portfolioRoutes(client: DhanClient, market: MarketDataService, risk?: RiskEngine, paper?: PaperExecutionEngine, agent?: AgentOrchestrator): Router {
   const router = Router();
   const isPaper = () => process.env.TRADING_MODE !== 'live';
 
@@ -259,6 +253,68 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       const { id, status } = req.body;
       await updatePaperStrategyStatus(id, status);
       res.json({ status: 'ok', id, newStatus: status });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.post('/paper/strategy/execute', async (req, res) => {
+    try {
+      const { id } = req.body;
+      const strategies = await listPaperStrategies();
+      const strat = strategies.find((s) => s.id === id);
+      if (!strat) return res.status(404).json({ error: 'Strategy not found' });
+
+      const gate = risk?.canTrade();
+      if (gate && !gate.allowed) {
+        return res.status(423).json({ error: `Execution blocked by risk engine: ${gate.reason}` });
+      }
+
+      let filled = 0;
+      for (const leg of strat.legs || []) {
+        const liveLtp = market.getLtp(leg.securityId || '0') ?? market.getLtp(String(leg.instrument));
+        const legPrice = liveLtp || Number(leg.bAvg || leg.sAvg || leg.price || 0);
+        if (!legPrice) continue;
+
+        if (paper) {
+          await paper.placeOrder({
+            correlation_id: `${strat.id}_${leg.optionType || 'OPT'}_${leg.strike || '0'}`,
+            intent_id: `trigger_${strat.id}`,
+            params: {
+              security_id: leg.securityId,
+              symbol: leg.instrument,
+              quantity: leg.qty,
+              transaction_type: leg.side,
+              order_type: 'MARKET',
+              exchange_segment: leg.exchangeSegment || 'NSE_FNO',
+              product_type: 'INTRADAY',
+              price: legPrice,
+            },
+            risk_limits: {
+              stop_loss: leg.stopLoss,
+              target: leg.target,
+              trailing_stop: leg.trailingStop,
+            },
+          });
+        } else {
+          await executePaperOrder({
+            symbol: leg.instrument,
+            securityId: leg.securityId,
+            transactionType: leg.side,
+            quantity: leg.qty,
+            price: legPrice,
+            correlationId: strat.id,
+            stopLoss: leg.stopLoss,
+            target: leg.target,
+            trailingStop: typeof leg.trailingStop === 'object' ? leg.trailingStop.distance : leg.trailingStop,
+          });
+        }
+        filled++;
+      }
+
+      await updatePaperStrategyStatus(id, 'RUNNING');
+      eventBus.log('TRADE', `Strategy "${strat.name}" executed & RUNNING (${filled} leg(s) filled with SL/TP)`, 'portfolio');
+      res.json({ status: 'ok', strategyId: id, legsFilled: filled });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
