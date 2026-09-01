@@ -5,6 +5,7 @@ import { MarketDataService } from './services/marketData';
 import { RiskEngine } from './services/riskEngine';
 import { AutonomyEngine } from './services/autonomy';
 import { AgentOrchestrator } from './services/agent';
+import { SelfHealingService } from './services/selfHealing';
 import { eventBus } from './services/eventBus';
 import { PaperExecutionEngine } from './engines/paper';
 import { LiveExecutionEngine } from './engines/live';
@@ -23,6 +24,7 @@ export interface Core {
   paper: PaperExecutionEngine;
   live: LiveExecutionEngine;
   tracker: OrderTracker;
+  selfHealing: SelfHealingService;
 }
 
 export async function startCore(): Promise<Core> {
@@ -54,6 +56,9 @@ export async function startCore(): Promise<Core> {
     });
   }
 
+  const selfHealing = new SelfHealingService();
+  selfHealing.start();
+
   await market.start();
   await seedExistingPositions(market);
   await risk.start();
@@ -62,7 +67,7 @@ export async function startCore(): Promise<Core> {
   eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
-  return { client, market, risk, autonomy, agent, paper, live, tracker };
+  return { client, market, risk, autonomy, agent, paper, live, tracker, selfHealing };
 }
 
 async function seedExistingPositions(market: MarketDataService): Promise<void> {

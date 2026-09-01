@@ -19,11 +19,12 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
     const indices = market.getIndices();
     const stats = market.stats();
     const anyLive = Object.values(indices).some((i: any) => i && i.ltp > 0);
+    // Always the same shape — callers must read `.indices`, never the top-level object.
     if (!anyLive) {
       // No live data yet — say so. No fabricated fallback quotes.
       return res.json({ indices: {}, stale: true, source: stats.source, error: 'Market data not yet available (check DhanHQ credentials / market hours)' });
     }
-    res.json(indices);
+    res.json({ indices, stale: false, source: stats.source, error: null });
   });
 
   router.get('/option-chain/:symbol', async (req, res) => {

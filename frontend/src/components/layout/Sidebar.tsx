@@ -1,4 +1,5 @@
 import { StatusDot } from '../ui/StatusDot';
+import { useApp } from '../../store/AppContext';
 import {
   ChartLine, ChessKnight, Layers, Wallet, Receipt, Brain, Satellite, Database,
   Calculator, Shield, ListChecks, Bell, Terminal, Settings, TrendingUp,
@@ -63,6 +64,10 @@ function NavSection({ title, items, activePage, onNavigate }: { title: string; i
 }
 
 export function Sidebar({ activePage, onNavigate }: { activePage: string; onNavigate: (id: string) => void }) {
+  const { state } = useApp();
+  const hasData = state.marketSource !== 'none';
+  const tickAge = state.marketTickAgeSec;
+
   return (
     <aside className="w-[215px] min-w-[215px] bg-surface-100 border-r border-border flex flex-col justify-between">
       <nav className="p-3 space-y-0.5 overflow-y-auto flex-1">
@@ -74,10 +79,28 @@ export function Sidebar({ activePage, onNavigate }: { activePage: string; onNavi
 
       <div className="p-3 border-t border-border bg-surface-50 space-y-1.5">
         <div className="text-[8.5px] font-mono text-muted uppercase tracking-widest font-semibold">System Connectivity</div>
-        <SystemStatusRow label="DhanHQ API" latency="18ms" status="live" />
-        <SystemStatusRow label="WS Ticks" latency="3.2ms" status="live" />
-        <SystemStatusRow label="Sidekiq" latency="12/25 busy" status="live" valueClass="text-sky" />
-        <SystemStatusRow label="Ollama LLM" latency="llama3.1" status="live" valueClass="text-purple" />
+        <SystemStatusRow
+          label="DhanHQ API"
+          latency={hasData ? state.marketSource.toUpperCase() : 'no data'}
+          status={hasData ? 'live' : 'error'}
+        />
+        <SystemStatusRow
+          label="WS Ticks"
+          latency={state.marketWsConnected ? 'connected' : tickAge != null ? `${tickAge}s stale` : 'REST fallback'}
+          status={state.marketWsConnected ? 'live' : 'warn'}
+        />
+        <SystemStatusRow
+          label="Persistence"
+          latency={state.persistence}
+          status={state.persistence === 'postgres' ? 'live' : 'warn'}
+          valueClass="text-sky"
+        />
+        <SystemStatusRow
+          label="LLM"
+          latency={state.llmMode}
+          status={state.llmMode === 'ollama' ? 'live' : 'idle'}
+          valueClass="text-purple"
+        />
       </div>
     </aside>
   );

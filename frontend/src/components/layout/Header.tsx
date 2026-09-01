@@ -11,6 +11,31 @@ interface HeaderProps {
   onKillSwitch: () => void;
 }
 
+interface TickerData {
+  ltp: number;
+  change: number;
+  pct: number;
+}
+
+function Ticker({ label, data, valueClass = "text-white" }: { label: string; data: TickerData | null; valueClass?: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="text-muted text-[10px]">{label}</span>
+      {data ? (
+        <>
+          <span className={`${valueClass} font-semibold`}>{fmt(data.ltp)}</span>
+          <span className={`text-[10px] ${data.change >= 0 ? "text-accent" : "text-danger"}`}>
+            {data.change >= 0 ? "+" : ""}
+            {fmt(data.pct)}%
+          </span>
+        </>
+      ) : (
+        <span className="text-muted">—</span>
+      )}
+    </div>
+  );
+}
+
 export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
   const { state, connected } = useApp();
   const [timeStr, setTimeStr] = useState(() =>
@@ -24,16 +49,12 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
     return () => clearInterval(timer);
   }, []);
 
-  const defaultIdx = { ltp: 24248.5, change: 85.3, pct: 0.35, high: 24300, low: 24100, open: 24163.2, prevClose: 24163.2 };
-  const defaultBnf = { ltp: 51842.15, change: -120.45, pct: -0.23, high: 52000, low: 51700, open: 51962.6, prevClose: 51962.6 };
-  const defaultSensex = { ltp: 79800.0, change: -150.0, pct: -0.19, high: 80100, low: 79650, open: 79950, prevClose: 79950 };
-  const defaultVix = { ltp: 13.42, change: -0.25, pct: -1.8, high: 13.8, low: 13.2, open: 13.67, prevClose: 13.67 };
-
+  // No fabricated fallback quotes — an index shows "—" until a real live tick arrives.
   const indices = state.indices || {};
-  const nifty = indices.NIFTY?.ltp ? indices.NIFTY : defaultIdx;
-  const bnf = indices.BANKNIFTY?.ltp ? indices.BANKNIFTY : defaultBnf;
-  const sensex = indices.SENSEX?.ltp ? indices.SENSEX : defaultSensex;
-  const vix = indices.INDIAVIX?.ltp ? indices.INDIAVIX : defaultVix;
+  const nifty = indices.NIFTY?.ltp ? indices.NIFTY : null;
+  const bnf = indices.BANKNIFTY?.ltp ? indices.BANKNIFTY : null;
+  const sensex = indices.SENSEX?.ltp ? indices.SENSEX : null;
+  const vix = indices.INDIAVIX?.ltp ? indices.INDIAVIX : null;
 
   return (
     <header className="app-header h-14 min-h-[56px] bg-surface-100 border-b border-border flex items-center justify-between px-5 z-20">
@@ -65,44 +86,10 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
 
       <div className="flex items-center gap-5">
         <div className="hidden lg:flex items-center gap-4 font-mono text-xs">
-          <div className="flex items-center gap-1.5">
-            <span className="text-muted text-[10px]">NIFTY</span>
-            <span className="text-white font-semibold">{fmt(nifty.ltp)}</span>
-            <span
-              className={`text-[10px] ${nifty.change >= 0 ? "text-accent" : "text-danger"}`}
-            >
-              {nifty.change >= 0 ? "+" : ""}
-              {fmt(nifty.pct)}%
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span className="text-muted text-[10px]">BANKNIFTY</span>
-            <span className="text-white font-semibold">{fmt(bnf.ltp)}</span>
-            <span
-              className={`text-[10px] ${bnf.change >= 0 ? "text-accent" : "text-danger"}`}
-            >
-              {bnf.change >= 0 ? "+" : ""}
-              {fmt(bnf.pct)}%
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span className="text-muted text-[10px]">SENSEX</span>
-            <span className="text-white font-semibold">{fmt(sensex.ltp)}</span>
-            <span
-              className={`text-[10px] ${sensex.change >= 0 ? "text-accent" : "text-danger"}`}
-            >
-              {sensex.change >= 0 ? "+" : ""}
-              {fmt(sensex.pct)}%
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span className="text-muted text-[10px]">INDIA VIX</span>
-            <span className="text-gold font-semibold">{fmt(vix.ltp)}</span>
-            <span className="text-accent text-[10px]">
-              {vix.change >= 0 ? "+" : ""}
-              {fmt(vix.pct)}%
-            </span>
-          </div>
+          <Ticker label="NIFTY" data={nifty} />
+          <Ticker label="BANKNIFTY" data={bnf} />
+          <Ticker label="SENSEX" data={sensex} />
+          <Ticker label="INDIA VIX" data={vix} valueClass="text-gold" />
         </div>
         <div className="flex items-center gap-3 border-l border-border pl-4">
           <div className="font-mono text-xs text-muted">{timeStr}</div>

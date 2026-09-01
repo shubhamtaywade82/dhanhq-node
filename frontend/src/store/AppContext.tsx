@@ -60,9 +60,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const refreshControlState = useCallback(async () => {
     try {
-      const [ctrl, alerts] = await Promise.all([
+      const [ctrl, alerts, health] = await Promise.all([
         api.controlState().catch(() => null),
         api.alerts(50).catch(() => null),
+        api.health().catch(() => null),
       ]);
       if (ctrl) {
         setState((prev) => ({
@@ -74,6 +75,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
           })),
           agentStatus: ctrl.agent?.personas || prev.agentStatus,
           agentRunning: !!ctrl.agent?.running,
+          marketSource: ctrl.market?.source || prev.marketSource,
+          marketWsConnected: !!ctrl.market?.wsConnected,
+          marketTickAgeSec: ctrl.market?.tickAgeSec ?? null,
+          llmMode: ctrl.agent?.llm || prev.llmMode,
+          persistence: health?.persistence || prev.persistence,
         }));
       }
       if (Array.isArray(alerts)) {
@@ -86,8 +92,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const refreshIndices = useCallback(async () => {
     try {
-      const indices = await api.indices();
-      const clean = Object.fromEntries(Object.entries(indices || {}).filter(([, v]) => v != null));
+      const res = await api.indices();
+      const clean = Object.fromEntries(Object.entries(res?.indices || {}).filter(([, v]) => v != null));
       if (Object.keys(clean).length > 0) {
         setState((prev) => ({ ...prev, indices: clean as any }));
       }

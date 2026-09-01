@@ -38,6 +38,8 @@ const mem = {
   alerts: [] as any[],
   agentEvents: [] as any[],
   riskState: null as any,
+  errorPatterns: new Map<string, any>(),
+  systemRules: [] as any[],
   autoid: 0,
 };
 
@@ -88,6 +90,16 @@ const SCHEMA_SQL = `
     id VARCHAR(16) PRIMARY KEY DEFAULT 'default', killed BOOLEAN NOT NULL DEFAULT FALSE,
     killed_reason TEXT, limits JSONB NOT NULL DEFAULT '{}',
     consecutive_losses INTEGER NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS error_patterns (
+    pattern TEXT PRIMARY KEY, level VARCHAR(16) NOT NULL, source VARCHAR(64) NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 1, first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS system_rules (
+    id SERIAL PRIMARY KEY, rule TEXT NOT NULL, pattern TEXT NOT NULL UNIQUE,
+    hit_count INTEGER NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
   INSERT INTO paper_wallet (id, initial_balance, available_margin, used_margin, realized_pnl)
   VALUES ('default', 100000.00, 100000.00, 0.00, 0.00)
@@ -144,6 +156,67 @@ function mapAlertRow(r: any) {
     id: Number(r.id), time: new Date(r.created_at).toLocaleTimeString('en-GB', { hour12: false }),
     level: r.level, source: r.source, msg: r.message, read: false, createdAt: r.created_at,
   };
+}
+
+// ── self-healing: error patterns + promoted rules ─────────────────────────
+export async function recordErrorPattern(level: 'WARN' | 'ERROR', source: string, pattern: string) {
+  if (mode === 'postgres') {
+    try {
+      await pool.query(
+        `INSERT INTO error_patterns (pattern, level, source) VALUES ($1, $2, $3)
+         ON CONFLICT (pattern) DO UPDATE SET hit_count = error_patterns.hit_count + 1, last_seen = NOW()`,
+        [pattern, level, source],
+      );
+    } catch { /* non-fatal */ }
+  } else {
+    const existing = mem.errorPatterns.get(pattern);
+    if (existing) { existing.hit_count++; existing.last_seen = new Date(); }
+    else mem.errorPatterns.set(pattern, { pattern, level, source, hit_count: 1, first_seen: new Date(), last_seen: new Date() });
+  }
+}
+
+export async function listErrorPatterns(minHits = 2) {
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT * FROM error_patterns WHERE hit_count >= $1 ORDER BY hit_count DESC', [minHits]);
+      return res.rows;
+    } catch { return []; }
+  }
+  return [...mem.errorPatterns.values()].filter((p) => p.hit_count >= minHits);
+}
+
+export async function ruleExistsForPattern(pattern: string): Promise<boolean> {
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT 1 FROM system_rules WHERE pattern = $1 LIMIT 1', [pattern]);
+      return (res.rowCount ?? 0) > 0;
+    } catch { return false; }
+  }
+  return mem.systemRules.some((r) => r.pattern === pattern);
+}
+
+export async function promoteRule(rule: string, pattern: string, hitCount: number) {
+  if (mode === 'postgres') {
+    try {
+      await pool.query(
+        `INSERT INTO system_rules (rule, pattern, hit_count) VALUES ($1, $2, $3)
+         ON CONFLICT (pattern) DO UPDATE SET rule = $1, hit_count = $3`,
+        [rule, pattern, hitCount],
+      );
+    } catch { /* non-fatal */ }
+  } else {
+    mem.systemRules.unshift({ id: ++mem.autoid, rule, pattern, hit_count: hitCount, active: true, created_at: new Date() });
+  }
+}
+
+export async function getActiveRules(limit = 20) {
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT rule FROM system_rules WHERE active = TRUE ORDER BY hit_count DESC LIMIT $1', [limit]);
+      return res.rows.map((r) => r.rule as string);
+    } catch { return []; }
+  }
+  return mem.systemRules.filter((r) => r.active).slice(0, limit).map((r) => r.rule as string);
 }
 
 // ── agent events ────────────────────────────────────────────────────────

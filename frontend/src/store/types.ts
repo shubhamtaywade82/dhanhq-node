@@ -179,6 +179,11 @@ export interface AppState {
   pnlHistory: number[];
   rateLimitHistory: { orders: number; data: number }[];
   logFilter: string;
+  marketSource: string;
+  marketWsConnected: boolean;
+  marketTickAgeSec: number | null;
+  llmMode: string;
+  persistence: string;
 }
 
 export type ToastType = 'success' | 'error' | 'warning';

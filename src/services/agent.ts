@@ -3,13 +3,14 @@ import { OllamaClient } from '@nemesis-oss/ollama-sdk';
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
-import { pushAgentEvent, listAgentEvents, createPaperStrategy } from '../db';
+import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules } from '../db';
 import { INDEX_INSTRUMENTS } from './marketData';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { LiveExecutionEngine } from '../engines/live';
 import { analyzeOptionChain } from './optionsAnalytics';
-import { buildIronCondor, buildCreditSpread, buildStraddle, evaluateStrategyBacktest, type ConstructedStrategy } from './strategyConstructor';
+import { buildIronCondor, buildCreditSpread, buildStraddle, buildOrbBuyingStrategy, buildVwapPullbackStrategy, evaluateStrategyBacktest, type ConstructedStrategy } from './strategyConstructor';
 import { analyzeOptionsBehavior } from '../routes/market';
+import { nearestIndexExpiry } from './marketHours';
 
 export type AgentKey = 'planner' | 'analyst' | 'strategy' | 'execution' | 'risk' | 'critic';
 
@@ -187,21 +188,26 @@ export class AgentOrchestrator {
 
     try {
       // 1. PLANNER
-      await this.reason(runId, 'planner', 'Decompose objective into concrete steps.', objective,
+      const rules = await getActiveRules().catch(() => []);
+      const rulesText = rules.length > 0 ? `\n\nSELF-HEALED RULES (learned from recurring failures — must adhere):\n${rules.map((r) => `- ${r}`).join('\n')}` : '';
+      await this.reason(runId, 'planner', `Decompose objective into concrete steps.${rulesText}`, objective,
         () => 'Plan: 1. Pull market quotes & chain 2. Analyze IV & PCR 3. Formulate strategy 4. Check risk 5. Execute 6. Critique');
 
       // 2. ANALYST
       const target = Object.keys(INDEX_INSTRUMENTS).find((s) => objective.toUpperCase().includes(s)) || 'NIFTY';
       const inst = INDEX_INSTRUMENTS[target];
-      const expiry = this.nearestWeeklyExpiry();
+      // Post-Sept-2025 SEBI rule: NIFTY/BANKNIFTY weeklies expire Tuesday, SENSEX Thursday
+      // (BANKNIFTY is monthly-only). A stale Thursday-only calc here made every option-chain
+      // fetch below 400 on non-Thursday symbols, so no strategy could ever be built.
+      const expiry = nearestIndexExpiry(target);
       const [ltpRes, chainRes, vixRes] = await Promise.all([
-        this.callTool(runId, 'analyst', 'dhan_ltp', { exchangeSegment: 'IDX_I', securityId: inst.securityId }),
+        this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
         this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),
-        this.callTool(runId, 'analyst', 'dhan_ltp', { exchangeSegment: 'IDX_I', securityId: INDEX_INSTRUMENTS.INDIAVIX.securityId }),
+        this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } }),
       ]);
 
-      const spot = ltpRes?.ltp || this.market.getLtp(inst.securityId) || 0;
-      const vix = vixRes?.ltp || 14;
+      const spot = extractLtp(ltpRes, inst.securityId) || this.market.getLtp(inst.securityId) || 0;
+      const vix = extractLtp(vixRes, INDEX_INSTRUMENTS.INDIAVIX.securityId) || 14;
       const rows = chainRes?.strikes || chainRes?.data || [];
       const analytics = analyzeOptionChain(target, rows, spot, expiry, vix);
 
@@ -245,10 +251,19 @@ export class AgentOrchestrator {
 
   private synthesizeStrategy(objective: string, target: string, spot: number, rows: any[], expiry: string, analytics: any): ConstructedStrategy | null {
     const obj = objective.toLowerCase();
+    // PCR > 1 (more puts written than calls) reads bullish — put writers expect the strike to hold as support.
+    const direction = analytics.pcrOi > 1.1 ? 'BULLISH' : analytics.pcrOi < 0.9 ? 'BEARISH' : 'BULLISH';
+
+    if (obj.includes('orb') || obj.includes('breakout')) return buildOrbBuyingStrategy(target, spot, rows, expiry, 1, direction);
+    if (obj.includes('vwap') || obj.includes('pullback')) return buildVwapPullbackStrategy(target, spot, rows, expiry, 1, direction);
     if (obj.includes('bull') || obj.includes('put spread')) return buildCreditSpread(target, 'BULLISH', spot, rows, expiry, 1);
     if (obj.includes('bear') || obj.includes('call spread')) return buildCreditSpread(target, 'BEARISH', spot, rows, expiry, 1);
     if (obj.includes('straddle')) return buildStraddle(target, spot, rows, expiry, 1, obj.includes('buy') ? 'BUY' : 'SELL');
-    return buildIronCondor(target, spot, rows, expiry, 1);
+    if (obj.includes('condor')) return buildIronCondor(target, spot, rows, expiry, 1);
+
+    // Default for the untargeted autonomous scan: ORB buying is the best-documented
+    // Indian index options-buying edge (~48% win rate, 2:1+ R:R) vs. undirected selling.
+    return buildOrbBuyingStrategy(target, spot, rows, expiry, 1, direction);
   }
 
   private async executeStrategy(runId: string, objective: string, strat: ConstructedStrategy | null, allowed: boolean): Promise<any> {
@@ -289,11 +304,13 @@ export class AgentOrchestrator {
       return { winRate: 100, totalDays: 0, totalPnlInr: 0, profitFactor: 1.5, passedValidation: true };
     }
   }
+}
 
-  private nearestWeeklyExpiry(): string {
-    const now = new Date(), delta = (4 - now.getDay() + 7) % 7;
-    const d = new Date(now);
-    d.setDate(d.getDate() + (delta === 0 && now.getHours() >= 15 ? 7 : delta));
-    return d.toISOString().slice(0, 10);
-  }
+function extractLtp(res: any, secId: string): number {
+  if (!res) return 0;
+  if (typeof res === 'number') return res;
+  const data = res.data || res;
+  const seg = data.IDX_I?.[secId] || data.NSE_FNO?.[secId] || data.NSE_EQ?.[secId] || data[secId];
+  if (typeof seg === 'number') return seg;
+  return Number(seg?.last_price ?? seg?.ltp ?? data.last_price ?? data.ltp ?? 0);
 }

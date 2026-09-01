@@ -11,6 +11,7 @@
     "dev:server": "ts-node-dev --respawn src/server.ts",
     "dev:frontend": "cd frontend && npm run dev",
     "dev:all": "npm run dev:server & npm run dev:frontend",
+    "subscribe:indices": "ts-node scripts/subscribe-indices.ts",
     "test": "jest --forceExit"
   },
   "dependencies": {

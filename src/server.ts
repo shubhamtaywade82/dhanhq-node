@@ -99,6 +99,7 @@ async function main() {
     core.autonomy.stop();
     core.risk.stop();
     core.market.stop();
+    core.selfHealing.stop();
     wss.close();
     server.close();
     log.info({ signal }, 'Shutdown complete');

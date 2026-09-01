@@ -56,7 +56,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ status: string; mode: string; persistence: string; killed: boolean; autonomy: boolean; marketSource: string; uptime: number }>('/api/health'),
 
-  indices: () => request<Record<string, { ltp: number; change: number; pct: number; high: number; low: number; open: number; prevClose: number; updatedAt?: number } | null>>('/api/market/indices'),
+  indices: () => request<{ indices: Record<string, { ltp: number; change: number; pct: number; high: number; low: number; open: number; prevClose: number; updatedAt?: number } | null>; stale: boolean; source: string; error: string | null }>('/api/market/indices'),
 
   optionChain: (symbol: string) => request<{ strikes: Array<{ strike: number; ce: any; pe: any }>; underlying: string }>(`/api/market/option-chain/${symbol}`),
 

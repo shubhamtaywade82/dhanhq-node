@@ -1,5 +1,5 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
-import { PositionMonitor, OrderUpdateWS } from '@nemesis-oss/dhanhq-sdk';
+import { PositionMonitor, OrderUpdateWS, RateLimitError } from '@nemesis-oss/dhanhq-sdk';
 import { eventBus } from './eventBus';
 import { marketClock, istNow } from './marketHours';
 
@@ -58,6 +58,11 @@ export class MarketDataService {
   private lastTickAt = 0;
   private lastWsTickAt = 0;
   private source: 'ws' | 'rest' | 'none' = 'none';
+  private rateLimitedUntil = 0;                           // backoff gate after a 429
+  private consecutiveRateLimits = 0;
+  private wsListenersAttached = false;
+  private wsRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private wsRetryAttempts = 0;
   private extraSubscriptions = new Set<string>();        // 'SEG:SECID' keys
   private unsubEventBus: (() => void) | null = null;
   readonly monitor = new PositionMonitor();
@@ -104,28 +109,46 @@ export class MarketDataService {
     try {
       patchOrderWsSafety();
       const ws: any = (this.client as any).ws;
-      ws.market?.on?.('tick', (tick: any) => {
-        this.wsTickCount++;
-        this.lastTickAt = Date.now();
-        this.lastWsTickAt = Date.now();
-        this.source = 'ws';
-        this.ingestTick(tick);
-      });
-      ws.orders?.on?.('order', (order: any) => {
-        eventBus.emit('order', { kind: 'order_update', order });
-      });
+      if (!this.wsListenersAttached) {
+        this.wsListenersAttached = true;
+        ws.market?.on?.('tick', (tick: any) => {
+          this.wsTickCount++;
+          this.lastTickAt = Date.now();
+          this.lastWsTickAt = Date.now();
+          this.source = 'ws';
+          this.ingestTick(tick);
+        });
+        ws.orders?.on?.('order', (order: any) => {
+          eventBus.emit('order', { kind: 'order_update', order });
+        });
+      }
       ws.connect?.().then(() => {
         ws.market?.subscribe?.(
           INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
         );
         this.wsStarted = true;
+        this.wsRetryAttempts = 0;
         eventBus.log('INFO', 'DhanHQ binary WebSocket connected — real-time tick stream live', 'market_data');
       }).catch((e: any) => {
         eventBus.log('WARN', `DhanHQ WebSocket unavailable (${e?.message || e}) — falling back to REST polling`, 'market_data');
+        this.scheduleWsRetry();
       });
     } catch (e: any) {
       eventBus.log('WARN', `DhanHQ WebSocket start failed (${e?.message || e}) — REST polling only`, 'market_data');
+      this.scheduleWsRetry();
     }
+  }
+
+  // A single failed handshake (e.g. a transient 429) used to disable the WS
+  // for the rest of the process's life. Retry with capped exponential backoff instead.
+  private scheduleWsRetry(): void {
+    if (this.wsStarted || this.wsRetryTimer) return;
+    this.wsRetryAttempts++;
+    const delay = Math.min(15_000 * 2 ** (this.wsRetryAttempts - 1), 5 * 60_000);
+    this.wsRetryTimer = setTimeout(() => {
+      this.wsRetryTimer = null;
+      this.tryStartWs();
+    }, delay);
   }
 
   private patchOrderWsSafety(): void {
@@ -136,11 +159,14 @@ export class MarketDataService {
     const tick = async () => {
       const clock = marketClock();
       const wsFresh = this.wsTickCount > 0 && Date.now() - this.lastWsTickAt < 10_000;
-      const interval = wsFresh ? 15_000 : clock.isMarketOpen ? 3_000 : 30_000;
+      const backoffRemaining = this.rateLimitedUntil - Date.now();
+      const interval = backoffRemaining > 0 ? backoffRemaining : wsFresh ? 15_000 : clock.isMarketOpen ? 3_000 : 30_000;
       if (this.pollTimer) clearTimeout(this.pollTimer);
       this.pollTimer = setTimeout(tick, interval);
-      await this.pollIndices();
-      await this.pollExtraInstruments();
+      if (backoffRemaining <= 0) {
+        await this.pollIndices();
+        await this.pollExtraInstruments();
+      }
     };
     tick();
   }
@@ -159,12 +185,22 @@ export class MarketDataService {
       if (touched) {
         this.restTickCount++;
         this.lastTickAt = Date.now();
+        this.consecutiveRateLimits = 0;
         if (this.wsTickCount === 0 || Date.now() - this.lastWsTickAt >= 10_000) {
           this.source = 'rest';
         }
       }
     } catch (e: any) {
-      eventBus.log('WARN', `Index quote poll failed: ${e?.message || e}`, 'market_data');
+      if (e instanceof RateLimitError) {
+        this.consecutiveRateLimits++;
+        // Exponential backoff (10s, 20s, 40s ... capped at 2min) — retrying every
+        // 3s into a 429 just keeps renewing Dhan's rate-limit window forever.
+        const backoffMs = e.retryAfterMs || Math.min(10_000 * 2 ** (this.consecutiveRateLimits - 1), 120_000);
+        this.rateLimitedUntil = Date.now() + backoffMs;
+        eventBus.log('WARN', `Index quote poll rate-limited — backing off ${Math.round(backoffMs / 1000)}s`, 'market_data');
+      } else {
+        eventBus.log('WARN', `Index quote poll failed: ${e?.message || e}`, 'market_data');
+      }
     }
   }
 
@@ -352,6 +388,7 @@ export class MarketDataService {
 
   stop(): void {
     if (this.pollTimer) clearTimeout(this.pollTimer);
+    if (this.wsRetryTimer) clearTimeout(this.wsRetryTimer);
     this.unsubEventBus?.();
     try { (this.client as any).ws?.disconnect?.(); } catch { /* noop */ }
   }
