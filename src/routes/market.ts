@@ -3,7 +3,7 @@ import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import type { MarketDataService } from '../services/marketData';
 import { getOptionsAnalysisCache, saveOptionsAnalysisCache } from '../db';
 import { eventBus } from '../services/eventBus';
-import { analyzeOptionChain } from '../services/optionsAnalytics';
+import { analyzeOptionChain, toChainRowView } from '../services/optionsAnalytics';
 import { nearestIndexExpiry } from '../services/marketHours';
 
 /**
@@ -37,9 +37,23 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
         expiry,
       });
       const rows = Array.isArray(chain) ? chain : chain?.strikes || chain?.data || [];
-      res.json({ strikes: rows, underlying: symbol, expiry, source: 'dhanhq' });
+      res.json({ strikes: toChainRowView(rows), underlying: symbol, expiry, source: 'dhanhq' });
     } catch (e: any) {
       res.status(502).json({ error: `Option chain unavailable: ${e.message}`, strikes: [], underlying: req.params.symbol?.toUpperCase() });
+    }
+  });
+
+  router.get('/expiries/:symbol', async (req, res) => {
+    try {
+      const symbol = (req.params.symbol || 'NIFTY').toUpperCase();
+      const res2 = await (client as any).optionChain.expiryList({
+        underlyingScrip: Number(securityIdFor(symbol)),
+        underlyingSeg: 'IDX_I',
+      });
+      const expiries: string[] = Array.isArray(res2) ? res2 : res2?.data || [];
+      res.json({ expiries, underlying: symbol });
+    } catch (e: any) {
+      res.status(502).json({ error: `Expiry list unavailable: ${e.message}`, expiries: [], underlying: req.params.symbol?.toUpperCase() });
     }
   });
 

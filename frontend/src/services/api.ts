@@ -58,7 +58,9 @@ export const api = {
 
   indices: () => request<{ indices: Record<string, { ltp: number; change: number; pct: number; high: number; low: number; open: number; prevClose: number; updatedAt?: number } | null>; stale: boolean; source: string; error: string | null }>('/api/market/indices'),
 
-  optionChain: (symbol: string) => request<{ strikes: Array<{ strike: number; ce: any; pe: any }>; underlying: string }>(`/api/market/option-chain/${symbol}`),
+  optionChain: (symbol: string, expiry?: string) => request<{ strikes: Array<{ strike: number; ce: any; pe: any }>; underlying: string; expiry: string }>(`/api/market/option-chain/${symbol}${expiry ? `?expiry=${expiry}` : ''}`),
+
+  expiries: (symbol: string) => request<{ expiries: string[]; underlying: string }>(`/api/market/expiries/${symbol}`),
 
   greeks: (symbol: string) => request<{ symbol: string; spot: number; expiry: string; strikes: Array<{ strike: number; ce: any; pe: any }> }>(`/api/market/greeks?symbol=${symbol}`),
 

@@ -27,7 +27,7 @@ export class AutonomyEngine {
   private agent: AgentOrchestrator | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private enabled = true;
-  private scanEnabled = process.env.AUTONOMOUS_SCAN_ENABLED === 'true';
+  private scanEnabled = process.env.AUTONOMOUS_SCAN_ENABLED !== 'false';
   private running = false;
   private lastCycleAt = 0;
   private lastScanAt = 0;
@@ -140,7 +140,7 @@ export class AutonomyEngine {
 
     this.lastScanAt = Date.now();
     try {
-      await this.agent.run('Autonomous options survey for NIFTY and BANKNIFTY', 'autonomous_scanner');
+      await this.agent.run('Autonomous options scan and execute for NIFTY and BANKNIFTY', 'autonomous_scanner');
     } catch { /* agent busy or skipped */ }
   }
 

@@ -132,7 +132,7 @@ export function selectStrikeByDelta(
   for (const row of rows) {
     const strike = row.strike;
     const leg = type === 'CALL' ? row.ce : row.pe;
-    const iv = Number(leg?.iv || leg?.impliedVolatility || 15) / 100;
+    const iv = Number(leg?.iv || leg?.impliedVolatility || leg?.implied_volatility || 15) / 100;
     const g = calculateGreeks(spot, strike, expiry, type, iv);
     const absDelta = Math.abs(g.delta);
     const diff = Math.abs(absDelta - Math.abs(targetDelta));
@@ -220,6 +220,27 @@ function normalizeRows(rows: any[]): Array<{ strike: number; ce: any; pe: any; r
     pe: r.pe || r.put || r.PUT || null,
     raw: r,
   })).filter((r) => Number.isFinite(r.strike) && r.strike > 0);
+}
+
+function flattenLeg(leg: any): { ltp: number; oi: number; volume: number; iv: number; delta: number; gamma: number } | null {
+  if (!leg) return null;
+  return {
+    ltp: Number(leg.ltp ?? leg.lastPrice ?? leg.last_price ?? 0),
+    oi: Number(leg.oi ?? leg.openInterest ?? 0),
+    volume: Number(leg.volume ?? 0),
+    iv: Number(leg.iv ?? leg.impliedVolatility ?? leg.implied_volatility ?? 0),
+    delta: Number(leg.delta ?? leg.greeks?.delta ?? 0),
+    gamma: Number(leg.gamma ?? leg.greeks?.gamma ?? 0),
+  };
+}
+
+/**
+ * SDK's fetchNormalized() renames raw Dhan ce/pe legs to call/put, and nests
+ * greeks — the frontend (and DeployModal) expect a flat {ltp,oi,volume,iv,delta,gamma}
+ * under ce/pe. This is the single place that reconciles both.
+ */
+export function toChainRowView(rows: any[]): Array<{ strike: number; ce: ReturnType<typeof flattenLeg>; pe: ReturnType<typeof flattenLeg> }> {
+  return normalizeRows(rows).map((r) => ({ strike: r.strike, ce: flattenLeg(r.ce), pe: flattenLeg(r.pe) }));
 }
 
 function computeMaxPain(rows: Array<{ strike: number; ce: any; pe: any }>): number {

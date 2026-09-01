@@ -353,7 +353,7 @@ function toLeg(row: any, type: 'CALL' | 'PUT', side: 'BUY' | 'SELL', qty: number
     qty,
     strike,
     optionType: optSuffix,
-    price: Number(leg.ltp || leg.lastPrice || 0),
+    price: Number(leg.ltp || leg.lastPrice || leg.last_price || 0),
     exchangeSegment: 'NSE_FNO',
   };
 }
