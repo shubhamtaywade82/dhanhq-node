@@ -34,8 +34,7 @@ export function AgentToolsMemory() {
       }
     };
     load();
-    const timer = setInterval(load, 15000);
-    return () => { alive = false; clearInterval(timer); };
+    return () => { alive = false; };
   }, []);
 
   const tagClasses: Record<string, string> = {
@@ -44,7 +43,8 @@ export function AgentToolsMemory() {
     destructive_write: 'bg-danger/10 text-danger',
   };
 
-  const criticMemories = events.filter((e) => e.agent === 'critic' && e.summary).slice(0, 8);
+  const liveEvents = state.telemetryEvents.length > 0 ? state.telemetryEvents : events;
+  const criticMemories = liveEvents.filter((e) => e.agent === 'critic' && e.summary).slice(0, 8);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

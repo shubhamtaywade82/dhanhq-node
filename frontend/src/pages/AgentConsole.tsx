@@ -33,20 +33,20 @@ export function AgentConsole() {
   const [input, setInput] = useState('');
   const [llmMode, setLlmMode] = useState<string>('…');
 
-  // Live agent status (personas, LLM mode) from the backend.
+  // Live agent status (personas, LLM mode) from the backend on mount.
+  // Real-time steps and state stream live over the WS telemetry channel.
   useEffect(() => {
     let alive = true;
-    const poll = async () => {
+    const loadStatus = async () => {
       try {
         const st = await api.agentStatus();
         if (!alive) return;
         setLlmMode(st.llm || 'deterministic');
         setState((prev) => ({ ...prev, agentRunning: !!st.running, agentStatus: st.personas || prev.agentStatus }));
-      } catch { /* backend down — UI shows disconnected */ }
+      } catch { /* backend down */ }
     };
-    poll();
-    const t = setInterval(poll, 5000);
-    return () => { alive = false; clearInterval(t); };
+    loadStatus();
+    return () => { alive = false; };
   }, [setState]);
 
   const runObjective = async (objective: string) => {

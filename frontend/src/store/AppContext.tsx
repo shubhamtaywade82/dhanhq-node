@@ -140,41 +140,33 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     boot();
 
-    // Continuous background sync keeps orders, strategies, and control state fresh.
+    // When WebSocket is connected, live events push state instantly.
+    // When WS is disconnected, fallback to REST polling.
     const interval = setInterval(async () => {
       try {
         if (!streamConnectedRef.current) {
-          await refreshIndices();
+          await Promise.all([refreshIndices(), refreshPortfolio(), refreshControlState()]);
         }
-        await Promise.all([refreshPortfolio(), refreshControlState()]);
       } catch {
         /* noop */
       }
-    }, 4000);
+    }, 5000);
 
-    // Uptime ticker — sourced from backend health (real process uptime).
+    // Local 1s clock tick; syncs health periodically without REST spam
     const uptimeInterval = setInterval(async () => {
-      try {
-        const health = await api.health();
-        if (mounted) {
-          setConnected(true);
-          setState((prev) => {
-            const unrealized = prev.positions.reduce((acc, p) => acc + (p.unrealizedProfit || p.unrealizedPnl || 0), 0);
-            const totalPnl = (prev.funds.realizedPnl || 0) + unrealized;
-            const pnlHistory = [...prev.pnlHistory, Math.round(totalPnl)];
-            if (pnlHistory.length > 180) pnlHistory.shift();
-            return {
-              ...prev,
-              uptimeSeconds: Math.floor(health.uptime || prev.uptimeSeconds + 2),
-              killed: !!health.killed,
-              pnlHistory,
-            };
-          });
-        }
-      } catch {
-        if (mounted) setConnected(false);
-      }
-    }, 2000);
+      if (!mounted) return;
+      setState((prev) => {
+        const unrealized = prev.positions.reduce((acc, p) => acc + (p.unrealizedProfit || p.unrealizedPnl || 0), 0);
+        const totalPnl = (prev.funds.realizedPnl || 0) + unrealized;
+        const pnlHistory = [...prev.pnlHistory, Math.round(totalPnl)];
+        if (pnlHistory.length > 180) pnlHistory.shift();
+        return {
+          ...prev,
+          uptimeSeconds: prev.uptimeSeconds + 1,
+          pnlHistory,
+        };
+      });
+    }, 1000);
 
     return () => {
       mounted = false;
@@ -191,35 +183,51 @@ export function AppProvider({ children }: { children: ReactNode }) {
     switch (env.channel) {
       case 'tick': {
         const p = env.payload || {};
-        const ltp = p.data?.ltp;
-        if (ltp == null) break;
+        const ltp = Number(p.data?.ltp ?? p.ltp ?? 0);
+        if (!ltp || ltp <= 0) break;
+        const secId = String(p.securityId || p.data?.securityId || '');
+        const sym = p.symbol || (secId === '13' ? 'NIFTY' : secId === '25' ? 'BANKNIFTY' : secId === '51' ? 'SENSEX' : secId === '26' ? 'INDIAVIX' : secId === '27' ? 'FINNIFTY' : secId === '442' ? 'MIDCPNIFTY' : undefined);
 
         setState((prev) => {
-          const nextIndices = p.symbol ? {
+          const nextIndices = sym ? {
             ...prev.indices,
-            [p.symbol]: {
+            [sym]: {
               ltp,
-              change: p.data.change ?? 0,
-              pct: p.data.pctChange ?? 0,
-              high: p.data.high ?? 0,
-              low: p.data.low ?? 0,
-              open: p.data.open ?? 0,
-              prevClose: p.data.prevClose ?? 0,
+              change: p.data?.change ?? 0,
+              pct: p.data?.pctChange ?? p.data?.pct ?? 0,
+              high: p.data?.high ?? 0,
+              low: p.data?.low ?? 0,
+              open: p.data?.open ?? 0,
+              prevClose: p.data?.prevClose ?? 0,
               spot: ltp,
             },
           } : prev.indices;
 
-          const nextPositions = p.securityId ? prev.positions.map((pos) => {
-            if (String(pos.securityId) === String(p.securityId)) {
-              const avg = Number(pos.buyAvg || pos.avgPrice || pos.sAvg || ltp);
-              const qty = Number(pos.netQty || pos.qty || 0);
-              const pnl = Number(((ltp - avg) * qty).toFixed(2));
-              return { ...pos, ltp, pnl };
+          const nextPositions = secId ? prev.positions.map((pos) => {
+            if (String(pos.securityId) === secId) {
+              const net = Number(pos.netQty ?? pos.net_qty ?? 0);
+              const buyAvg = Number(pos.buyAvg ?? pos.buy_avg ?? 0);
+              const sellAvg = Number(pos.sellAvg ?? pos.sell_avg ?? 0);
+              const unrealized = net !== 0 ? (net > 0 ? (ltp - buyAvg) * net : (sellAvg - ltp) * Math.abs(net)) : 0;
+              const realized = Number(pos.realizedProfit ?? pos.realized_pnl ?? 0);
+              const pnl = Number((realized + unrealized).toFixed(2));
+              return { ...pos, ltp, pnl, unrealizedPnl: unrealized, unrealizedProfit: unrealized };
             }
             return pos;
           }) : prev.positions;
 
-          return { ...prev, indices: nextIndices, positions: nextPositions };
+          const nextQuotes = secId ? {
+            ...(prev.quotes || {}),
+            [secId]: {
+              ltp,
+              oi: p.data?.oi,
+              volume: p.data?.volume,
+              change: p.data?.change,
+              pct: p.data?.pctChange,
+            },
+          } : prev.quotes;
+
+          return { ...prev, indices: nextIndices, positions: nextPositions, quotes: nextQuotes };
         });
         break;
       }

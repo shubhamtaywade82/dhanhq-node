@@ -110,8 +110,10 @@ export class MarketDataService {
       patchOrderWsSafety();
       const ws: any = (this.client as any).ws;
       if (ws.market) {
-        // Index instruments (IDX_I) require ticker mode (RequestCode 15) as they lack order depth
-        ws.market.mode = 'ticker';
+        // 'full' mode (RequestCode 21) is the only mode carrying OI — needed for live
+        // option-chain legs subscribed via addInstruments(). The whole ws.market
+        // connection shares one mode, so indices ride along on 'full' too.
+        ws.market.mode = 'full';
         // Register subscriptions upfront so onOpen automatically transmits them
         ws.market.subscribe(
           INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
@@ -300,11 +302,7 @@ export class MarketDataService {
       } as any);
     } catch { /* monitor defensive */ }
 
-    if (symbol) {
-      eventBus.emit('tick', { symbol, data: this.toTickPayload(snap) });
-    } else {
-      eventBus.emit('tick', { securityId: secId, data: this.toTickPayload(snap) });
-    }
+    eventBus.emit('tick', { symbol, securityId: secId, data: this.toTickPayload(snap) });
   }
 
   private ingestRestQuote(secId: string, symbol: string | undefined, d: any): void {
@@ -340,11 +338,7 @@ export class MarketDataService {
       } as any);
     } catch { /* monitor defensive */ }
 
-    if (symbol) {
-      eventBus.emit('tick', { symbol, data: this.toTickPayload(snap) });
-    } else {
-      eventBus.emit('tick', { securityId: secId, data: this.toTickPayload(snap) });
-    }
+    eventBus.emit('tick', { symbol, securityId: secId, data: this.toTickPayload(snap) });
   }
 
   private toTickPayload(s: QuoteSnapshot) {

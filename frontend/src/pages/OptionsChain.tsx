@@ -8,7 +8,7 @@ import { RefreshCw } from 'lucide-react';
 import { api } from '../services/api';
 import type { IndexData } from '../store/types';
 
-interface OptionLeg { ltp: number; oi: number; volume: number; iv: number; delta: number; gamma: number }
+interface OptionLeg { securityId?: string; ltp: number; oi: number; volume: number; iv: number; delta: number; gamma: number }
 interface OptionStrikeRow { strike: number; ce: OptionLeg; pe: OptionLeg }
 
 const CE_COLS = ['OI', 'Vol', 'IV%', 'Delta', 'LTP'] as const;
@@ -32,9 +32,6 @@ export function OptionsChain() {
   const step = symbol === 'SENSEX' || symbol === 'BANKNIFTY' ? 100 : 50;
   const atm = Math.round(spot / step) * step;
 
-  // spot/step/atm change on every live tick — keep them out of loadChain's
-  // identity (via a ref) so the poll effect below doesn't restart on every
-  // tick and pile up overlapping requests against a slow endpoint.
   const fallbackRef = useRef({ spot, step, atm });
   fallbackRef.current = { spot, step, atm };
 
@@ -48,8 +45,8 @@ export function OptionsChain() {
     }).catch(() => setExpiries([]));
   }, [symbol]);
 
-  const loadChain = useCallback(async (isBackground = false) => {
-    if (!isBackground) setLoading(true);
+  const loadChain = useCallback(async () => {
+    setLoading(true);
     try {
       const res = await api.optionChain(symbol, selectedExpiry || undefined);
       if (res?.strikes && res.strikes.length > 0) {
@@ -62,15 +59,37 @@ export function OptionsChain() {
       const f = fallbackRef.current;
       setChainRows(generateRealisticChain(f.spot, f.step, f.atm));
     } finally {
-      if (!isBackground) setLoading(false);
+      setLoading(false);
     }
   }, [symbol, selectedExpiry]);
 
+  // Initial load when symbol or expiry changes (no polling loop needed — WS streams updates)
   useEffect(() => {
-    loadChain(false);
-    const interval = setInterval(() => loadChain(true), 5000);
-    return () => clearInterval(interval);
+    loadChain();
   }, [loadChain]);
+
+  // Real-time update for option strikes from global AppContext quotes
+  useEffect(() => {
+    const quotes = state.quotes;
+    if (!quotes || Object.keys(quotes).length === 0) return;
+
+    setChainRows((prev) => {
+      let matched = false;
+      const next = prev.map((row) => {
+        const ceQ = row.ce?.securityId ? quotes[row.ce.securityId] : null;
+        const peQ = row.pe?.securityId ? quotes[row.pe.securityId] : null;
+        if (!ceQ && !peQ) return row;
+
+        matched = true;
+        return {
+          ...row,
+          ce: ceQ ? { ...row.ce, ltp: ceQ.ltp, oi: ceQ.oi ?? row.ce.oi, volume: ceQ.volume ?? row.ce.volume } : row.ce,
+          pe: peQ ? { ...row.pe, ltp: peQ.ltp, oi: peQ.oi ?? row.pe.oi, volume: peQ.volume ?? row.pe.volume } : row.pe,
+        };
+      });
+      return matched ? next : prev;
+    });
+  }, [state.quotes]);
 
   // Deep OTM/ITM strikes on an expiry-day chain routinely carry zero OI,
   // volume and LTP on both legs — pure noise in a 200+ row table. Drop them.

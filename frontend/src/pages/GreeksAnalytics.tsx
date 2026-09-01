@@ -31,8 +31,7 @@ export function GreeksAnalytics() {
       }
     };
     load();
-    const t = setInterval(load, 10000);
-    return () => { alive = false; clearInterval(t); };
+    return () => { alive = false; };
   }, []);
 
   // Portfolio-level Greeks: prefer live chain greeks; fall back to the

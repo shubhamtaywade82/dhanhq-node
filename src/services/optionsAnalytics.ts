@@ -222,9 +222,10 @@ function normalizeRows(rows: any[]): Array<{ strike: number; ce: any; pe: any; r
   })).filter((r) => Number.isFinite(r.strike) && r.strike > 0);
 }
 
-function flattenLeg(leg: any): { ltp: number; oi: number; volume: number; iv: number; delta: number; gamma: number } | null {
+function flattenLeg(leg: any): { securityId: string; ltp: number; oi: number; volume: number; iv: number; delta: number; gamma: number } | null {
   if (!leg) return null;
   return {
+    securityId: String(leg.securityId || leg.security_id || leg.secId || ''),
     ltp: Number(leg.ltp ?? leg.lastPrice ?? leg.last_price ?? 0),
     oi: Number(leg.oi ?? leg.openInterest ?? 0),
     volume: Number(leg.volume ?? 0),

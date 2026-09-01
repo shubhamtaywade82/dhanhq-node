@@ -20,7 +20,7 @@ import { moduleLogger } from '../lib/logger';
  */
 
 const ALL_CHANNELS: Channel[] = ['tick', 'log', 'alert', 'telemetry', 'risk', 'portfolio', 'order', 'system'];
-const HYDRATION_CHANNELS: Channel[] = ['log', 'alert', 'telemetry'];
+const HYDRATION_CHANNELS: Channel[] = ['tick', 'portfolio', 'risk', 'log', 'alert', 'telemetry'];
 
 const log = moduleLogger('ws');
 

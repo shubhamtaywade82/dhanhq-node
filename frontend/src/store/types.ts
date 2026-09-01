@@ -154,6 +154,7 @@ export interface AppState {
   uptimeSeconds: number;
   latency: number;
   indices: Record<string, IndexData>;
+  quotes?: Record<string, { ltp: number; oi?: number; volume?: number; change?: number; pct?: number }>;
   strategies: Strategy[];
   recentFills: Fill[];
   orders: Order[];

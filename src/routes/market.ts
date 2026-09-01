@@ -37,6 +37,9 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
         expiry,
       });
       const rows = Array.isArray(chain) ? chain : chain?.strikes || chain?.data || [];
+      const spotSnap = market.getQuote(securityIdFor(symbol));
+      const spot = spotSnap?.ltp || 0;
+      subscribeAtmOptionLegs(market, symbol, rows, spot);
       res.json({ strikes: toChainRowView(rows), underlying: symbol, expiry, source: 'dhanhq' });
     } catch (e: any) {
       res.status(502).json({ error: `Option chain unavailable: ${e.message}`, strikes: [], underlying: req.params.symbol?.toUpperCase() });
@@ -392,3 +395,26 @@ function computeAnalysisSummary(days: any[], symbol: string) {
     days,
   };
 }
+
+function subscribeAtmOptionLegs(market: MarketDataService, symbol: string, rows: any[], spot: number): void {
+  if (!rows || rows.length === 0) return;
+  const seg = symbol === 'SENSEX' ? 'BSE_FNO' : 'NSE_FNO';
+  const sorted = [...rows].sort((a: any, b: any) => {
+    const sA = Number(a.strike ?? a.Strike ?? 0);
+    const sB = Number(b.strike ?? b.Strike ?? 0);
+    return Math.abs(sA - spot) - Math.abs(sB - spot);
+  });
+  // Subscribe ±10 strikes around ATM (20 strikes total = 40 contracts)
+  const atmStrikes = sorted.slice(0, 20);
+  const instruments: Array<{ securityId: string; exchangeSegment: string }> = [];
+  for (const r of atmStrikes) {
+    const cId = r.call?.security_id || r.ce?.security_id || r.ce?.securityId;
+    const pId = r.put?.security_id || r.pe?.security_id || r.pe?.securityId;
+    if (cId) instruments.push({ securityId: String(cId), exchangeSegment: seg });
+    if (pId) instruments.push({ securityId: String(pId), exchangeSegment: seg });
+  }
+  if (instruments.length > 0) {
+    market.addInstruments(instruments);
+  }
+}
+
