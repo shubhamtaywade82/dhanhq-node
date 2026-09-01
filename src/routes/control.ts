@@ -153,7 +153,7 @@ export function controlRoutes(
   router.post('/strategy/backtest', async (req, res) => {
     try {
       const { symbol = 'NIFTY', type = 'STRADDLE', days = 5, entryType, targetPct, slPct, timeExit, lots, side } = req.body || {};
-      const secMap: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442' };
+      const secMap: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', SENSEX: '51' };
       const sym = symbol.toUpperCase();
       const secId = secMap[sym] || '13';
       const histData = await analyzeOptionsBehavior(client, {

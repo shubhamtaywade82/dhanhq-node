@@ -1,5 +1,5 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
-import { PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
+import { PositionMonitor, OrderUpdateWS } from '@nemesis-oss/dhanhq-sdk';
 import { eventBus } from './eventBus';
 import { marketClock, istNow } from './marketHours';
 
@@ -102,6 +102,7 @@ export class MarketDataService {
       return;
     }
     try {
+      patchOrderWsSafety();
       const ws: any = (this.client as any).ws;
       ws.market?.on?.('tick', (tick: any) => {
         this.wsTickCount++;
@@ -125,6 +126,10 @@ export class MarketDataService {
     } catch (e: any) {
       eventBus.log('WARN', `DhanHQ WebSocket start failed (${e?.message || e}) — REST polling only`, 'market_data');
     }
+  }
+
+  private patchOrderWsSafety(): void {
+    patchOrderWsSafety();
   }
 
   private schedulePolling(): void {
@@ -350,4 +355,44 @@ export class MarketDataService {
     this.unsubEventBus?.();
     try { (this.client as any).ws?.disconnect?.(); } catch { /* noop */ }
   }
+}
+
+function patchOrderWsSafety(): void {
+  const proto = (OrderUpdateWS as any)?.prototype;
+  if (!proto || proto.__safetyPatched) return;
+  proto.__safetyPatched = true;
+  const origOnMessage = proto.onMessage;
+  proto.onMessage = function (data: any) {
+    try {
+      const raw = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString('utf8') : null);
+      if (!raw) return;
+      const trimmed = raw.trim();
+      if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return;
+      if (trimmed.includes('}{')) {
+        const parts = trimmed.split(/(?<=\})(?=\{)/);
+        for (const part of parts) {
+          try {
+            const parsed = JSON.parse(part);
+            if (parsed.Type === 'order_alert' && parsed.Data) {
+              const state = {
+                orderId: typeof parsed.Data.OrderNo === 'string' ? parsed.Data.OrderNo : undefined,
+                correlationId: typeof parsed.Data.CorrelationId === 'string' && parsed.Data.CorrelationId.length > 0 ? parsed.Data.CorrelationId : undefined,
+                status: typeof parsed.Data.Status === 'string' ? parsed.Data.Status : undefined,
+                tradedQty: typeof parsed.Data.TradedQty === 'number' ? parsed.Data.TradedQty : undefined,
+                averageTradedPrice: typeof parsed.Data.AvgTradedPrice === 'number' ? parsed.Data.AvgTradedPrice : undefined,
+                securityId: typeof parsed.Data.SecurityId === 'string' ? parsed.Data.SecurityId : undefined,
+                raw: parsed.Data,
+              };
+              (this as any).orderStore?.upsert?.(state);
+              this.emit('order', state);
+            }
+          } catch { /* ignore malformed part */ }
+        }
+        return;
+      }
+      origOnMessage.call(this, data);
+    } catch {
+      // Guard against malformed JSON or heartbeat frames from Dhan
+    }
+  };
 }

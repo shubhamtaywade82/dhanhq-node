@@ -3,18 +3,20 @@ import {
 } from '../services/optionsAnalytics';
 import {
   buildIronCondor, buildCreditSpread, buildStraddle, buildStrangle, evaluateStrategyBacktest,
+  buildOrbBuyingStrategy, buildVwapPullbackStrategy, calculateFnoFrictions, calculatePositionSize,
 } from '../services/strategyConstructor';
 
-describe('Options & Volatility Analytics Core', () => {
-  const sampleChain = [
-    { strike: 24000, ce: { oi: 10000, volume: 5000, ltp: 550, iv: 15, securityId: '101' }, pe: { oi: 50000, volume: 20000, ltp: 10, iv: 15, securityId: '201' } },
-    { strike: 24200, ce: { oi: 20000, volume: 15000, ltp: 380, iv: 14, securityId: '102' }, pe: { oi: 40000, volume: 18000, ltp: 25, iv: 14, securityId: '202' } },
-    { strike: 24500, ce: { oi: 60000, volume: 45000, ltp: 150, iv: 13, securityId: '103' }, pe: { oi: 65000, volume: 50000, ltp: 140, iv: 13, securityId: '203' } },
-    { strike: 24800, ce: { oi: 80000, volume: 30000, ltp: 30, iv: 14, securityId: '104' }, pe: { oi: 15000, volume: 8000, ltp: 360, iv: 14, securityId: '204' } },
-    { strike: 25000, ce: { oi: 95000, volume: 35000, ltp: 8, iv: 15, securityId: '105' }, pe: { oi: 5000, volume: 2000, ltp: 520, iv: 15, securityId: '205' } },
-  ];
+const sampleChain = [
+  { strike: 24000, ce: { oi: 10000, volume: 5000, ltp: 550, iv: 15, securityId: '101' }, pe: { oi: 50000, volume: 20000, ltp: 10, iv: 15, securityId: '201' } },
+  { strike: 24200, ce: { oi: 20000, volume: 15000, ltp: 380, iv: 14, securityId: '102' }, pe: { oi: 40000, volume: 18000, ltp: 25, iv: 14, securityId: '202' } },
+  { strike: 24500, ce: { oi: 60000, volume: 45000, ltp: 150, iv: 13, securityId: '103' }, pe: { oi: 65000, volume: 50000, ltp: 140, iv: 13, securityId: '203' } },
+  { strike: 24800, ce: { oi: 80000, volume: 30000, ltp: 30, iv: 14, securityId: '104' }, pe: { oi: 15000, volume: 8000, ltp: 360, iv: 14, securityId: '204' } },
+  { strike: 25000, ce: { oi: 95000, volume: 35000, ltp: 8, iv: 15, securityId: '105' }, pe: { oi: 5000, volume: 2000, ltp: 520, iv: 15, securityId: '205' } },
+];
 
-  const expiry = new Date(Date.now() + 5 * 86400000).toISOString().slice(0, 10);
+const expiry = new Date(Date.now() + 5 * 86400000).toISOString().slice(0, 10);
+
+describe('Options & Volatility Analytics Core', () => {
 
   it('calculates Black-Scholes Greeks with correct sign conventions', () => {
     const callGreeks = calculateGreeks(24500, 24500, expiry, 'CALL', 0.14);
@@ -150,5 +152,28 @@ describe('Strategy Backtest Evaluation Engine', () => {
     // Day 2 big expansion 290 -> 340 (Short loss)
     expect(report.days[1].pnl).toBeLessThan(0);
     expect(report.winRate).toBe(50);
+  });
+
+  it('evaluates Options Buying strategies, friction calculations, and 1% risk position sizing', () => {
+    const orbBuy = buildOrbBuyingStrategy('NIFTY', 24500, sampleChain, expiry, 1, 'BULLISH');
+    expect(orbBuy).not.toBeNull();
+    expect(orbBuy?.legs[0].side).toBe('BUY');
+    expect(orbBuy?.lotSize).toBe(65);
+
+    const vwapBuy = buildVwapPullbackStrategy('BANKNIFTY', 58000, sampleChain, expiry, 1, 'BEARISH');
+    expect(vwapBuy).not.toBeNull();
+    expect(vwapBuy?.lotSize).toBe(30);
+
+    // 1% risk position sizing: ₹10,00,000 capital, 50 pt stop on NIFTY (lot: 65)
+    // Risk budget = ₹10,000. Risk/lot = 50 * 65 = 3250. Max lots = floor(10000 / 3250) = 3 lots.
+    const size = calculatePositionSize(1000000, 50, 'NIFTY', 1);
+    expect(size.lots).toBe(3);
+    expect(size.qty).toBe(195);
+
+    // F&O frictions on ₹200 entry -> ₹300 exit (65 qty):
+    const fno = calculateFnoFrictions(200, 300, 65);
+    expect(fno.stt).toBe(19.5); // 300 * 65 * 0.0010 = 19.50
+    expect(fno.brokerage).toBe(40); // ₹20 in + ₹20 out
+    expect(fno.totalFriction).toBeGreaterThan(50);
   });
 });

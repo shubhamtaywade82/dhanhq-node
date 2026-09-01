@@ -1,3 +1,5 @@
+import dotenv from "dotenv";
+dotenv.config();
 import { DhanClient, DhanAuth } from "@nemesis-oss/dhanhq-sdk";
 import Redis from "ioredis";
 import { moduleLogger } from "./lib/logger";

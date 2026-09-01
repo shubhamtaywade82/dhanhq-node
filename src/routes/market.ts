@@ -4,6 +4,7 @@ import type { MarketDataService } from '../services/marketData';
 import { getOptionsAnalysisCache, saveOptionsAnalysisCache } from '../db';
 import { eventBus } from '../services/eventBus';
 import { analyzeOptionChain } from '../services/optionsAnalytics';
+import { nearestIndexExpiry } from '../services/marketHours';
 
 /**
  * Market data routes — every response is sourced from live DhanHQ data.
@@ -27,13 +28,15 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
 
   router.get('/option-chain/:symbol', async (req, res) => {
     try {
-      const { symbol } = req.params;
+      const symbol = (req.params.symbol || 'NIFTY').toUpperCase();
+      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
         underlyingScrip: Number(securityIdFor(symbol)),
         underlyingSeg: 'IDX_I',
+        expiry,
       });
       const rows = Array.isArray(chain) ? chain : chain?.strikes || chain?.data || [];
-      res.json({ strikes: rows, underlying: symbol.toUpperCase(), source: 'dhanhq' });
+      res.json({ strikes: rows, underlying: symbol, expiry, source: 'dhanhq' });
     } catch (e: any) {
       res.status(502).json({ error: `Option chain unavailable: ${e.message}`, strikes: [], underlying: req.params.symbol?.toUpperCase() });
     }
@@ -58,21 +61,25 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
   router.get('/greeks', async (req, res) => {
     try {
       const symbol = ((req.query.symbol as string) || 'NIFTY').toUpperCase();
+      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
-        underlyingScrip: Number(securityIdFor(symbol)), underlyingSeg: 'IDX_I',
+        underlyingScrip: Number(securityIdFor(symbol)),
+        underlyingSeg: 'IDX_I',
+        expiry,
       });
-      const rows = Array.isArray(chain) ? chain : chain?.strikes || [];
+      const rows = Array.isArray(chain) ? chain : chain?.strikes || chain?.data || [];
       const spotSnap = market.getQuote(securityIdFor(symbol));
       const spot = spotSnap?.ltp || Number(req.query.spot) || 0;
       if (!spot) return res.status(502).json({ error: 'Underlying spot unavailable — cannot compute Greeks' });
 
-      const expiry = (req.query.expiry as string) || nearestWeeklyExpiry();
-      const strikes = rows.slice(0, 21).map((r: any) => {
+      const strikes = rows.slice(0, 35).map((r: any) => {
         const strike = Number(r.strike ?? r.Strike);
+        const ceLeg = r.ce || r.call || r.CALL;
+        const peLeg = r.pe || r.put || r.PUT;
         return {
           strike,
-          ce: greeksFor(r?.ce, strike, 'CALL', spot, expiry),
-          pe: greeksFor(r?.pe, strike, 'PUT', spot, expiry),
+          ce: greeksFor(ceLeg, strike, 'CALL', spot, expiry),
+          pe: greeksFor(peLeg, strike, 'PUT', spot, expiry),
         };
       }).filter((s: any) => Number.isFinite(s.strike));
 
@@ -86,7 +93,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
     try {
       const symbol = (req.params.symbol || 'NIFTY').toUpperCase();
       const secId = securityIdFor(symbol);
-      const expiry = (req.query.expiry as string) || nearestWeeklyExpiry();
+      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
         underlyingScrip: Number(secId), underlyingSeg: 'IDX_I', expiry,
       });
@@ -122,16 +129,6 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
 function securityIdFor(symbol: string): string {
   const map: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', SENSEX: '51', INDIAVIX: '26' };
   return map[symbol.toUpperCase()] || '13';
-}
-
-function nearestWeeklyExpiry(): string {
-  const now = new Date();
-  const day = now.getDay();
-  let delta = (4 - day + 7) % 7;
-  if (delta === 0 && now.getHours() >= 15) delta = 7;
-  const d = new Date(now);
-  d.setDate(d.getDate() + delta);
-  return d.toISOString().slice(0, 10);
 }
 
 function greeksFor(leg: any, strike: number, type: 'CALL' | 'PUT', spot: number, expiry: string) {
@@ -200,7 +197,7 @@ export async function analyzeOptionsBehavior(client: DhanClient, params: Analysi
     }
 
     const spot = item.spot;
-    const step = params.symbol === 'BANKNIFTY' ? 100 : 50;
+    const step = params.symbol === 'BANKNIFTY' || params.symbol === 'SENSEX' ? 100 : (params.symbol === 'MIDCPNIFTY' ? 25 : 50);
     const atmStrike = Math.round(spot.open / step) * step;
     const strikesData = [];
 

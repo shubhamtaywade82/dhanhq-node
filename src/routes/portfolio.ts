@@ -25,6 +25,35 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
   const router = Router();
   const isPaper = () => process.env.TRADING_MODE !== 'live';
 
+  router.get('/summary', async (req, res) => {
+    try {
+      const [positions, wallet, strategies, orders] = await Promise.all([
+        listPaperPositions(),
+        getPaperWallet(),
+        listPaperStrategies(),
+        listPaperOrders(),
+      ]);
+      const indices = market.getIndices();
+      const spotMap: Record<string, number> = {};
+      for (const [sym, data] of Object.entries(indices)) {
+        if (data?.ltp) spotMap[sym] = data.ltp;
+      }
+      const greeks = aggregatePortfolioGreeks(positions, spotMap, new Date().toISOString().slice(0, 10));
+      res.json({
+        wallet,
+        positions,
+        strategies,
+        ordersCount: orders.length,
+        openPositionsCount: positions.filter((p: any) => p.netQty !== 0).length,
+        greeks,
+        risk: risk?.snapshot() || null,
+      });
+    } catch (e: any) {
+      log.warn({ requestId: req.id, err: { message: e.message } }, 'Portfolio summary fetch failed');
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   router.get('/positions', async (req, res) => {
     try {
       if (isPaper() || req.query.mode === 'paper') {

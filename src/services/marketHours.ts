@@ -62,3 +62,43 @@ export function marketClock(now: Date = new Date()): MarketClock {
 export function isIndianMarketOpen(now: Date = new Date()): boolean {
   return marketClock(now).isMarketOpen;
 }
+
+/**
+ * Computes nearest valid expiry for Indian indices per SEBI 2025-2026 schedule:
+ * - NIFTY: Weekly on Tuesday (2)
+ * - SENSEX: Weekly on Thursday (4)
+ * - BANKNIFTY: Monthly on last Tuesday of the month
+ */
+export function nearestIndexExpiry(symbol = 'NIFTY', now: Date = new Date()): string {
+  const sym = symbol.toUpperCase();
+  const parts = istParts(now);
+  const targetDay = sym === 'SENSEX' ? 4 : 2; // Thursday for SENSEX, Tuesday for NIFTY/BANKNIFTY
+
+  if (sym === 'BANKNIFTY') {
+    return getLastTuesdayOfMonth(parts.dateStr, parts.hours >= 15);
+  }
+
+  let delta = (targetDay - parts.dayOfWeek + 7) % 7;
+  if (delta === 0 && parts.hours >= 15 && parts.minutes >= 30) delta = 7;
+  const d = new Date(now.getTime() + IST_OFFSET_MINUTES * 60_000);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+
+function getLastTuesdayOfMonth(dateStr: string, passedExpiryHour: boolean): string {
+  const [y, m] = dateStr.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0));
+  const day = lastDay.getUTCDay();
+  const diff = (day - 2 + 7) % 7;
+  lastDay.setUTCDate(lastDay.getUTCDate() - diff);
+  const expiryStr = lastDay.toISOString().slice(0, 10);
+
+  if (dateStr > expiryStr || (dateStr === expiryStr && passedExpiryHour)) {
+    const nextMonthLastDay = new Date(Date.UTC(y, m + 1, 0));
+    const nextDiff = (nextMonthLastDay.getUTCDay() - 2 + 7) % 7;
+    nextMonthLastDay.setUTCDate(nextMonthLastDay.getUTCDate() - nextDiff);
+    return nextMonthLastDay.toISOString().slice(0, 10);
+  }
+  return expiryStr;
+}
+

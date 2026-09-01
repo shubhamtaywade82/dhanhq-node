@@ -73,6 +73,7 @@ export const api = {
 
   quote: (securityId: string, exchange = 'NSE_FNO') => request<any>(`/api/market/quote/${securityId}?exchange=${exchange}`),
 
+  portfolioSummary: () => request<any>('/api/portfolio/summary'),
   positions: () => request<any[]>('/api/portfolio/positions'),
   orders: () => request<any[]>('/api/portfolio/orders'),
   trades: () => request<any[]>('/api/portfolio/trades'),

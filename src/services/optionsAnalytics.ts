@@ -146,6 +146,32 @@ export function selectStrikeByDelta(
   return bestRow;
 }
 
+/** Selects the strike row whose option premium (LTP) is closest to target (e.g. ₹200 for near-ITM ORB). */
+export function selectStrikeByPremiumTarget(
+  chainRows: any[],
+  targetPremium: number,
+  type: 'CALL' | 'PUT'
+): any | null {
+  const rows = normalizeRows(chainRows);
+  if (rows.length === 0) return null;
+
+  let bestRow: any = null;
+  let minDiff = Infinity;
+
+  for (const row of rows) {
+    const leg = type === 'CALL' ? row.ce : row.pe;
+    const ltp = Number(leg?.ltp ?? leg?.lastPrice ?? leg?.last_price ?? 0);
+    if (ltp <= 0) continue;
+    const diff = Math.abs(ltp - targetPremium);
+    if (diff < minDiff) {
+      minDiff = diff;
+      bestRow = { ...row, targetLeg: leg, strike: row.strike };
+    }
+  }
+
+  return bestRow || rows[0];
+}
+
 export function aggregatePortfolioGreeks(
   positions: Array<{ tradingSymbol: string; netQty: number; securityId?: string; ltp?: number }>,
   spotPrices: Record<string, number>,
@@ -263,15 +289,8 @@ function normalPdf(x: number): number {
 }
 
 function erf(x: number): number {
-  // Abramowitz and Stegun formula 7.1.26
-  const sign = Math.sign(x);
-  const absX = Math.abs(x);
-  const a1 = 0.254829592;
-  const a2 = -0.284496736;
-  const a3 = 1.421413741;
-  const a4 = -1.453152027;
-  const a5 = 1.061405429;
-  const p = 0.3275911;
+  const sign = Math.sign(x), absX = Math.abs(x), p = 0.3275911;
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429;
   const t = 1 / (1 + p * absX);
   const poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
   return sign * (1 - poly * Math.exp(-absX * absX));
