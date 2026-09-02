@@ -6,6 +6,7 @@ import { RiskEngine } from './services/riskEngine';
 import { AutonomyEngine } from './services/autonomy';
 import { AgentOrchestrator } from './services/agent';
 import { SelfHealingService } from './services/selfHealing';
+import { startTelegramNotifier } from './services/telegramNotifier';
 import { eventBus } from './services/eventBus';
 import { PaperExecutionEngine } from './engines/paper';
 import { LiveExecutionEngine } from './engines/live';
@@ -60,6 +61,7 @@ export async function startCore(): Promise<Core> {
 
   const selfHealing = new SelfHealingService();
   selfHealing.start();
+  startTelegramNotifier();
 
   await market.start();
   await seedExistingPositions(market);

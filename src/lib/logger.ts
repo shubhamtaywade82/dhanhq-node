@@ -1,5 +1,7 @@
 import pino, { Logger, LoggerOptions } from 'pino';
 import { randomUUID } from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 /**
  * Structured logging core (Pino).
@@ -13,7 +15,13 @@ import { randomUUID } from 'crypto';
  *      PINs, Authorization headers and cookies are redacted centrally.
  *   4. Request-scoped child loggers give every HTTP request a stable
  *      `requestId` that the frontend echoes via `x-request-id`.
- *   5. Pretty printing ONLY in development (pino-pretty).
+ *   5. Pretty printing ONLY in development (pino-pretty), always to stdout.
+ *   6. Every line ALSO lands in a daily-rotated JSONL file on disk
+ *      (`logs/YYYY-MM-DD.jsonl`, same convention as local-agent-stack) —
+ *      the terminal running the dev server is not the only place logs
+ *      live, and a crash/restart (ts-node-dev --respawn) doesn't lose
+ *      scrollback. The filename is fixed at process start, not rotated
+ *      mid-run past midnight — restart the process to roll to a new file.
  *
  * Levels (Pino standard): fatal > error > warn > info > debug > trace.
  * EventBus levels (INFO/WARN/ERROR/SYSTEM/TRADE) map onto these —
@@ -21,6 +29,10 @@ import { randomUUID } from 'crypto';
  */
 
 const isDev = process.env.NODE_ENV !== 'production';
+
+const LOG_DIR = process.env.LOG_DIR || path.resolve(__dirname, '../../logs');
+fs.mkdirSync(LOG_DIR, { recursive: true });
+const logFile = path.join(LOG_DIR, `${new Date().toISOString().slice(0, 10)}.jsonl`);
 
 const options: LoggerOptions = {
   level: process.env.LOG_LEVEL ?? (isDev ? 'debug' : 'info'),
@@ -51,19 +63,16 @@ const options: LoggerOptions = {
   },
   // ISO 8601 timestamps — time-zone safe (IST trading hours!), sortable.
   timestamp: pino.stdTimeFunctions.isoTime,
-  ...(isDev
-    ? {
-        transport: {
-          target: 'pino-pretty',
-          options: {
-            colorize: true,
-            translateTime: 'SYS:standard',
-            ignore: 'pid,hostname',
-            singleLine: true,
-          },
-        },
-      }
-    : {}),
+  transport: {
+    targets: [
+      // Raw JSON, always, to the daily file — the durable copy.
+      { target: 'pino/file', level: 'trace', options: { destination: logFile, mkdir: true } },
+      isDev
+        ? { target: 'pino-pretty', level: 'trace', options: { colorize: true, translateTime: 'SYS:standard', ignore: 'pid,hostname', singleLine: true } }
+        // Prod: raw JSON to stdout too (fd 1) — the platform log collector ships these.
+        : { target: 'pino/file', level: 'trace', options: { destination: 1 } },
+    ],
+  },
 };
 
 export const logger: Logger = pino(options);

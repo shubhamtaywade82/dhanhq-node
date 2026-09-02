@@ -1,4 +1,4 @@
-import { selectStrikeByDelta, selectStrikeByPremiumTarget } from './optionsAnalytics';
+import { selectStrikeByDelta, selectStrikeByPremiumTarget, calculateGreeks } from './optionsAnalytics';
 import { listPaperStrategies, createPaperStrategy } from '../db';
 import { INDEX_INSTRUMENTS } from './marketData';
 import { nearestIndexExpiry } from './marketHours';
@@ -670,7 +670,7 @@ export function evaluateStrategyBacktest(symbol: string, type: string, daysData:
 
   const validDays = (daysData || []).filter((d) => d && Array.isArray(d.timeline) && d.timeline.length > 0);
   const days: BacktestDayResult[] = validDays.map((d) =>
-    simulateDayBacktest(d, type, { targetPct, slPct, timeExit, lots, lotSize, isShort, entryType: cfg.entryType || type })
+    simulateDayBacktest(d, type, { targetPct, slPct, timeExit, lots, lotSize, isShort, entryType: cfg.entryType || type, symbol })
   );
 
   const wins = days.filter((d) => d.netPnlInr > 0).length, totalDays = days.length;
@@ -690,32 +690,190 @@ export function evaluateStrategyBacktest(symbol: string, type: string, daysData:
   return { symbol, strategyType: type, totalDays, wins, winRate, totalPnl, totalPnlInr, netPnlInr, totalFrictionInr, profitFactor, maxDrawdownRoi, avgRoi, passedValidation, days };
 }
 
+interface BacktestLegSpec {
+  optType: 'CALL' | 'PUT';
+  targetDelta: number;
+  side: 'BUY' | 'SELL';
+  qtyMultiplier: number;
+}
+
+/**
+ * Leg definitions mirroring each live build* function's actual strike-delta
+ * targets and sides, so a backtest for a given type simulates the same
+ * combination of strikes the live strategy would actually open — not a
+ * generic ATM-straddle stand-in for every multi-leg type.
+ */
+function getStrategyLegSpecs(type: string, direction: 'CALL' | 'PUT', side: 'BUY' | 'SELL'): BacktestLegSpec[] {
+  const t = type.toUpperCase();
+  if (t.includes('STRADDLE')) {
+    return [
+      { optType: 'CALL', targetDelta: 0.50, side, qtyMultiplier: 1 },
+      { optType: 'PUT', targetDelta: 0.50, side, qtyMultiplier: 1 },
+    ];
+  }
+  if (t.includes('STRANGLE')) {
+    return [
+      { optType: 'CALL', targetDelta: 0.25, side, qtyMultiplier: 1 },
+      { optType: 'PUT', targetDelta: 0.25, side, qtyMultiplier: 1 },
+    ];
+  }
+  if (t === 'IRON_CONDOR') {
+    return [
+      { optType: 'PUT', targetDelta: 0.10, side: 'BUY', qtyMultiplier: 1 },
+      { optType: 'CALL', targetDelta: 0.10, side: 'BUY', qtyMultiplier: 1 },
+      { optType: 'PUT', targetDelta: 0.25, side: 'SELL', qtyMultiplier: 1 },
+      { optType: 'CALL', targetDelta: 0.25, side: 'SELL', qtyMultiplier: 1 },
+    ];
+  }
+  if (t === 'IRON_BUTTERFLY') {
+    return [
+      { optType: 'PUT', targetDelta: 0.15, side: 'BUY', qtyMultiplier: 1 },
+      { optType: 'CALL', targetDelta: 0.15, side: 'BUY', qtyMultiplier: 1 },
+      { optType: 'PUT', targetDelta: 0.50, side: 'SELL', qtyMultiplier: 1 },
+      { optType: 'CALL', targetDelta: 0.50, side: 'SELL', qtyMultiplier: 1 },
+    ];
+  }
+  if (t === 'BULL_PUT_SPREAD') {
+    return [
+      { optType: 'PUT', targetDelta: 0.15, side: 'BUY', qtyMultiplier: 1 },
+      { optType: 'PUT', targetDelta: 0.30, side: 'SELL', qtyMultiplier: 1 },
+    ];
+  }
+  if (t === 'BEAR_CALL_SPREAD') {
+    return [
+      { optType: 'CALL', targetDelta: 0.15, side: 'BUY', qtyMultiplier: 1 },
+      { optType: 'CALL', targetDelta: 0.30, side: 'SELL', qtyMultiplier: 1 },
+    ];
+  }
+  if (t === 'BULL_CALL_SPREAD') {
+    return [
+      { optType: 'CALL', targetDelta: 0.50, side: 'BUY', qtyMultiplier: 1 },
+      { optType: 'CALL', targetDelta: 0.25, side: 'SELL', qtyMultiplier: 1 },
+    ];
+  }
+  if (t === 'BEAR_PUT_SPREAD') {
+    return [
+      { optType: 'PUT', targetDelta: 0.50, side: 'BUY', qtyMultiplier: 1 },
+      { optType: 'PUT', targetDelta: 0.25, side: 'SELL', qtyMultiplier: 1 },
+    ];
+  }
+  if (t === 'RATIO_SPREAD') {
+    return [
+      { optType: direction, targetDelta: 0.50, side: 'BUY', qtyMultiplier: 1 },
+      { optType: direction, targetDelta: 0.20, side: 'SELL', qtyMultiplier: 2 },
+    ];
+  }
+  if (t === 'ORB_15M' || t === 'ORB_30M' || t === 'ORB_PREMIUM_200' || t === 'EMA_CROSSOVER') {
+    return [{ optType: direction, targetDelta: 0.55, side: 'BUY', qtyMultiplier: 1 }];
+  }
+  // VWAP_RSI_PULLBACK, NAKED_BUY, and anything unrecognized: single ATM leg.
+  return [{ optType: direction, targetDelta: 0.50, side, qtyMultiplier: 1 }];
+}
+
+/** Finds the historical strike (from the day's fetched ATM±5 rows) whose
+ * Black-Scholes delta is closest to the target — the same selection logic
+ * live strike selection uses, applied to historical IV/spot instead of a
+ * live chain. */
+function selectHistoricalStrikeByDelta(strikes: any[], targetDelta: number, optType: 'CALL' | 'PUT', spot: number, expiry: string): any | null {
+  let best: any = null, minDiff = Infinity;
+  for (const s of strikes || []) {
+    const leg = optType === 'CALL' ? s.call : s.put;
+    if (!leg || !leg.open) continue;
+    const iv = Number(leg.iv || 15) / 100;
+    const g = calculateGreeks(spot, s.strike, expiry, optType, iv);
+    const diff = Math.abs(Math.abs(g.delta) - targetDelta);
+    if (diff < minDiff) { minDiff = diff; best = s; }
+  }
+  return best;
+}
+
+/** A resolved strike may carry its own full timeline (real historical data);
+ * fall back to the day's shared timeline when it doesn't (e.g. a fixture
+ * with only one strike's series, or missing per-strike history). */
+function buildLegTimeline(strikeRow: any, dayTimeline: any[]): any[] {
+  const src = strikeRow?.timeline?.length > 0 ? strikeRow.timeline : dayTimeline;
+  return [...src].sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+}
+
+/** As-of lookup, not exact-match: each strike is fetched independently and
+ * can sample slightly different timestamps (data gaps on illiquid OTM
+ * strikes), so a leg's most recent VALUE at-or-before `time` is used rather
+ * than requiring every leg to share the exact same time grid. Walks past
+ * candles that exist at that time but lack the needed field too (ce/pe can
+ * be individually missing on a shared-time candle) — stopping at the first
+ * present-but-fieldless candle would silently drop back to `fallback`. */
+function legPremiumAt(leg: { optType: 'CALL' | 'PUT'; timeline: any[] }, time: string, fallback: number): number {
+  let value: number | null = null;
+  for (const pt of leg.timeline) {
+    if (pt.time > time) break;
+    const v = leg.optType === 'CALL' ? pt.ce : pt.pe;
+    if (v != null) value = v;
+  }
+  return value != null ? value : fallback;
+}
+
 function simulateDayBacktest(day: any, type: string, cfg: any): BacktestDayResult {
   const timeline = day?.timeline || [];
-  const atm = day?.strikes?.find((s: any) => s.label === 'ATM') || day?.strikes?.[0] || {};
   if (!timeline.length) {
     return { date: day?.date || '', pnl: 0, pnlInr: 0, netPnlInr: 0, frictionInr: 0, roi: 0, netRoi: 0, maxProfit: 0, maxDrawdown: 0, status: 'NO_DATA', reason: 'No timeline' };
   }
 
-  const { entryIdx, direction } = findEntrySignal(timeline, type, cfg);
-  const entry = timeline[entryIdx] || timeline[0];
-  const isCall = direction === 'CALL' || type.includes('CALL') || (type.includes('CE') && !type.includes('PE'));
-  const isPut = direction === 'PUT' || type.includes('PUT') || (type.includes('PE') && !type.includes('CE'));
+  const { entryIdx, direction: rawDirection } = findEntrySignal(timeline, type, cfg);
+  const t = type.toUpperCase();
+  const direction: 'CALL' | 'PUT' = rawDirection !== 'BOTH' ? rawDirection : (t.includes('PUT') || t.includes('PE') ? 'PUT' : 'CALL');
+  const side: 'BUY' | 'SELL' = cfg.side || (cfg.isShort ? 'SELL' : (type.startsWith('SHORT') || type === 'IRON_CONDOR' || type === 'IRON_BUTTERFLY' || type.includes('CREDIT') || type === 'STRANGLE' || type === 'STRADDLE' ? 'SELL' : 'BUY'));
+  const legSpecs = getStrategyLegSpecs(type, direction, side);
 
-  const entryBase = isCall ? (entry.ce || atm.call?.open || 1) : (isPut ? (entry.pe || atm.put?.open || 1) : (entry.straddle || (atm.call?.open + atm.put?.open) || 1));
-  const sim = trackTradeProgression(timeline, entryIdx, entryBase, isCall, isPut, cfg);
+  // Strikes are selected off the spot AT ENTRY, not the day's open — ATM
+  // (and every delta-target strike) shifts as spot moves intraday, and an
+  // ORB/VWAP entry can fire well after open. Once selected the strike is
+  // fixed for the rest of the trade (below), matching a real position.
+  const entryPt = timeline[entryIdx] || timeline[0];
+  const spot = Number(entryPt?.spot) || Number(day?.spot?.open) || 0;
+  const expiry = cfg.expiry || nearestIndexExpiry(cfg.symbol || 'NIFTY', new Date(day.date || Date.now()));
+
+  const resolved = legSpecs.map((spec) => {
+    const row = selectHistoricalStrikeByDelta(day?.strikes || [], spec.targetDelta, spec.optType, spot, expiry);
+    return row ? { ...spec, timeline: buildLegTimeline(row, timeline) } : null;
+  });
+  if (resolved.some((l) => l === null)) {
+    return { date: day?.date || '', pnl: 0, pnlInr: 0, netPnlInr: 0, frictionInr: 0, roi: 0, netRoi: 0, maxProfit: 0, maxDrawdown: 0, status: 'NO_DATA', reason: 'Could not resolve one or more legs from historical strikes' };
+  }
+  const legs = resolved as Array<BacktestLegSpec & { timeline: any[] }>;
+
+  const signedQty = (leg: BacktestLegSpec) => (leg.side === 'BUY' ? 1 : -1) * leg.qtyMultiplier;
+  const portfolioValue = (time: string, fallback: number) =>
+    legs.reduce((sum, leg) => sum + signedQty(leg) * legPremiumAt(leg, time, fallback), 0);
+
+  const entryFallback = entryPt.ce ?? entryPt.pe ?? entryPt.straddle ?? 1;
+  const entryValue = portfolioValue(entryPt.time, entryFallback);
+  const riskBase = Math.abs(entryValue) || 1;
+
+  const sim = trackTradeProgression(timeline, entryIdx, entryValue, riskBase, portfolioValue, cfg);
 
   const exitPt = timeline[sim.exitIdx] || timeline[timeline.length - 1];
-  const exitVal = isCall ? (exitPt.ce || entryBase) : (isPut ? (exitPt.pe || entryBase) : (exitPt.straddle || entryBase));
-  const finalPnl = Number((cfg.isShort ? entryBase - exitVal : exitVal - entryBase).toFixed(2));
+  const exitValue = portfolioValue(exitPt.time, entryValue);
+  const finalPnl = Number((exitValue - entryValue).toFixed(2));
   const grossPnlInr = Number((finalPnl * cfg.lotSize * cfg.lots).toFixed(2));
-  const frictions = calculateFnoFrictions(entryBase, exitVal, cfg.lotSize * cfg.lots);
-  const netPnlInr = Number((grossPnlInr - frictions.totalFriction).toFixed(2));
-  const finalRoi = Number(((finalPnl / (entryBase || 1)) * 100).toFixed(1));
-  const netRoi = Number(((netPnlInr / ((entryBase * cfg.lotSize * cfg.lots) || 1)) * 100).toFixed(1));
+
+  // Per-leg frictions, oriented by each leg's own side — a 4-leg condor
+  // charges brokerage/STT/stamp-duty per leg, not once for the whole combo.
+  let totalFriction = 0;
+  for (const leg of legs) {
+    const entryPrem = legPremiumAt(leg, entryPt.time, entryFallback);
+    const exitPrem = legPremiumAt(leg, exitPt.time, entryPrem);
+    const qty = cfg.lotSize * cfg.lots * leg.qtyMultiplier;
+    const [buyPrem, sellPrem] = leg.side === 'SELL' ? [exitPrem, entryPrem] : [entryPrem, exitPrem];
+    totalFriction += calculateFnoFrictions(buyPrem, sellPrem, qty).totalFriction;
+  }
+  totalFriction = Number(totalFriction.toFixed(2));
+
+  const netPnlInr = Number((grossPnlInr - totalFriction).toFixed(2));
+  const finalRoi = Number(((finalPnl / riskBase) * 100).toFixed(1));
+  const netRoi = Number(((netPnlInr / (riskBase * cfg.lotSize * cfg.lots || 1)) * 100).toFixed(1));
 
   return {
-    date: day.date, pnl: finalPnl, pnlInr: grossPnlInr, netPnlInr, frictionInr: frictions.totalFriction,
+    date: day.date, pnl: finalPnl, pnlInr: grossPnlInr, netPnlInr, frictionInr: totalFriction,
     roi: finalRoi, netRoi, maxProfit: Number(sim.maxGain.toFixed(1)), maxDrawdown: Number(sim.maxDrop.toFixed(1)),
     status: sim.status, reason: sim.reason,
   };
@@ -739,15 +897,18 @@ function findEntrySignal(timeline: any[], type: string, cfg: any): { entryIdx: n
   return { entryIdx: 0, direction: defDir };
 }
 
-function trackTradeProgression(timeline: any[], entryIdx: number, entryBase: number, isCall: boolean, isPut: boolean, cfg: any) {
+/** Walks the shared reference timeline (drives the time axis + breakout
+ * detection); `portfolioValue` combines every leg's own premium series
+ * (independent strikes) into one signed position value at each timestamp. */
+function trackTradeProgression(timeline: any[], entryIdx: number, entryValue: number, riskBase: number, portfolioValue: (time: string, fallback: number) => number, cfg: any) {
   let exitIdx = timeline.length - 1, reason = 'EOD 15:20', status = 'EOD_EXIT';
   let maxGain = 0, maxDrop = 0;
 
   for (let i = entryIdx; i < timeline.length; i++) {
     const pt = timeline[i];
-    const curVal = isCall ? (pt.ce || entryBase) : (isPut ? (pt.pe || entryBase) : (pt.straddle || entryBase));
-    const pnlPts = cfg.isShort ? (entryBase - curVal) : (curVal - entryBase);
-    const roiPct = (pnlPts / (entryBase || 1)) * 100;
+    const curVal = portfolioValue(pt.time, entryValue);
+    const pnlPts = curVal - entryValue;
+    const roiPct = (pnlPts / riskBase) * 100;
 
     if (roiPct > maxGain) maxGain = roiPct;
     if (roiPct < maxDrop) maxDrop = roiPct;

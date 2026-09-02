@@ -154,6 +154,77 @@ describe('Strategy Backtest Evaluation Engine', () => {
     expect(report.winRate).toBe(50);
   });
 
+  it('backtests a 4-leg Iron Condor from its real OTM strikes, not an ATM-straddle stand-in', () => {
+    const spot = 24500, step = 50;
+    const times = ['09:15', '15:20'];
+    // 11 strikes (ATM ±5), each with its OWN timeline and IV — so the two
+    // short legs (~0.25 delta) and two long wing legs (~0.10 delta) must
+    // resolve to four DIFFERENT strikes, not all collapse onto ATM.
+    const strikes = Array.from({ length: 11 }, (_, i) => {
+      const offset = i - 5;
+      const strike = spot + offset * step;
+      const otmFactor = Math.max(0, 1 - Math.abs(offset) * 0.15);
+      const callOpen = Number((120 * otmFactor + 5).toFixed(2));
+      const putOpen = Number((120 * otmFactor + 5).toFixed(2));
+      return {
+        label: offset === 0 ? 'ATM' : `ATM${offset > 0 ? '+' : ''}${offset}`,
+        strike,
+        call: { open: callOpen, iv: 15 },
+        put: { open: putOpen, iv: 15 },
+        timeline: times.map((time, idx) => ({
+          time,
+          ce: Number((callOpen * (idx === 0 ? 1 : 0.7)).toFixed(2)),
+          pe: Number((putOpen * (idx === 0 ? 1 : 0.7)).toFixed(2)),
+        })),
+      };
+    });
+    const dayTimeline = times.map((time) => ({ time, spot, ce: 120, pe: 120, straddle: 240 }));
+    const condorDay = [{ date: '2026-08-27', spot: { open: spot, high: spot, low: spot, close: spot }, strikes, timeline: dayTimeline }];
+
+    const report = evaluateStrategyBacktest('NIFTY', 'IRON_CONDOR', condorDay, { lots: 1 });
+
+    expect(report.totalDays).toBe(1);
+    expect(report.days[0].status).not.toBe('NO_DATA');
+    expect(Number.isFinite(report.days[0].pnl)).toBe(true);
+    // 4 legs x (₹20 brokerage x 2 fills) = ₹160 minimum, versus ~₹50-90 a
+    // single-leg round trip would produce — confirms per-leg summation.
+    expect(report.days[0].frictionInr).toBeGreaterThanOrEqual(160);
+  });
+
+  it('carries a leg forward on its own last known price when its strike is missing a candle (as-of, not exact-match)', () => {
+    // Real data shape: each strike row has ONE shared timeline (ce+pe fetched
+    // together per strike). A gap means one field is missing on a candle
+    // (e.g. the PE leg of that API response was shorter) — every row here
+    // is missing `pe` at 09:20 uniformly, so it applies whichever specific
+    // strike ends up chosen for the PUT leg.
+    const strikes = Array.from({ length: 11 }, (_, i) => {
+      const offset = i - 5;
+      return {
+        label: offset === 0 ? 'ATM' : `ATM${offset > 0 ? '+' : ''}${offset}`,
+        strike: 24500 + offset * 50,
+        call: { open: 100, iv: 15 },
+        put: { open: 100, iv: 15 },
+        timeline: [
+          { time: '09:15', ce: 100, pe: 100 },
+          { time: '09:20', ce: 90 }, // pe missing on this candle
+          { time: '09:26', ce: 80, pe: 80 },
+        ],
+      };
+    });
+    const dayTimeline = ['09:15', '09:20', '09:26'].map((time) => ({ time, spot: 24500, ce: 100, pe: 100, straddle: 200 }));
+    const day = [{ date: '2026-08-27', spot: { open: 24500, high: 24500, low: 24500, close: 24500 }, strikes, timeline: dayTimeline }];
+
+    const report = evaluateStrategyBacktest('NIFTY', 'STRANGLE', day, { targetPct: 15, slPct: 50, side: 'SELL', lots: 1 });
+
+    // Correct: CALL -80 + PUT carried-forward -100 (from 09:15, last known,
+    // since 09:20 has no pe) vs entry -200 => +40 net gain, +15% target hit
+    // at 09:26. The bug this guards against would instead substitute the
+    // combined portfolio's entry value (-200) as if it were the PUT leg's
+    // own premium at the gap, flipping the sign/magnitude entirely.
+    expect(report.days[0].status).toBe('TARGET_HIT');
+    expect(report.days[0].pnl).toBe(40);
+  });
+
   it('evaluates Options Buying strategies, friction calculations, and 1% risk position sizing', () => {
     const orbBuy = buildOrbBuyingStrategy('NIFTY', 24500, sampleChain, expiry, 1, 'BULLISH');
     expect(orbBuy).not.toBeNull();
