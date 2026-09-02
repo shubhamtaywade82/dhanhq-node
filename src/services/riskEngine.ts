@@ -56,6 +56,8 @@ export class RiskEngine {
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastBreakers: CircuitBreakerRow[] = [];
   private lastEvalAt = 0;
+  private tickEvalScheduled = false;
+  private lastRiskEmitAt = 0;
 
   constructor(client: DhanClient, market: MarketDataService) {
     this.client = client;
@@ -68,11 +70,25 @@ export class RiskEngine {
     this.killed = !!persisted.killed;
     this.killedReason = persisted.killedReason || null;
 
-    // Re-evaluate every 5s — cheap, DB-backed, market-data-free.
+    // Re-evaluate every 5s — a fallback heartbeat, not the primary trigger.
     this.timer = setInterval(() => { void this.evaluate(); }, 5000);
     // React to fills immediately.
     eventBus.on('order', () => { void this.evaluate(); });
+    // React to live ticks too — a fast adverse move (e.g. toward the daily
+    // loss limit) should trip the kill switch within one tick, not wait up
+    // to 5s for the timer. Coalesced: a burst of ticks in the same turn
+    // triggers one evaluate(), not N — cheap now reads are in-memory only.
+    eventBus.on('tick', () => this.scheduleTickEvaluate());
     eventBus.log('SYSTEM', `Risk engine armed (dailyLossLimit=₹${this.limits.dailyLossLimit}, margin=${this.limits.maxMarginUtilPct}%, losses=${this.limits.maxConsecutiveLosses})`, 'risk_engine');
+  }
+
+  private scheduleTickEvaluate(): void {
+    if (this.tickEvalScheduled) return;
+    this.tickEvalScheduled = true;
+    setImmediate(() => {
+      this.tickEvalScheduled = false;
+      void this.evaluate();
+    });
   }
 
   getLimits(): RiskLimits {
@@ -253,7 +269,15 @@ export class RiskEngine {
       }
     }
 
-    eventBus.emit('risk', this.snapshot());
+    // Evaluation runs every tick for fast breach detection, but broadcasting
+    // the full snapshot at the same rate floods the eventBus/log bridge for
+    // no UI benefit (numbers don't need to redraw faster than ~1/s). Throttle
+    // the emit only — detection and kill-switch arming above are unaffected.
+    const now = Date.now();
+    if (now - this.lastRiskEmitAt >= 1000) {
+      this.lastRiskEmitAt = now;
+      eventBus.emit('risk', this.snapshot());
+    }
     return rows;
   }
 

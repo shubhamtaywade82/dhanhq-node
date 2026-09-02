@@ -73,14 +73,19 @@ export class MarketDataService {
 
   async start(): Promise<void> {
     // Feed monitor exits into the bus (autonomy engine acts on them).
+    // ExitSignal nests the position ({securityId, exchangeSegment, ...}) and
+    // names the trigger price `price`, not `exitPrice` — reading those
+    // fields flat off `signal` silently produced `undefined` for all three,
+    // so autonomy's exit handler could never match a real position and
+    // stop-loss/target/trailing exits never actually closed anything.
     this.monitor.on('exit', (signal: any) => {
       eventBus.emit('order', {
         kind: 'exit_signal',
         reason: signal.reason,
-        positionId: signal.positionId,
-        securityId: signal.securityId,
+        positionId: signal.position?.securityId,
+        securityId: signal.position?.securityId,
         pnl: signal.pnl,
-        exitPrice: signal.exitPrice,
+        exitPrice: signal.price,
       });
     });
 
@@ -190,7 +195,7 @@ export class MarketDataService {
         const d = idxData[secId];
         if (!d) continue;
         touched = true;
-        this.ingestRestQuote(secId, symbol, d);
+        this.ingestRestQuote(secId, symbol, d, 'IDX_I');
       }
       if (touched) {
         this.restTickCount++;
@@ -243,7 +248,7 @@ export class MarketDataService {
       for (const [seg, ids] of Object.entries(bySegment)) {
         for (const id of ids) {
           const d = data[seg]?.[id];
-          if (d) this.ingestRestQuote(id, undefined, d);
+          if (d) this.ingestRestQuote(id, undefined, d, seg);
         }
       }
     } catch { /* non-fatal */ }
@@ -305,7 +310,7 @@ export class MarketDataService {
     eventBus.emit('tick', { symbol, securityId: secId, data: this.toTickPayload(snap) });
   }
 
-  private ingestRestQuote(secId: string, symbol: string | undefined, d: any): void {
+  private ingestRestQuote(secId: string, symbol: string | undefined, d: any, exchangeSegment: string): void {
     const ltp = Number(d.lastTradedPrice || d.last_price || d.ltp || 0);
     if (!ltp) return;
     const ohlc = d.ohlc || {};
@@ -331,7 +336,7 @@ export class MarketDataService {
       this.monitor.onTick({
         type: 'ticker',
         responseCode: 0, messageLength: 0, exchangeSegmentCode: 0,
-        exchangeSegment: 'IDX_I',
+        exchangeSegment,
         securityId: secId,
         ltp, ltt: Math.floor(Date.now() / 1000),
         raw: Buffer.alloc(0),

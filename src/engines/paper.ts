@@ -108,20 +108,29 @@ export class PaperExecutionEngine {
       ? Number(risk_limits.trailing_stop.distance)
       : (risk_limits?.trailing_stop ? Number(risk_limits.trailing_stop) : undefined);
 
-    const result = await executePaperOrder({
-      symbol,
-      securityId: String(security_id),
-      exchangeSegment: params.exchange_segment || 'NSE_FNO',
-      transactionType: transaction_type,
-      orderType: order_type,
-      productType: params.product_type || 'INTRADAY',
-      quantity,
-      price: Number(fillPrice.toFixed(2)),
-      correlationId: correlation_id,
-      stopLoss: risk_limits?.stop_loss ? Number(risk_limits.stop_loss) : undefined,
-      target: risk_limits?.target ? Number(risk_limits.target) : undefined,
-      trailingStop: trailDist,
-    }, this.resolveMargin);
+    let result: any;
+    try {
+      result = await executePaperOrder({
+        symbol,
+        securityId: String(security_id),
+        exchangeSegment: params.exchange_segment || 'NSE_FNO',
+        transactionType: transaction_type,
+        orderType: order_type,
+        productType: params.product_type || 'INTRADAY',
+        quantity,
+        price: Number(fillPrice.toFixed(2)),
+        correlationId: correlation_id,
+        stopLoss: risk_limits?.stop_loss ? Number(risk_limits.stop_loss) : undefined,
+        target: risk_limits?.target ? Number(risk_limits.target) : undefined,
+        trailingStop: trailDist,
+      }, this.resolveMargin);
+    } catch (e: any) {
+      // Insufficient margin (or any other fill precondition) — reject like
+      // a broker would, not a 500.
+      eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${e.message}`, 'paper_engine');
+      eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: e.message });
+      return { status: 'REJECTED', reason: e.message };
+    }
 
     const fillPayload = {
       intent_id,

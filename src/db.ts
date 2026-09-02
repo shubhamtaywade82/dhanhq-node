@@ -692,20 +692,30 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
   const latencyMs = Math.max(1, Date.now() - t0 + Math.floor(Math.random() * 20));
   const charges = calculateOrderCharges(input.transactionType, fillPrice, qty);
 
+  // Single computation from the always-in-sync in-memory snapshot (see
+  // header) — Postgres below persists this exact result, never a second one.
+  const curPos = mem.positions.get(sym);
+  const u = input.transactionType === 'BUY' ? calculateBuyUpdate(curPos, qty, fillPrice) : calculateSellUpdate(curPos, qty, fillPrice);
+  const newRealized = Number(curPos?.realized_pnl || 0) + u.realized;
+  const marginRequired = await resolveMarginRequired(u, securityId, exchangeSegment, input.productType || 'INTRADAY', marginResolver);
+  const marginDelta = marginRequired - Number(curPos?.margin_blocked || 0);
+
+  // Affordability gate — a real broker rejects an order it can't margin.
+  // Only trades that INCREASE required margin are gated; closing or
+  // reducing a position always goes through (even if the account is
+  // already over-margined) so a position is never un-closeable.
+  if (marginDelta > 0) {
+    const availableMargin = Number(mem.wallet.available_margin);
+    const projectedAvailable = availableMargin + u.realized - marginDelta - charges;
+    if (projectedAvailable < 0) {
+      throw new Error(`Insufficient margin: need ₹${marginDelta.toFixed(2)} more, ₹${availableMargin.toFixed(2)} available`);
+    }
+  }
+
   if (mode === 'postgres') {
     const client = await pool.connect();
-    let u: PositionUpdate, newRealized: number, marginRequired: number;
     try {
       await client.query('BEGIN');
-
-      // Read position FIRST so the order row can carry its realized PnL
-      // (used by the risk engine's consecutive-loss breaker).
-      const posRes = await client.query('SELECT * FROM paper_positions WHERE id = $1', [sym]);
-      const curPos = posRes.rows[0];
-      u = input.transactionType === 'BUY' ? calculateBuyUpdate(curPos, qty, fillPrice) : calculateSellUpdate(curPos, qty, fillPrice);
-      newRealized = Number(curPos?.realized_pnl || 0) + u.realized;
-      marginRequired = await resolveMarginRequired(u, securityId, exchangeSegment, input.productType || 'INTRADAY', marginResolver);
-      const marginDelta = marginRequired - Number(curPos?.margin_blocked || 0);
 
       await client.query(
         `INSERT INTO paper_orders (id, correlation_id, symbol, security_id, exchange_segment, transaction_type, order_type, product_type, quantity, price, status, filled_qty, avg_price, latency_ms, realized_pnl, charges)
@@ -731,17 +741,10 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
     } finally {
       client.release();
     }
-    pushOrderToMem(orderId, sym, securityId, exchangeSegment, input, qty, fillPrice, latencyMs, u.realized, charges);
-    applyFillToMem(sym, u, newRealized, fillPrice, marginRequired, input, charges);
-  } else {
-    const curPos = mem.positions.get(sym);
-    const u = input.transactionType === 'BUY' ? calculateBuyUpdate(curPos, qty, fillPrice) : calculateSellUpdate(curPos, qty, fillPrice);
-    const newRealized = Number(curPos?.realized_pnl || 0) + u.realized;
-    const marginRequired = await resolveMarginRequired(u, securityId, exchangeSegment, input.productType || 'INTRADAY', marginResolver);
-
-    pushOrderToMem(orderId, sym, securityId, exchangeSegment, input, qty, fillPrice, latencyMs, u.realized, charges);
-    applyFillToMem(sym, u, newRealized, fillPrice, marginRequired, input, charges);
   }
+
+  pushOrderToMem(orderId, sym, securityId, exchangeSegment, input, qty, fillPrice, latencyMs, u.realized, charges);
+  applyFillToMem(sym, u, newRealized, fillPrice, marginRequired, input, charges);
 
   return { orderId, symbol: sym, side: input.transactionType, quantity: qty, fillPrice, charges, status: 'TRADED', latencyMs };
 }

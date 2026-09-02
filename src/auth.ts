@@ -35,7 +35,17 @@ function lazyRedis(url: string): Redis {
 
 export const redisPublisher: Pick<Redis, 'publish' | 'set' | 'get' | 'ping' | 'info' | 'ttl' | 'keys'> & { status?: string } = lazyRedis(redisUrl);
 export const redisSubscriber = lazyRedis(redisUrl);
-export const redisAvailable = () => (redisPublisher as any).status === 'ready';
+export const redisAvailable = async (): Promise<boolean> => {
+  if ((redisPublisher as any).status === 'ready') return true;
+  if ((redisPublisher as any).status === 'connecting') {
+    await Promise.race([
+      new Promise((resolve) => (redisPublisher as any).once('ready', resolve)),
+      new Promise((resolve) => setTimeout(resolve, 500)),
+    ]);
+    return (redisPublisher as any).status === 'ready';
+  }
+  return false;
+};
 
 // Fetches a fresh token from the Rails token authority (algo_scalper_api).
 async function fetchTokenFromRails(baseUrl: string, bearerToken?: string): Promise<string> {
@@ -59,7 +69,7 @@ export async function generateTokenViaTotp(clientId: string, pin: string, totpSe
   const token = res.accessToken;
   if (!token) throw new Error("[Auth] TOTP response did not contain access token");
 
-  if (redisAvailable()) {
+  if (await redisAvailable()) {
     await redisPublisher.set("dhan:auth:access_token", token, "EX", 82800).catch(() => {});
     await redisPublisher.set("dhan:auth:client_id", clientId).catch(() => {});
   }
@@ -70,7 +80,8 @@ let activeToken: string | null = null;
 let activeTokenAt = 0;
 
 export async function createDhanClient(): Promise<DhanClient> {
-  const clientId = (redisAvailable() ? await redisPublisher.get("dhan:auth:client_id").catch(() => null) : null)
+  const isRedisReady = await redisAvailable();
+  const clientId = (isRedisReady ? await redisPublisher.get("dhan:auth:client_id").catch(() => null) : null)
     || process.env.DHAN_CLIENT_ID || process.env.CLIENT_ID || "";
   const accessToken = process.env.DHAN_ACCESS_TOKEN;
   const pin = process.env.DHAN_PIN;
@@ -85,7 +96,7 @@ export async function createDhanClient(): Promise<DhanClient> {
 
   const resolveToken = async (): Promise<string> => {
     // 1. Primary: Read live rotating token from Redis (written by algo_scalper_api)
-    if (redisAvailable()) {
+    if (await redisAvailable()) {
       try {
         const rToken = await redisPublisher.get("dhan:auth:access_token").catch(() => null);
         if (rToken) {
@@ -138,12 +149,12 @@ export async function createDhanClient(): Promise<DhanClient> {
     tokenProvider: resolveToken,
   });
 
-  setupTokenRotationSubscriber();
+  await setupTokenRotationSubscriber();
   return client;
 }
 
-function setupTokenRotationSubscriber() {
-  if (!redisAvailable()) return;
+async function setupTokenRotationSubscriber() {
+  if (!(await redisAvailable())) return;
   redisSubscriber.subscribe("dhan:auth:rotated", (err) => {
     if (err) log.error({ err: { message: err.message }, channel: "dhan:auth:rotated" }, "Failed to subscribe to dhan:auth:rotated");
     else log.info({ channel: "dhan:auth:rotated" }, "Subscribed to dhan:auth:rotated from algo_scalper_api");

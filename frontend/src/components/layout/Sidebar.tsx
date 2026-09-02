@@ -34,7 +34,7 @@ const analyticsItems: NavItem[] = [
 
 const infraItems: NavItem[] = [
   { id: 'sidekiq-infra', label: 'Sidekiq Jobs', icon: <ListChecks size={13} /> },
-  { id: 'alerts', label: 'Alerts', icon: <Bell size={13} />, badge: 3 },
+  { id: 'alerts', label: 'Alerts', icon: <Bell size={13} /> },
   { id: 'logs', label: 'Logs & Traces', icon: <Terminal size={13} /> },
   { id: 'config', label: 'Configuration', icon: <Settings size={13} /> },
 ];
@@ -67,6 +67,10 @@ export function Sidebar({ activePage, onNavigate }: { activePage: string; onNavi
   const { state } = useApp();
   const hasData = state.marketSource !== 'none';
   const tickAge = state.marketTickAgeSec;
+  const unreadAlerts = state.alerts.filter((a) => !a.read).length;
+  const infraItemsWithBadge = infraItems.map((item) =>
+    item.id === 'alerts' && unreadAlerts > 0 ? { ...item, badge: unreadAlerts } : item
+  );
 
   return (
     <aside className="w-[215px] min-w-[215px] bg-surface-100 border-r border-border flex flex-col justify-between">
@@ -74,7 +78,7 @@ export function Sidebar({ activePage, onNavigate }: { activePage: string; onNavi
         <NavSection title="Trading Core" items={tradingItems} activePage={activePage} onNavigate={onNavigate} />
         <NavSection title="Agentic Intel" items={agentItems} activePage={activePage} onNavigate={onNavigate} />
         <NavSection title="Analytics & Risk" items={analyticsItems} activePage={activePage} onNavigate={onNavigate} />
-        <NavSection title="Infrastructure" items={infraItems} activePage={activePage} onNavigate={onNavigate} />
+        <NavSection title="Infrastructure" items={infraItemsWithBadge} activePage={activePage} onNavigate={onNavigate} />
       </nav>
 
       <div className="p-3 border-t border-border bg-surface-50 space-y-1.5">

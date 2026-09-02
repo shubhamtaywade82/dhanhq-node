@@ -36,6 +36,7 @@ export class AutonomyEngine {
   private eodDate = '';
   private handledExits = new Set<string>();
   private unsubBus: Array<() => void> = [];
+  private tickMarkScheduled = false;
 
   constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine) {
     this.client = client;
@@ -61,6 +62,13 @@ export class AutonomyEngine {
       if (p.kind !== 'exit_signal') return;
       await this.handleExitSignal(p);
     }));
+
+    // Mark-to-market + portfolio push on every live tick, not just the 2s
+    // cycle below — position P&L should move the instant a real price does.
+    // Coalesced: a burst of ticks across several instruments in the same
+    // turn triggers one recompute, not N. The interval loop remains as a
+    // fallback heartbeat (EOD/limits/scan still run on their own cadence).
+    this.unsubBus.push(eventBus.on('tick', () => this.scheduleTickMark()));
 
     this.scheduleNext(1000);
     eventBus.log('SYSTEM', `Autonomy engine started (mode=${process.env.TRADING_MODE || 'paper'}, EOD 15:20 IST, scanner=${this.scanEnabled})`, 'autonomy');
@@ -169,6 +177,18 @@ export class AutonomyEngine {
       const [positions, wallet] = await Promise.all([listPaperPositions(), getPaperWallet()]);
       eventBus.emit('portfolio', { positions, funds: wallet, markedAt: Date.now() });
     } catch { /* snapshot failure is non-fatal */ }
+  }
+
+  private scheduleTickMark(): void {
+    if (this.tickMarkScheduled || !this.enabled) return;
+    this.tickMarkScheduled = true;
+    setImmediate(async () => {
+      this.tickMarkScheduled = false;
+      try {
+        await markPositionsToMarket((secId) => this.market.getLtp(secId));
+        await this.publishPortfolioSnapshot();
+      } catch { /* the 2s cycle below is the fallback */ }
+    });
   }
 
   private async enforceStrategyLimits(): Promise<void> {

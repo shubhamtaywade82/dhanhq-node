@@ -5,7 +5,7 @@ export const fmt = (n: number, d = 2): string =>
   });
 
 export const fmtINR = (n: number): string =>
-  (n >= 0 ? '+' : '') + fmt(Math.abs(n), 0);
+  (n >= 0 ? '+' : '-') + fmt(Math.abs(n), 0);
 
 export const pnlClass = (n: number): string =>
   n >= 0 ? 'text-accent' : 'text-danger';

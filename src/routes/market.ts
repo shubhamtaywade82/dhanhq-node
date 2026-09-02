@@ -317,7 +317,7 @@ async function fetchStrikeRollingCandles(client: DhanClient, params: AnalysisPar
   try {
     const base = {
       securityId: Number(params.securityId),
-      exchangeSegment: 'NSE_FNO',
+      exchangeSegment: params.symbol === 'SENSEX' ? 'BSE_FNO' : 'NSE_FNO',
       instrument: 'OPTIDX',
       expiryFlag: params.expiryFlag || 'WEEK',
       expiryCode: params.expiryCode || 1,

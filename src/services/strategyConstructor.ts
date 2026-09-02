@@ -73,8 +73,13 @@ export async function warmLotSizeCache(client: any, symbol: string, exchangeSegm
   if (cached && cached.expiresAt > Date.now()) return;
   try {
     const instrument = await client?.instruments?.find?.(exchangeSegment, sym);
-    if (instrument?.lotSize) {
-      lotSizeCache.set(sym, { value: Number(instrument.lotSize), expiresAt: Date.now() + LOT_SIZE_CACHE_TTL_MS });
+    // `find()` on a bare index symbol under NSE_FNO can match a synthetic
+    // index reference row (instrument: 'INDEX', lotSize: 1) instead of an
+    // actual options/futures contract — never trust that, it would silently
+    // undersize every order to 1 contract. Keep the hardcoded fallback then.
+    const lotSize = Number(instrument?.lotSize);
+    if (lotSize > 1 && instrument?.instrument !== 'INDEX') {
+      lotSizeCache.set(sym, { value: lotSize, expiresAt: Date.now() + LOT_SIZE_CACHE_TTL_MS });
     }
   } catch { /* keep the hardcoded fallback */ }
 }
@@ -615,7 +620,10 @@ function toLeg(row: any, type: 'CALL' | 'PUT', side: 'BUY' | 'SELL', qty: number
     strike,
     optionType: optSuffix,
     price,
-    exchangeSegment: 'NSE_FNO',
+    // SENSEX options trade on BSE, not NSE — a wrong segment here means
+    // every quote lookup for the leg silently returns nothing and its LTP
+    // (and therefore P&L) never updates past the entry fill price.
+    exchangeSegment: symbol.toUpperCase() === 'SENSEX' ? 'BSE_FNO' : 'NSE_FNO',
     stopLoss,
     target,
     trailingStop: trailDist && trailDist > 0 ? { distance: trailDist } : undefined,
@@ -684,8 +692,13 @@ export function evaluateStrategyBacktest(symbol: string, type: string, daysData:
   const profitFactor = grossLoss > 0 ? Number((grossProfit / grossLoss).toFixed(2)) : (grossProfit > 0 ? 99 : 1.5);
   const maxDrawdownRoi = days.length > 0 ? Math.min(...days.map((d) => d.maxDrawdown)) : 0;
   const avgRoi = totalDays > 0 ? Number((days.reduce((s, d) => s + d.netRoi, 0) / totalDays).toFixed(1)) : 0;
-  // If no historical days were returned, default to true; otherwise require positive statistical edge
-  const passedValidation = totalDays === 0 || (winRate >= 35 && profitFactor >= 1.0 && maxDrawdownRoi > -50);
+  // Statistical edge validation: Buyers need high payoff ratio (PF >= 1.15, positive net P&L); Sellers need win rate >= 35%, PF >= 1.10, positive net P&L.
+  const isBuyer = type.startsWith('ORB') || type.startsWith('VWAP') || type.startsWith('EMA') || type === 'NAKED_BUY';
+  const passedValidation = totalDays === 0 || (
+    isBuyer
+      ? (winRate >= 20 && profitFactor >= 1.15 && netPnlInr > 0)
+      : (winRate >= 35 && profitFactor >= 1.10 && netPnlInr > 0)
+  );
 
   return { symbol, strategyType: type, totalDays, wins, winRate, totalPnl, totalPnlInr, netPnlInr, totalFrictionInr, profitFactor, maxDrawdownRoi, avgRoi, passedValidation, days };
 }

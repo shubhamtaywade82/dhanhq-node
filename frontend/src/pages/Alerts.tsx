@@ -1,6 +1,8 @@
+import { useEffect } from 'react';
 import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
+import { api } from '../services/api';
 import { CheckCheck, Info, AlertTriangle, XCircle } from 'lucide-react';
 
 const icons: Record<string, typeof Info> = { INFO: Info, WARN: AlertTriangle, ERROR: XCircle };
@@ -8,6 +10,17 @@ const borderColors: Record<string, string> = { INFO: 'border-sky/20', WARN: 'bor
 
 export function Alerts() {
   const { state, setState, showToast } = useApp();
+
+  // state.alerts is seeded once at app boot, then only grows from live WS
+  // pushes — refetch the real backend list every time this page is opened
+  // so it never silently drifts from what's actually persisted.
+  useEffect(() => {
+    api.alerts(100).then((alerts) => {
+      if (Array.isArray(alerts)) {
+        setState((prev) => ({ ...prev, alerts: alerts.map((a: any) => ({ id: a.id, time: a.time, level: a.level, msg: a.msg, read: a.read ?? false })) }));
+      }
+    }).catch(() => { /* keep whatever is already in state */ });
+  }, [setState]);
 
   const markAllRead = () => {
     setState(prev => ({
@@ -26,6 +39,10 @@ export function Alerts() {
         </div>
         <Button variant="ghost" onClick={markAllRead}><CheckCheck size={12} className="mr-1" /> Mark All as Read</Button>
       </div>
+
+      {state.alerts.length === 0 && (
+        <Card className="p-8 text-center text-muted text-xs">No alerts yet.</Card>
+      )}
 
       <div className="space-y-2.5">
         {state.alerts.map((a) => {
