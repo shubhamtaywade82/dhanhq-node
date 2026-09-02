@@ -147,6 +147,10 @@ export async function createDhanClient(): Promise<DhanClient> {
     clientId,
     token: initialToken || undefined,
     tokenProvider: resolveToken,
+    // SDK default is 5s for every REST call. Too short for heavier endpoints
+    // (e.g. expiredOptionsData/rollingoption over a full trading day) — those
+    // were failing on a plain timeout and getting misread as "no data".
+    timeoutMs: 20000,
   });
 
   await setupTokenRotationSubscriber();

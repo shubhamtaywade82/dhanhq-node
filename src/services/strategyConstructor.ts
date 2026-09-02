@@ -693,11 +693,14 @@ export function evaluateStrategyBacktest(symbol: string, type: string, daysData:
   const maxDrawdownRoi = days.length > 0 ? Math.min(...days.map((d) => d.maxDrawdown)) : 0;
   const avgRoi = totalDays > 0 ? Number((days.reduce((s, d) => s + d.netRoi, 0) / totalDays).toFixed(1)) : 0;
   // Statistical edge validation: Buyers need high payoff ratio (PF >= 1.15, positive net P&L); Sellers need win rate >= 35%, PF >= 1.10, positive net P&L.
+  // maxDrawdownRoi > -50%: a single tail-risk session (gamma shock, gap) must
+  // not be able to pass just because the rest of the sample was profitable —
+  // this is the risk-of-ruin gate, not optional.
   const isBuyer = type.startsWith('ORB') || type.startsWith('VWAP') || type.startsWith('EMA') || type === 'NAKED_BUY';
-  const passedValidation = totalDays === 0 || (
+  const passedValidation = totalDays > 0 && (
     isBuyer
-      ? (winRate >= 20 && profitFactor >= 1.15 && netPnlInr > 0)
-      : (winRate >= 35 && profitFactor >= 1.10 && netPnlInr > 0)
+      ? (winRate >= 20 && profitFactor >= 1.15 && netPnlInr > 0 && maxDrawdownRoi > -50)
+      : (winRate >= 35 && profitFactor >= 1.10 && netPnlInr > 0 && maxDrawdownRoi > -50)
   );
 
   return { symbol, strategyType: type, totalDays, wins, winRate, totalPnl, totalPnlInr, netPnlInr, totalFrictionInr, profitFactor, maxDrawdownRoi, avgRoi, passedValidation, days };

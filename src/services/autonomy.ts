@@ -166,10 +166,24 @@ export class AutonomyEngine {
         const ltp = this.market.getLtp(String(pos.securityId)) || pos.ltp;
         const res = await closePaperPosition(pos.tradingSymbol, ltp);
         eventBus.log('TRADE', `Auto-exit ${pos.tradingSymbol}: ${res.status} @ ₹${ltp} (${p.reason})`, 'autonomy');
+        await this.closeParentStrategyIfFlat(pos.tradingSymbol);
       }
     } catch (e: any) {
       eventBus.log('ERROR', `Auto-exit failed: ${e.message}`, 'autonomy');
     }
+  }
+
+  /** A leg closing via SL/target/trailing (not the strategy-level loss-limit
+   * path below) never told the parent strategy — it stayed RUNNING forever
+   * with a stale PnL once all its legs were flat. */
+  private async closeParentStrategyIfFlat(tradingSymbol: string): Promise<void> {
+    const strategies = await listPaperStrategies();
+    const strat = strategies.find((s: any) => s.status === 'RUNNING' && (s.legs || []).some((l: any) => l.instrument === tradingSymbol));
+    if (!strat) return;
+    const positions = await listPaperPositions();
+    const posMap = new Map(positions.map((p: any) => [p.tradingSymbol, p]));
+    const stillOpen = (strat.legs || []).some((l: any) => Number(posMap.get(l.instrument)?.netQty || 0) !== 0);
+    if (!stillOpen) await updatePaperStrategyStatus(strat.id, 'STOPPED');
   }
 
   private async publishPortfolioSnapshot(): Promise<void> {
@@ -202,7 +216,7 @@ export class AutonomyEngine {
       let pnl = 0;
       for (const leg of strat.legs || []) {
         const pos = posMap.get(leg.instrument);
-        if (pos) pnl += Number(pos.pnl || 0);
+        if (pos) pnl += Number(pos.realizedProfit || 0) + Number(pos.unrealizedProfit || 0);
       }
       if (pnl <= -limit) {
         eventBus.log('WARN', `Strategy ${strat.name} loss limit breached (₹${pnl} ≤ -₹${limit})`, 'autonomy');

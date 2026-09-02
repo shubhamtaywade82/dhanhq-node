@@ -178,7 +178,7 @@ export interface AppState {
   logs: LogEntry[];
   logIdCounter: number;
   alertIdCounter: number;
-  pnlHistory: number[];
+  pnlHistory: { t: number; v: number }[];
   rateLimitHistory: { orders: number; data: number }[];
   logFilter: string;
   marketSource: string;

@@ -1,7 +1,9 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { fmt } from '../utils/formatters';
 
-export function usePnlChart(data: number[]) {
+export interface PnlPoint { t: number; v: number }
+
+export function usePnlChart(data: PnlPoint[]) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const draw = useCallback(() => {
@@ -10,20 +12,32 @@ export function usePnlChart(data: number[]) {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const rect = canvas.parentElement?.getBoundingClientRect();
-    if (!rect) return;
+    if (!rect || rect.width === 0 || rect.height === 0) return;
 
-    canvas.width = rect.width - 32;
-    canvas.height = 190;
-    const w = canvas.width;
-    const h = canvas.height;
+    // Guard against malformed points (e.g. stale entries from a hot-reload
+    // that changed the point shape mid-session) — never let a bad t/v
+    // propagate into NaN gridlines or "Invalid Date" axis labels.
+    const clean = data.filter((p) => Number.isFinite(p?.t) && Number.isFinite(p?.v));
+    if (clean.length === 0) return;
+    data = clean;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = (rect.width - 32) * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = `${rect.width - 32}px`;
+    canvas.style.height = `${rect.height}px`;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const w = rect.width - 32;
+    const h = rect.height;
     const pad = { top: 15, right: 60, bottom: 25, left: 10 };
     const cw = w - pad.left - pad.right;
     const ch = h - pad.top - pad.bottom;
 
     ctx.clearRect(0, 0, w, h);
 
-    const min = Math.min(...data, 0);
-    const max = Math.max(...data);
+    const values = data.map((p) => p.v);
+    const min = Math.min(...values, 0);
+    const max = Math.max(...values);
     const range = max - min || 1;
 
     ctx.strokeStyle = 'rgba(28, 40, 63, 0.7)';
@@ -45,7 +59,7 @@ export function usePnlChart(data: number[]) {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    const isPos = data[data.length - 1] >= 0;
+    const isPos = values[values.length - 1] >= 0;
     const grad = ctx.createLinearGradient(0, pad.top, 0, h - pad.bottom);
     if (isPos) {
       grad.addColorStop(0, 'rgba(0, 229, 160, 0.16)');
@@ -55,10 +69,12 @@ export function usePnlChart(data: number[]) {
       grad.addColorStop(1, 'rgba(255, 59, 92, 0.16)');
     }
 
+    const xFor = (i: number) => pad.left + (data.length > 1 ? (i / (data.length - 1)) * cw : cw / 2);
+    const yFor = (v: number) => pad.top + ch * (1 - (v - min) / range);
+
     ctx.beginPath();
-    data.forEach((v, i) => {
-      const x = pad.left + (i / (data.length - 1)) * cw;
-      const y = pad.top + ch * (1 - (v - min) / range);
+    data.forEach((p, i) => {
+      const x = xFor(i), y = yFor(p.v);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
@@ -69,9 +85,8 @@ export function usePnlChart(data: number[]) {
     ctx.fill();
 
     ctx.beginPath();
-    data.forEach((v, i) => {
-      const x = pad.left + (i / (data.length - 1)) * cw;
-      const y = pad.top + ch * (1 - (v - min) / range);
+    data.forEach((p, i) => {
+      const x = xFor(i), y = yFor(p.v);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
@@ -80,7 +95,7 @@ export function usePnlChart(data: number[]) {
     ctx.stroke();
 
     const lastX = pad.left + cw;
-    const lastY = pad.top + ch * (1 - (data[data.length - 1] - min) / range);
+    const lastY = yFor(values[values.length - 1]);
     ctx.beginPath();
     ctx.arc(lastX, lastY, 4, 0, Math.PI * 2);
     ctx.fillStyle = isPos ? '#00e5a0' : '#ff3b5c';
@@ -93,17 +108,26 @@ export function usePnlChart(data: number[]) {
       const v = max - (range / 4) * i;
       ctx.fillText(fmt(v, 0), w - 6, pad.top + (ch / 4) * i + 3);
     }
+
+    // Real clock labels spanning the actual data range — not a fixed guess.
     ctx.textAlign = 'center';
-    ['09:15', '10:00', '10:45', '11:30'].forEach((l, i) => {
-      ctx.fillText(l, pad.left + (i / 3) * cw, h - 6);
-    });
+    const labelCount = Math.min(5, data.length);
+    for (let i = 0; i < labelCount; i++) {
+      const idx = labelCount > 1 ? Math.round((i / (labelCount - 1)) * (data.length - 1)) : 0;
+      const label = new Date(data[idx].t).toLocaleTimeString('en-GB', {
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata',
+      });
+      ctx.fillText(label, xFor(idx), h - 6);
+    }
   }, [data]);
 
   useEffect(() => {
     draw();
-    const handleResize = () => draw();
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    const el = canvasRef.current?.parentElement;
+    if (!el) return;
+    const ro = new ResizeObserver(() => draw());
+    ro.observe(el);
+    return () => ro.disconnect();
   }, [draw]);
 
   return canvasRef;

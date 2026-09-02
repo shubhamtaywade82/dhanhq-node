@@ -1,10 +1,11 @@
+import { useState } from "react";
 import { useApp } from "../store/AppContext";
 import { Card } from "../components/ui/Card";
 import { Badge, StratBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { LerpNumber } from "../components/ui/LerpNumber";
 import { fmt, fmtINR, pnlClass, sideClass } from "../utils/formatters";
-import { usePnlChart } from "../hooks/usePnlChart";
+import { usePnlChart, type PnlPoint } from "../hooks/usePnlChart";
 import { Plus, Brain } from "lucide-react";
 
 interface DashboardProps {
@@ -12,12 +13,25 @@ interface DashboardProps {
   onDeploy: () => void;
 }
 
+type PnlChartPeriod = '15M' | '1H' | 'SESSION';
+const PNL_PERIOD_SECONDS: Record<PnlChartPeriod, number | null> = { '15M': 15 * 60, '1H': 60 * 60, SESSION: null };
+
 export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
   const { state } = useApp();
+  const [pnlPeriod, setPnlPeriod] = useState<PnlChartPeriod>('SESSION');
   const realizedPnl = Number(state.funds.realizedPnl || 0);
-  const positionPnl = state.positions.reduce((acc, p) => acc + (Number(p.pnl) || Number(p.realizedProfit) || 0), 0);
-  const totalPnl = realizedPnl + positionPnl;
-  const canvasRef = usePnlChart(state.pnlHistory.length > 0 ? state.pnlHistory : [0, realizedPnl]);
+  // Only OPEN positions' unrealized PnL — a closed position's lifetime
+  // realizedProfit is already inside state.funds.realizedPnl and must not
+  // be summed again here, or Day P&L double-counts every closed trade.
+  const unrealizedPnl = state.positions
+    .filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0)
+    .reduce((acc, p) => acc + (Number(p.unrealizedProfit ?? p.unrealizedPnl) || 0), 0);
+  const totalPnl = realizedPnl + unrealizedPnl;
+  const windowSecs = PNL_PERIOD_SECONDS[pnlPeriod];
+  const pnlSeries: PnlPoint[] = windowSecs
+    ? state.pnlHistory.filter((p) => p.t >= Date.now() - windowSecs * 1000)
+    : state.pnlHistory;
+  const canvasRef = usePnlChart(pnlSeries.length > 0 ? pnlSeries : [{ t: Date.now(), v: totalPnl }]);
   const recentOrders = state.orders.slice(0, 8);
 
   return (
@@ -25,48 +39,54 @@ export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
       <MetricsGrid state={state} totalPnl={totalPnl} />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Card className="col-span-2 p-4">
+        <Card className="col-span-2 p-4 h-[320px] flex flex-col">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <span className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Intraday P&L Performance Curve</span>
               <span className="text-[9px] font-mono text-accent bg-accent/10 px-1.5 py-0.5 rounded">REALTIME</span>
             </div>
             <div className="flex gap-1.5">
-              <button className="btn btn-ghost text-[10px] py-0.5 px-2.5">1H</button>
-              <button className="btn btn-ghost text-[10px] py-0.5 px-2.5 border-accent/30 text-accent">SESSION</button>
-              <button className="btn btn-ghost text-[10px] py-0.5 px-2.5">1W</button>
+              {(['15M', '1H', 'SESSION'] as PnlChartPeriod[]).map((p) => (
+                <button
+                  key={p}
+                  onClick={() => setPnlPeriod(p)}
+                  className={`btn btn-ghost text-[10px] py-0.5 px-2.5 ${pnlPeriod === p ? 'border-accent/30 text-accent' : ''}`}
+                >
+                  {p}
+                </button>
+              ))}
             </div>
           </div>
-          <canvas ref={canvasRef} height={190} className="w-full" />
+          <div className="flex-1 min-h-0">
+            <canvas ref={canvasRef} className="w-full h-full" />
+          </div>
         </Card>
-        <Card className="p-4 flex flex-col justify-between">
-          <div>
-            <div className="flex items-center justify-between mb-3 gap-2">
-              <span className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Active Strategies</span>
-              <button className="text-[10px] font-mono text-accent hover:underline whitespace-nowrap" onClick={() => onNavigate("strategies")}>
-                View All ({state.strategies.filter((s) => s.status !== "STOPPED").length}) →
-              </button>
-            </div>
-            <div className="max-h-[320px] overflow-y-auto pr-1 space-y-2 scrollbar-thin scrollbar-thumb-border hover:scrollbar-thumb-muted/30">
-              {state.strategies.filter((s) => s.status !== "STOPPED").length === 0 ? (
-                <div className="text-center py-6 text-muted text-xs">No active strategies.</div>
-              ) : (
-                state.strategies.filter((s) => s.status !== "STOPPED").map((s) => (
-                  <div key={s.id} className="p-2.5 rounded-lg bg-surface-50 border border-border hover:border-[#2a3d5e] transition-all cursor-pointer" onClick={() => onNavigate("strategies")}>
-                    <div className="flex items-center justify-between mb-1 gap-2">
-                      <span className="text-[11px] font-semibold text-white truncate min-w-0">{s.name}</span>
-                      <StratBadge status={s.status} />
-                    </div>
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-[9px] font-mono text-muted shrink-0">{s.symbol} · {s.type} · {s.lots}L</span>
-                      <span className={`text-[11px] font-mono font-bold whitespace-nowrap ${pnlClass(s.pnl)}`}>{fmtINR(s.pnl)}</span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
+        <Card className="p-4 h-[320px] flex flex-col">
+          <div className="flex items-center justify-between mb-3 gap-2">
+            <span className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Active Strategies</span>
+            <button className="text-[10px] font-mono text-accent hover:underline whitespace-nowrap" onClick={() => onNavigate("strategies")}>
+              View All ({state.strategies.filter((s) => s.status !== "STOPPED").length}) →
+            </button>
           </div>
-          <Button className="w-full mt-3" onClick={onDeploy}><Plus size={14} /> Deploy New Strategy</Button>
+          <div className="flex-1 min-h-0 overflow-y-auto pr-1 space-y-2 scrollbar-thin scrollbar-thumb-border hover:scrollbar-thumb-muted/30">
+            {state.strategies.filter((s) => s.status !== "STOPPED").length === 0 ? (
+              <div className="text-center py-6 text-muted text-xs">No active strategies.</div>
+            ) : (
+              state.strategies.filter((s) => s.status !== "STOPPED").map((s) => (
+                <div key={s.id} className="p-2.5 rounded-lg bg-surface-50 border border-border hover:border-[#2a3d5e] transition-all cursor-pointer" onClick={() => onNavigate("strategies")}>
+                  <div className="flex items-center justify-between mb-1 gap-2">
+                    <span className="text-[11px] font-semibold text-white truncate min-w-0">{s.name}</span>
+                    <StratBadge status={s.status} />
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[9px] font-mono text-muted shrink-0">{s.symbol} · {s.type} · {s.lots}L</span>
+                    <span className={`text-[11px] font-mono font-bold whitespace-nowrap ${pnlClass(s.pnl)}`}>{fmtINR(s.pnl)}</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+          <Button className="w-full mt-3 shrink-0" onClick={onDeploy}><Plus size={14} /> Deploy New Strategy</Button>
         </Card>
       </div>
 

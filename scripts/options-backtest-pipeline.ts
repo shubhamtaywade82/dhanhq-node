@@ -10,7 +10,6 @@ import {
   calculateFnoFrictions,
   BacktestReport,
 } from '../src/services/strategyConstructor';
-import { calculateGreeks } from '../src/services/optionsAnalytics';
 import { analyzeOptionsBehavior } from '../src/routes/market';
 
 // ── 1. Strategy Universe Definition ─────────────────────────────────────
@@ -91,111 +90,6 @@ function saveCachedDays(symbol: string, daysCount: number, days: any[]): void {
   } catch { /* non-fatal cache write */ }
 }
 
-// ── 3. Multi-Regime Greeks Simulation Engine ────────────────────────────
-
-interface SessionRegime {
-  name: 'RANGE_BOUND' | 'TRENDING_BULL' | 'TRENDING_BEAR' | 'GAMMA_SHOCK';
-  spotDeltaPct: number;
-  ivShiftPct: number;
-  middayReversal: boolean;
-}
-
-function generateMultiRegimeHistoricalDays(symbol: string, baseSpot: number, daysCount = 15): any[] {
-  const step = symbol === 'SENSEX' ? 100 : 50;
-  const regimes: SessionRegime[] = [
-    { name: 'RANGE_BOUND', spotDeltaPct: 0.15, ivShiftPct: -1.5, middayReversal: true },
-    { name: 'RANGE_BOUND', spotDeltaPct: -0.20, ivShiftPct: -2.0, middayReversal: false },
-    { name: 'TRENDING_BULL', spotDeltaPct: 0.85, ivShiftPct: 1.0, middayReversal: false },
-    { name: 'RANGE_BOUND', spotDeltaPct: 0.10, ivShiftPct: -1.2, middayReversal: true },
-    { name: 'TRENDING_BEAR', spotDeltaPct: -0.95, ivShiftPct: 2.5, middayReversal: false },
-    { name: 'RANGE_BOUND', spotDeltaPct: -0.15, ivShiftPct: -1.8, middayReversal: true },
-    { name: 'GAMMA_SHOCK', spotDeltaPct: 1.30, ivShiftPct: 4.0, middayReversal: true },
-    { name: 'RANGE_BOUND', spotDeltaPct: 0.25, ivShiftPct: -1.0, middayReversal: false },
-    { name: 'TRENDING_BULL', spotDeltaPct: 0.70, ivShiftPct: 0.5, middayReversal: false },
-    { name: 'GAMMA_SHOCK', spotDeltaPct: -1.20, ivShiftPct: 3.5, middayReversal: true },
-  ];
-
-  const times = [
-    '09:15', '09:30', '09:45', '10:00', '10:30', '11:00',
-    '11:30', '12:00', '12:30', '13:00', '13:30', '14:00',
-    '14:30', '15:00', '15:20',
-  ];
-
-  const days = [];
-  const baseDate = new Date();
-
-  for (let d = daysCount - 1; d >= 0; d--) {
-    const curDate = new Date(baseDate);
-    curDate.setDate(curDate.getDate() - d);
-    const dateStr = curDate.toISOString().split('T')[0];
-
-    const regime = regimes[d % regimes.length];
-    const openSpot = baseSpot * (1 + (Math.sin(d) * 0.006));
-    const totalMove = openSpot * (regime.spotDeltaPct / 100);
-    const atmStrike = Math.round(openSpot / step) * step;
-
-    const timeline = times.map((time, tIdx) => {
-      const progress = tIdx / (times.length - 1);
-      let spot = openSpot + totalMove * progress;
-      if (regime.middayReversal && progress > 0.5) {
-        spot = openSpot + totalMove * (1 - (progress - 0.5) * 1.6);
-      }
-      // Apply realistic intraday micro-fluctuations
-      spot += Math.sin(tIdx * 1.5) * (step * 0.12);
-
-      const timeFraction = (15 - tIdx) / 15;
-      const baseIv = 14.0 + regime.ivShiftPct * progress;
-
-      const atmGreeksCe = calculateGreeks(spot, atmStrike, dateStr, 'CALL', baseIv / 100);
-      const atmGreeksPe = calculateGreeks(spot, atmStrike, dateStr, 'PUT', baseIv / 100);
-
-      const ceLtp = Math.max(5, (spot * 0.0075) * timeFraction + Math.max(0, spot - atmStrike) + atmGreeksCe.delta * (spot - openSpot));
-      const peLtp = Math.max(5, (spot * 0.0075) * timeFraction + Math.max(0, atmStrike - spot) - atmGreeksPe.delta * (spot - openSpot));
-
-      return {
-        time,
-        spot: Number(spot.toFixed(2)),
-        ce: Number(ceLtp.toFixed(2)),
-        pe: Number(peLtp.toFixed(2)),
-        straddle: Number((ceLtp + peLtp).toFixed(2)),
-      };
-    });
-
-    const closeSpot = timeline[timeline.length - 1].spot;
-    const highSpot = Math.max(...timeline.map((t) => t.spot));
-    const lowSpot = Math.min(...timeline.map((t) => t.spot));
-
-    const strikes = [-4, -3, -2, -1, 0, 1, 2, 3, 4].map((offset) => {
-      const strike = atmStrike + offset * step;
-      const label = offset === 0 ? 'ATM' : `ATM${offset > 0 ? '+' : ''}${offset}`;
-
-      const strikeTimeline = timeline.map((pt) => {
-        const ce = Math.max(3, pt.ce - offset * (step * 0.45));
-        const pe = Math.max(3, pt.pe + offset * (step * 0.45));
-        return { time: pt.time, ce: Number(ce.toFixed(2)), pe: Number(pe.toFixed(2)) };
-      });
-
-      return {
-        strike,
-        label,
-        call: { open: strikeTimeline[0].ce, close: strikeTimeline[strikeTimeline.length - 1].ce, iv: 14.5 },
-        put: { open: strikeTimeline[0].pe, close: strikeTimeline[strikeTimeline.length - 1].pe, iv: 14.5 },
-        timeline: strikeTimeline,
-      };
-    });
-
-    days.push({
-      date: dateStr,
-      regime: regime.name,
-      spot: { open: openSpot, high: highSpot, low: lowSpot, close: closeSpot },
-      strikes,
-      timeline,
-    });
-  }
-
-  return days;
-}
-
 // ── 4. Unified Multi-Strategy Pipeline Runner ───────────────────────────
 
 export async function runFullOptionsBacktest(
@@ -204,34 +98,31 @@ export async function runFullOptionsBacktest(
   daysCount = 15,
 ): Promise<StrategyScorecard[]> {
   const secId = symbol === 'SENSEX' ? '51' : '13';
-  const baseSpot = symbol === 'SENSEX' ? 76944 : 24055;
 
   console.log(`\n[Backtest] ── Preparing Dataset for ${symbol} (Sessions: ${daysCount}) ──`);
 
   // 1. Check local persistent disk cache first
   let daysData: any[] = loadCachedDays(symbol, daysCount) || [];
 
-  // 2. Fetch from DhanHQ API if not cached
+  // 2. Fetch from DhanHQ API if not cached — no synthetic fallback. A
+  // backtest run on invented price paths is worse than no backtest: it
+  // reports PASSED/REJECTED with false confidence. If DhanHQ has no real
+  // rolling-option history for this window, surface that and stop.
   if (daysData.length === 0) {
-    try {
-      const analysis = await analyzeOptionsBehavior(client, {
-        symbol,
-        securityId: secId,
-        daysCount,
-        interval: '15',
-        expiryFlag: 'WEEK',
-        expiryCode: 1,
-      });
-      daysData = analysis.days || [];
-      if (daysData.length > 0) {
-        saveCachedDays(symbol, daysCount, daysData);
-        console.log(`  • Fetched & Cached ${daysData.length} live historical sessions from DhanHQ.`);
-      }
-    } catch (err: any) {
-      console.log(`  ℹ️ Live expired options feed notice (${err.message}). Activating Multi-Regime Greeks Engine.`);
-      daysData = generateMultiRegimeHistoricalDays(symbol, baseSpot, daysCount);
-      saveCachedDays(symbol, daysCount, daysData);
+    const analysis = await analyzeOptionsBehavior(client, {
+      symbol,
+      securityId: secId,
+      daysCount,
+      interval: '15',
+      expiryFlag: 'WEEK',
+      expiryCode: 1,
+    });
+    daysData = analysis.days || [];
+    if (daysData.length === 0) {
+      throw new Error(`${symbol}: analyzeOptionsBehavior returned zero usable sessions`);
     }
+    saveCachedDays(symbol, daysCount, daysData);
+    console.log(`  • Fetched & Cached ${daysData.length} live historical sessions from DhanHQ.`);
   } else {
     console.log(`  • Loaded ${daysData.length} sessions directly from local disk cache (.cache/backtest/).`);
   }
@@ -283,15 +174,22 @@ function formatInr(val: number): string {
 
 async function main() {
   console.log(`========================================================================================`);
-  console.log(` Production Multi-Strategy Options Backtesting & Edge Ranking Engine`);
-  console.log(` Strategies: 12 Setups | Multi-Regime Greeks Simulation (Trend, Range, Vol Shock)`);
-  console.log(` Statutory Frictions: STT 0.10%, Stamp Duty, Flat ₹20 Brokerage, 18% GST, 0.25% Slippage`);
+  console.log(` Multi-Strategy Options Backtesting & Edge Ranking Engine (real DhanHQ history only)`);
+  console.log(` Strategies: 12 Setups | Statutory Frictions: STT 0.10%, Stamp Duty, ₹20 Brokerage, 18% GST, 0.25% Slippage`);
   console.log(`========================================================================================`);
 
   const client = await createDhanClient();
+  let anyFailed = false;
 
   for (const sym of ['NIFTY', 'SENSEX'] as const) {
-    const scorecards = await runFullOptionsBacktest(client, sym, 15);
+    let scorecards: StrategyScorecard[];
+    try {
+      scorecards = await runFullOptionsBacktest(client, sym, 15);
+    } catch (err: any) {
+      anyFailed = true;
+      console.log(`\n❌ ${sym}: ${err.message} — skipping (no synthetic fallback; results would be fabricated).`);
+      continue;
+    }
 
     console.log(`\n┌─ ${sym} Strategy Performance & Edge Ranking Matrix ──────────────────────────────────────────`);
     console.log(`│ ${'Strategy'.padEnd(20)} | ${'Category'.padEnd(27)} | ${'Win%'.padStart(6)} | ${'Gross P&L'.padStart(13)} | ${'Frictions'.padStart(10)} | ${'Net P&L'.padStart(13)} | ${'PF'.padStart(5)} | ${'Edge'}`);
@@ -306,7 +204,11 @@ async function main() {
     console.log(`└─────────────────────────────────────────────────────────────────────────────────────────────────────────\n`);
   }
 
-  console.log(`✅ Backtest completed. Results verified with multi-regime Greeks decay and full statutory friction modeling.`);
+  if (anyFailed) {
+    console.log(`⚠️  Completed with gaps — at least one symbol had no real DhanHQ history for this window.`);
+    process.exit(1);
+  }
+  console.log(`✅ Backtest completed on real DhanHQ rolling-option history.`);
   process.exit(0);
 }
 
