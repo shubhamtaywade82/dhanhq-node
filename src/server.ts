@@ -20,6 +20,9 @@ import { clientLogsRoutes } from './routes/clientLogs';
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3003;
+const HOST = process.env.CONTROL_PLANE_HOST || '127.0.0.1';
+const ALLOWED_ORIGIN = process.env.CONTROL_PLANE_ORIGIN || 'http://localhost:5175';
+const CONTROL_PLANE_TOKEN = process.env.CONTROL_PLANE_TOKEN || '';
 const log = moduleLogger('server');
 
 // The autonomous trading server must NEVER crash on an async surprise —
@@ -45,10 +48,31 @@ async function main() {
   attachBusLoggerBridge();
 
   // 3. HTTP + WS control plane (frontend is an observer/controller only).
+  //
+  // Security posture: this is a single-operator localhost control plane, but
+  // "only listens on the laptop" is not a boundary by itself — any webpage
+  // open in the same browser can still have JS issue requests to it. Locking
+  // CORS to the exact known origin blocks that: for JSON POSTs (order
+  // placement, kill switch) the browser preflights and refuses to send the
+  // real request to an origin the server didn't explicitly allow.
+  //
+  // A CONTROL_PLANE_TOKEN bearer check is available but NOT enforced unless
+  // set — the current frontend sends no auth header, so making it mandatory
+  // here would lock the operator out of their own running system. Set it and
+  // wire the frontend to send it when ready to close this residual gap.
+  if (!CONTROL_PLANE_TOKEN) {
+    log.warn('CONTROL_PLANE_TOKEN not set — order/kill-switch endpoints are unauthenticated (CORS-origin-restricted only). Set it to require a bearer token.');
+  }
   const app = express();
-  app.use(cors());
+  app.use(cors({ origin: ALLOWED_ORIGIN, credentials: true }));
   app.use(express.json());
   app.use(requestLogger); // access logs + req.log child (requestId/traceId)
+  app.use((req, res, next) => {
+    if (!CONTROL_PLANE_TOKEN || req.path === '/api/health') return next();
+    const presented = req.get('authorization')?.replace(/^Bearer\s+/i, '');
+    if (presented !== CONTROL_PLANE_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
+    next();
+  });
 
   const streamManager = new MarketStreamManager();
   streamManager.attach(); // bind hub to the central event bus
@@ -77,7 +101,17 @@ async function main() {
   app.use(errorHandler);
 
   const server = createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({
+    server,
+    path: '/ws',
+    // Same optional-token posture as the HTTP layer — only enforced if set.
+    verifyClient: CONTROL_PLANE_TOKEN
+      ? (info, cb) => {
+          const url = new URL(info.req.url || '/ws', 'http://internal');
+          cb(url.searchParams.get('token') === CONTROL_PLANE_TOKEN);
+        }
+      : undefined,
+  });
 
   wss.on('connection', (ws) => {
     streamManager.subscribe(ws);
@@ -85,9 +119,11 @@ async function main() {
     ws.on('error', () => streamManager.unsubscribe(ws));
   });
 
-  server.listen(PORT, () => {
+  // Loopback-only by default — was previously bound to every interface,
+  // reachable from anywhere on the local network.
+  server.listen(PORT, HOST, () => {
     log.info(
-      { port: PORT, http: `http://localhost:${PORT}`, ws: `ws://localhost:${PORT}/ws`, persistence: dbMode() },
+      { host: HOST, port: PORT, http: `http://${HOST}:${PORT}`, ws: `ws://${HOST}:${PORT}/ws`, persistence: dbMode() },
       'Control plane listening (HTTP + WebSocket)',
     );
   });

@@ -62,15 +62,28 @@ describe('Paper execution engine — real-LTP pricing policy', () => {
   });
 
   it('fills at the live LTP with adverse slippage, not at params.price', async () => {
-    const { paper } = await stubEngines(100);
-    const result: any = await paper.placeOrder({
-      correlation_id: 'test_ltp_fill',
-      intent_id: 'i2',
-      params: { security_id: '44000', quantity: 50, transaction_type: 'BUY', order_type: 'MARKET', price: 555 },
-    });
-    expect(result.status).toBe('TRADED');
-    // BUY slippage = +1 tick (0.05) over the live LTP of 100, NOT price 555.
-    expect(result.fill_price).toBeCloseTo(100.05, 2);
+    // getFillablePrice refuses to consider ANY quote fillable outside market
+    // hours (DATA-01 fix) — pin the clock to a known IST market-open moment
+    // so this test verifies pricing behavior, not whatever time it happens
+    // to run at.
+    // Fake Date only — placeOrder/risk.start() rely on real setTimeout/setInterval
+    // internally, and jest's default fake-timer mode freezes those too, hanging
+    // the test until it times out.
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST, Tuesday
+    try {
+      const { paper } = await stubEngines(100);
+      const result: any = await paper.placeOrder({
+        correlation_id: 'test_ltp_fill',
+        intent_id: 'i2',
+        params: { security_id: '44000', quantity: 50, transaction_type: 'BUY', order_type: 'MARKET', price: 555 },
+      });
+      expect(result.status).toBe('TRADED');
+      // BUY slippage = +1 tick (0.05) over the live LTP of 100, NOT price 555.
+      expect(result.fill_price).toBeCloseTo(100.05, 2);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('REJECTS orders while the kill switch is engaged', async () => {

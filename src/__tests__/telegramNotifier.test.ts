@@ -1,4 +1,4 @@
-import { splitIntoChunks, shouldForwardLog, formatLogMessage } from '../services/telegramNotifier';
+import { splitIntoChunks, shouldForwardLog, formatLogMessage, throttleRepeat } from '../services/telegramNotifier';
 
 describe('Telegram notifier', () => {
   it('does not split messages under the limit', () => {
@@ -35,6 +35,35 @@ describe('Telegram notifier', () => {
     expect(shouldForwardLog('TRADE', 'autonomy', 'Square-off complete: 3 position(s) closed')).toBe(true);
     // Same prefix, wrong source — must not accidentally match.
     expect(shouldForwardLog('TRADE', 'paper_engine', 'Square-off complete: 3 position(s) closed')).toBe(false);
+  });
+
+  it('forwards autonomy auto-exit events too, not just the EOD summary', () => {
+    expect(shouldForwardLog('TRADE', 'autonomy', 'Auto-exit NIFTY24050CE: TRADED @ ₹18.50 (stop_loss)')).toBe(true);
+  });
+
+  it('throttleRepeat sends the first occurrence, suppresses immediate repeats of the same root cause', () => {
+    const t0 = 1_000_000;
+    expect(throttleRepeat('WARN', 'paper_engine', 'Paper order REJECTED for strat_orb_abc123_CE_57200: Insufficient margin: need ₹136815.00 more, ₹83819.79 available', t0)).not.toBeNull();
+    // Different strategy id, different amounts — same root cause after normalization — suppressed.
+    expect(throttleRepeat('WARN', 'paper_engine', 'Paper order REJECTED for strat_orb_xyz789_CE_57100: Insufficient margin: need ₹144885.00 more, ₹83819.79 available', t0 + 60_000)).toBeNull();
+    expect(throttleRepeat('WARN', 'paper_engine', 'Paper order REJECTED for strat_orb_qqq111_CE_57200: Insufficient margin: need ₹137032.50 more, ₹83819.79 available', t0 + 5 * 60_000)).toBeNull();
+  });
+
+  it('throttleRepeat sends a count-annotated reminder after the reminder interval', () => {
+    const t0 = 2_000_000;
+    expect(throttleRepeat('WARN', 'market_data', 'Index quote poll rate-limited — backing off 10s', t0)).not.toBeNull();
+    expect(throttleRepeat('WARN', 'market_data', 'Index quote poll rate-limited — backing off 20s', t0 + 60_000)).toBeNull();
+    const reminder = throttleRepeat('WARN', 'market_data', 'Index quote poll rate-limited — backing off 40s', t0 + 31 * 60_000);
+    expect(reminder).toContain('recurring');
+    expect(reminder).toContain('suppressed');
+  });
+
+  it('throttleRepeat never suppresses ERROR or TRADE, only WARN/SYSTEM', () => {
+    const t0 = 3_000_000;
+    for (let i = 0; i < 5; i++) {
+      expect(throttleRepeat('ERROR', 'risk_engine', 'KILL SWITCH ENGAGED: daily loss', t0 + i * 1000)).not.toBeNull();
+      expect(throttleRepeat('TRADE', 'autonomy', 'Auto-exit NIFTY24050CE: TRADED @ ₹18.50 (stop_loss)', t0 + i * 1000)).not.toBeNull();
+    }
   });
 
   it('formats an ERROR as an emoji-headed HTML card with context and a time footer', () => {

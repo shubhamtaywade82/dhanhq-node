@@ -963,8 +963,13 @@ export async function seedStandardStrategies(
       niftyRows = chain?.strikes || chain || [];
     } catch { /* non-fatal */ }
 
-    const niftySpot = market.getLtp(niftySecId) || 24000;
-    if (niftyRows.length > 0) {
+    // A stale/missing price used to fall back to a hardcoded fake spot
+    // (24000, 57200, ...) — seeded strategies would silently center their
+    // strikes on a number with no relationship to the real market. Skip
+    // seeding that index this boot instead; it seeds again next boot once a
+    // real price is available.
+    const niftySpot = market.getFillablePrice(niftySecId, { allowClosed: true });
+    if (niftySpot != null && niftyRows.length > 0) {
       const ic = buildIronCondor('NIFTY', niftySpot, niftyRows, niftyExpiry, 1);
       if (ic) { await deploySeeded(ic, paper, market); count++; }
 
@@ -986,8 +991,8 @@ export async function seedStandardStrategies(
       bnfRows = chain?.strikes || chain || [];
     } catch { /* non-fatal */ }
 
-    const bnfSpot = market.getLtp(bnfSecId) || 57200;
-    if (bnfRows.length > 0) {
+    const bnfSpot = market.getFillablePrice(bnfSecId, { allowClosed: true });
+    if (bnfSpot != null && bnfRows.length > 0) {
       const ib = buildIronButterfly('BANKNIFTY', bnfSpot, bnfRows, bnfExpiry, 1);
       if (ib) { await deploySeeded(ib, paper, market); count++; }
 
@@ -1004,8 +1009,8 @@ export async function seedStandardStrategies(
       finRows = chain?.strikes || chain || [];
     } catch { /* non-fatal */ }
 
-    const finSpot = market.getLtp(finSecId) || 25900;
-    if (finRows.length > 0) {
+    const finSpot = market.getFillablePrice(finSecId, { allowClosed: true });
+    if (finSpot != null && finRows.length > 0) {
       const strad = buildStraddle('FINNIFTY', finSpot, finRows, finExpiry, 1, 'SELL');
       if (strad) { await deploySeeded(strad, paper, market); count++; }
 
@@ -1022,8 +1027,8 @@ export async function seedStandardStrategies(
       snxRows = chain?.strikes || chain || [];
     } catch { /* non-fatal */ }
 
-    const snxSpot = market.getLtp(snxSecId) || 76900;
-    if (snxRows.length > 0) {
+    const snxSpot = market.getFillablePrice(snxSecId, { allowClosed: true });
+    if (snxSpot != null && snxRows.length > 0) {
       const ic = buildIronCondor('SENSEX', snxSpot, snxRows, snxExpiry, 1);
       if (ic) { await deploySeeded(ic, paper, market); count++; }
 
@@ -1040,8 +1045,8 @@ export async function seedStandardStrategies(
       midRows = chain?.strikes || chain || [];
     } catch { /* non-fatal */ }
 
-    const midSpot = market.getLtp(midSecId) || 12800;
-    if (midRows.length > 0) {
+    const midSpot = market.getFillablePrice(midSecId, { allowClosed: true });
+    if (midSpot != null && midRows.length > 0) {
       const bps = buildCreditSpread('MIDCPNIFTY', 'BULLISH', midSpot, midRows, midExpiry, 1);
       if (bps) { await deploySeeded(bps, paper, market); count++; }
     }

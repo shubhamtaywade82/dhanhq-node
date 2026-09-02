@@ -71,9 +71,11 @@ export class PaperExecutionEngine {
       return { status: 'REJECTED', reason: gate.reason };
     }
 
-    // Resolve the live LTP — needed for MARKET pricing and to check whether
-    // a LIMIT order is marketable.
-    const liveLtp = this.market.getLtp(security_id);
+    // Resolve a fillable price — needed for MARKET pricing and to check
+    // whether a LIMIT order is marketable. getFillablePrice (not getLtp)
+    // enforces a tight staleness bound regardless of market hours, so a
+    // fill is never priced off an arbitrarily old off-hours cache.
+    const liveLtp = this.market.getFillablePrice(security_id);
     let referencePrice: number | null;
     if (order_type === 'MARKET') {
       referencePrice = liveLtp ?? (price > 0 ? Number(price) : null);

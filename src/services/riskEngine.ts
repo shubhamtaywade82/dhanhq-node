@@ -2,6 +2,9 @@ import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { eventBus } from './eventBus';
 import { marketClock } from './marketHours';
 import type { MarketDataService } from './marketData';
+import { INDEX_INSTRUMENTS } from './marketData';
+import { nearestIndexExpiry } from './marketHours';
+import { calculateGreeks } from './optionsAnalytics';
 import {
   getPaperWallet, listPaperPositions, getTodayOrderStats,
   pushAlert, getRiskState, saveRiskState, closeAllPaperPositions,
@@ -27,6 +30,8 @@ export interface RiskLimits {
   maxConsecutiveLosses: number;  // trades
   maxRejectionRatePct: number;   // % rejected / total today
   staleTickSec: number;          // seconds without a tick during market hours
+  maxConcurrentStrategies: number; // simultaneous RUNNING strategies, any index
+  maxPortfolioDeltaPct: number;    // |net delta-equivalent notional| as % of equity
 }
 
 export const DEFAULT_RISK_LIMITS: RiskLimits = {
@@ -36,6 +41,8 @@ export const DEFAULT_RISK_LIMITS: RiskLimits = {
   maxConsecutiveLosses: 5,
   maxRejectionRatePct: 10,
   staleTickSec: 10,
+  maxConcurrentStrategies: Number(process.env.RISK_MAX_CONCURRENT_STRATEGIES) || 5,
+  maxPortfolioDeltaPct: Number(process.env.RISK_MAX_PORTFOLIO_DELTA_PCT) || 150,
 };
 
 export interface CircuitBreakerRow {
@@ -122,6 +129,14 @@ export class RiskEngine {
     if (this.killed) return { allowed: false, reason: 'Kill switch engaged' };
     const clock = marketClock();
     if (clock.squareOffWindow) return { allowed: false, reason: 'EOD square-off window — no new entries' };
+    // These breakers were computed by the last evaluate() cycle (runs every
+    // tick) and displayed in the UI as ERROR, but nothing actually blocked
+    // new entries on them — the dashboard could show red while the agent
+    // kept trading. Read the same cached rows evaluate() already built.
+    for (const rule of ['Margin Utilization', 'Stale Market Tick', 'Concurrent Strategies', 'Portfolio Net Delta']) {
+      const row = this.lastBreakers.find((b) => b.rule === rule);
+      if (row?.state === 'ERROR') return { allowed: false, reason: `${rule} breached (${row.current} vs ${row.threshold})` };
+    }
     return { allowed: true };
   }
 
@@ -187,10 +202,38 @@ export class RiskEngine {
     return { status: 'ok' };
   }
 
+  /** Rupee-equivalent net directional exposure across every open position,
+   * normalized across underlyings by delta (so NIFTY and SENSEX deltas are
+   * comparable) — the actual professional-desk number, not a strategy count.
+   * Symbol format is "<UNDERLYING><STRIKE><CE|PE>" (e.g. NIFTY24050PE),
+   * which is how every position is already keyed in this system. Expiry and
+   * IV aren't persisted per-position, so this approximates with the current
+   * nearest weekly expiry and a flat 15% IV — a coarse but honest estimate,
+   * refreshed every evaluate() cycle rather than pretending precision it
+   * doesn't have. */
+  private estimatePortfolioDeltaNotional(positions: any[]): number {
+    let deltaNotional = 0;
+    for (const p of positions) {
+      const netQty = Number(p.netQty ?? p.net_qty ?? 0);
+      if (netQty === 0) continue;
+      const m = String(p.tradingSymbol || '').match(/^([A-Z]+?)(\d+)(CE|PE)$/);
+      if (!m) continue;
+      const [, underlying, strikeStr, optType] = m;
+      const inst = (INDEX_INSTRUMENTS as any)[underlying];
+      if (!inst) continue;
+      const spot = this.market.getLtp(inst.securityId);
+      if (!spot) continue;
+      const expiry = nearestIndexExpiry(underlying);
+      const g = calculateGreeks(spot, Number(strikeStr), expiry, optType === 'CE' ? 'CALL' : 'PUT', 0.15);
+      deltaNotional += netQty * g.delta * spot;
+    }
+    return deltaNotional;
+  }
+
   async evaluate(): Promise<CircuitBreakerRow[]> {
     this.lastEvalAt = Date.now();
-    const [wallet, positions, orderStats] = await Promise.all([
-      getPaperWallet(), listPaperPositions(), getTodayOrderStats(),
+    const [wallet, positions, orderStats, strategies] = await Promise.all([
+      getPaperWallet(), listPaperPositions(), getTodayOrderStats(), listPaperStrategies(),
     ]);
 
     const unrealized = positions.reduce((acc, p) => acc + (Number(p.unrealizedPnl) || 0), 0);
@@ -198,6 +241,9 @@ export class RiskEngine {
     const total = Number(wallet.totalBalance) || 1;
     const utilPct = (Number(wallet.usedMargin) / total) * 100;
     const rejectionRate = orderStats.total > 0 ? (orderStats.rejected / orderStats.total) * 100 : 0;
+    const runningCount = strategies.filter((s: any) => s.status === 'RUNNING').length;
+    const deltaNotional = this.estimatePortfolioDeltaNotional(positions);
+    const deltaPct = (Math.abs(deltaNotional) / total) * 100;
     const tickAge = this.market.tickAgeSec();
     const clock = marketClock();
     const stale = clock.isMarketOpen && tickAge > this.limits.staleTickSec;
@@ -237,6 +283,20 @@ export class RiskEngine {
         current: clock.isMarketOpen ? (tickAge === Infinity ? 'no ticks yet' : `${tickAge}s`) : 'market closed',
         state: stale ? 'ERROR' : 'OK',
         action: 'Pause strategies consuming stale data',
+      },
+      {
+        rule: 'Concurrent Strategies',
+        threshold: `${this.limits.maxConcurrentStrategies}`,
+        current: `${runningCount}`,
+        state: runningCount >= this.limits.maxConcurrentStrategies ? 'ERROR' : runningCount >= this.limits.maxConcurrentStrategies - 1 ? 'WARN' : 'OK',
+        action: 'Block new strategy deploys — correlated pile-up across indices',
+      },
+      {
+        rule: 'Portfolio Net Delta',
+        threshold: `${this.limits.maxPortfolioDeltaPct}% of equity`,
+        current: `${deltaPct.toFixed(0)}% (₹${Math.round(deltaNotional).toLocaleString('en-IN')})`,
+        state: deltaPct >= this.limits.maxPortfolioDeltaPct ? 'ERROR' : deltaPct >= this.limits.maxPortfolioDeltaPct * 0.7 ? 'WARN' : 'OK',
+        action: 'Block new same-direction entries — aggregate directional exposure too large',
       },
       {
         rule: 'EOD Square-Off Proximity',

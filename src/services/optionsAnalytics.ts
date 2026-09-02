@@ -27,6 +27,7 @@ export interface OptionChainAnalytics {
   highestCallOiStrike: number;
   highestPutOiStrike: number;
   atmStrike: number;
+  atmIv: number;
   totalCallOi: number;
   totalPutOi: number;
   regime: 'HIGH_IV_RANGE' | 'LOW_IV_TREND' | 'EXPIRY_GAMMA' | 'NEUTRAL';
@@ -73,6 +74,35 @@ export function calculateGreeks(
   };
 }
 
+// ── IV rank (percentile) tracking ────────────────────────────────────────
+// In-memory only — resets on restart, and deliberately so: DhanHQ's expired-
+// options history endpoint is unreliable (see scripts/options-backtest-
+// pipeline.ts), so there is no trustworthy multi-day IV series to seed
+// from. This builds a real rank from the process's own live observations
+// rather than fabricate a longer history.
+const IV_HISTORY_MAX_SAMPLES = 500;
+const IV_RANK_MIN_SAMPLES = 50;
+const ivHistory = new Map<string, number[]>();
+
+export function recordIvSample(symbol: string, atmIv: number): void {
+  if (!(atmIv > 0)) return;
+  const arr = ivHistory.get(symbol) || [];
+  arr.push(atmIv);
+  if (arr.length > IV_HISTORY_MAX_SAMPLES) arr.shift();
+  ivHistory.set(symbol, arr);
+}
+
+/** Percentile rank (0-100) of the most recent IV sample within its recorded
+ * history. Returns null before IV_RANK_MIN_SAMPLES accumulate — callers
+ * must treat null as "unknown," never as "low," and skip the gate. */
+export function getIvRank(symbol: string): number | null {
+  const arr = ivHistory.get(symbol);
+  if (!arr || arr.length < IV_RANK_MIN_SAMPLES) return null;
+  const current = arr[arr.length - 1];
+  const below = arr.filter((v) => v <= current).length;
+  return Number(((below / arr.length) * 100).toFixed(1));
+}
+
 export function analyzeOptionChain(
   symbol: string,
   chainRows: any[],
@@ -109,9 +139,14 @@ export function analyzeOptionChain(
   const atmStrike = pickNearestStrike(strikeRows, spot);
   const regime = classifyRegime(vix, pcrOi, expiry);
 
+  const atmRow = strikeRows.find((r) => r.strike === atmStrike);
+  const ivOf = (leg: any) => Number(leg?.iv ?? leg?.impliedVolatility ?? leg?.implied_volatility ?? 0);
+  const atmIvs = [ivOf(atmRow?.ce), ivOf(atmRow?.pe)].filter((v) => v > 0);
+  const atmIv = atmIvs.length > 0 ? Number((atmIvs.reduce((a, b) => a + b, 0) / atmIvs.length).toFixed(2)) : 0;
+
   return {
     symbol, spot, expiry, pcrOi, pcrVolume, maxPainStrike,
-    highestCallOiStrike, highestPutOiStrike, atmStrike,
+    highestCallOiStrike, highestPutOiStrike, atmStrike, atmIv,
     totalCallOi, totalPutOi, regime,
   };
 }

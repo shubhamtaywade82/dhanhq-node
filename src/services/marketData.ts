@@ -63,6 +63,7 @@ export class MarketDataService {
   private wsListenersAttached = false;
   private wsRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private wsRetryAttempts = 0;
+  private wsSilenceWatch: ReturnType<typeof setInterval> | null = null;
   private extraSubscriptions = new Set<string>();        // 'SEG:SECID' keys
   private unsubEventBus: (() => void) | null = null;
   readonly monitor = new PositionMonitor();
@@ -115,10 +116,16 @@ export class MarketDataService {
       patchOrderWsSafety();
       const ws: any = (this.client as any).ws;
       if (ws.market) {
-        // 'full' mode (RequestCode 21) is the only mode carrying OI — needed for live
-        // option-chain legs subscribed via addInstruments(). The whole ws.market
-        // connection shares one mode, so indices ride along on 'full' too.
-        ws.market.mode = 'full';
+        // 'full' mode (RequestCode 21) was tried here for OI on option-chain
+        // legs, but DhanHQ silently drops IDX_I subscriptions under it —
+        // verified directly (0 ticks in 15s on 'full' vs 67 ticks in 8s on
+        // 'ticker', same securityIds). The whole ws.market connection shares
+        // one mode, so it broke every index tick, forcing 100% REST-poll
+        // dependency and the resulting rate-limit spam. 'ticker' is what
+        // actually delivers LTP — the safety-critical path (SL/target
+        // monitoring, real-time UI) needs that far more than live OI, which
+        // the option-chain page already refreshes via periodic REST anyway.
+        ws.market.mode = 'ticker';
         // Register subscriptions upfront so onOpen automatically transmits them
         ws.market.subscribe(
           INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
@@ -136,22 +143,63 @@ export class MarketDataService {
         ws.orders?.on?.('order', (order: any) => {
           eventBus.emit('order', { kind: 'order_update', order });
         });
+        // Promise.allSettled never rejects, so a .then()/.catch() pair on it
+        // used to always run .then() — wsStarted=true and a "connected" log
+        // fired even when every connect attempt failed, and the .catch()
+        // retry path was dead code. A real close/error also went unhandled,
+        // so a mid-session drop silently degraded to REST for the rest of
+        // the day with no reconnect and no signal. Fixed below: inspect the
+        // settled results, and treat the socket's own lifecycle as normal
+        // (a drop is expected, not exceptional).
+        ws.market?.on?.('close', (code: number) => {
+          if (!this.wsStarted) return; // already handled by the connect-failure path
+          this.wsStarted = false;
+          eventBus.log('WARN', `Market WS closed (code=${code}) — reconnecting`, 'market_data');
+          eventBus.emit('system', { type: 'feed_degraded', source: 'rest' });
+          this.scheduleWsRetry();
+        });
+        ws.market?.on?.('error', (e: any) => {
+          eventBus.log('WARN', `Market WS error: ${e?.message || e}`, 'market_data');
+        });
       }
       const connects: Promise<any>[] = [];
       if (ws.market?.connect) connects.push(ws.market.connect());
       if (ws.orders?.connect) connects.push(ws.orders.connect().catch(() => {}));
-      Promise.allSettled(connects).then(() => {
+      Promise.allSettled(connects).then((results) => {
+        const ok = results.length > 0 && results.some((r) => r.status === 'fulfilled');
+        if (!ok) {
+          const why = results
+            .map((r) => (r.status === 'rejected' ? (r.reason?.message || String(r.reason)) : ''))
+            .filter(Boolean).join('; ') || 'no connect attempts succeeded';
+          eventBus.log('WARN', `DhanHQ WebSocket connect failed (${why}) — REST polling only`, 'market_data');
+          this.scheduleWsRetry();
+          return;
+        }
         this.wsStarted = true;
         this.wsRetryAttempts = 0;
+        this.lastWsTickAt = Date.now(); // grace period starts from connect, not epoch 0
         eventBus.log('INFO', 'DhanHQ binary WebSocket connected — real-time tick stream live', 'market_data');
-      }).catch((e: any) => {
-        eventBus.log('WARN', `DhanHQ WebSocket unavailable (${e?.message || e}) — falling back to REST polling`, 'market_data');
-        this.scheduleWsRetry();
+        this.armSilenceWatch();
       });
     } catch (e: any) {
       eventBus.log('WARN', `DhanHQ WebSocket start failed (${e?.message || e}) — REST polling only`, 'market_data');
       this.scheduleWsRetry();
     }
+  }
+
+  /** A half-open socket reports connected and delivers nothing — only tick
+   * arrival proves liveness. Forces a reconnect on silence during market
+   * hours rather than trusting the 'open' event forever. */
+  private armSilenceWatch(): void {
+    if (this.wsSilenceWatch) return;
+    this.wsSilenceWatch = setInterval(() => {
+      if (!this.wsStarted || !marketClock().isMarketOpen) return;
+      if (Date.now() - this.lastWsTickAt < 20_000) return;
+      eventBus.log('WARN', 'No WS tick for 20s during market hours — forcing reconnect', 'market_data');
+      this.wsStarted = false;
+      try { (this.client as any).ws?.market?.disconnect?.(); } catch { /* already gone */ }
+      this.scheduleWsRetry();
+    }, 10_000);
   }
 
   // A single failed handshake (e.g. a transient 429) used to disable the WS
@@ -360,13 +408,34 @@ export class MarketDataService {
 
   // ── queries ──────────────────────────────────────────────────────────
 
+  /** Display-only. Returns the last-known price at any age, including
+   * off-hours — a closed-market ticker showing yesterday's close is
+   * correct, not stale. NEVER use this to decide a fill or gate a trade —
+   * use getFillablePrice() for that; see its docstring for why. */
   getLtp(securityId: string | number): number | null {
     const snap = this.quotes.get(String(securityId));
     if (!snap || !snap.ltp) return null;
-    // Staleness guard: a quote older than 5 minutes during market hours is
-    // not a fillable price.
     const clock = marketClock();
     if (clock.isMarketOpen && Date.now() - snap.updatedAt > 5 * 60_000) return null;
+    return snap.ltp;
+  }
+
+  /** The ONLY price source any execution path may use — order fills,
+   * strategy seeding, position sizing. getLtp()'s staleness guard only
+   * applied during market hours, so a boot outside market hours (or a
+   * feed outage) returned an arbitrarily old cached price with no bound at
+   * all, and callers that saw null from getLtp() (e.g. seedStandardStrategies)
+   * fell back to a HARDCODED FAKE SPOT rather than skipping — both are real
+   * incidents this closes. Refuses outside market hours unless explicitly
+   * allowed (backtests / manual overrides), and always enforces a tight age
+   * bound regardless of hours. */
+  getFillablePrice(securityId: string | number, opts: { allowClosed?: boolean; maxAgeMs?: number } = {}): number | null {
+    const clock = marketClock();
+    if (!clock.isMarketOpen && !opts.allowClosed) return null;
+    const snap = this.quotes.get(String(securityId));
+    if (!snap || !snap.ltp || snap.ltp <= 0) return null;
+    const maxAgeMs = opts.maxAgeMs ?? 15_000;
+    if (Date.now() - snap.updatedAt > maxAgeMs) return null;
     return snap.ltp;
   }
 
@@ -412,6 +481,7 @@ export class MarketDataService {
   stop(): void {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     if (this.wsRetryTimer) clearTimeout(this.wsRetryTimer);
+    if (this.wsSilenceWatch) clearInterval(this.wsSilenceWatch);
     this.unsubEventBus?.();
     try { (this.client as any).ws?.disconnect?.(); } catch { /* noop */ }
   }

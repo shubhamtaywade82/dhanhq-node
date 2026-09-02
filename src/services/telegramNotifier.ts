@@ -10,11 +10,17 @@ const log = moduleLogger('telegram');
  * fallback behavior) wired onto this app's eventBus instead of Rails
  * service call sites.
  *
- * Forwards every `log` channel event at WARN/ERROR/SYSTEM level, plus the
- * EOD square-off result specifically (it logs at TRADE level but is exactly
- * the kind of "what just happened" alert this exists for). Deliberately not
- * a full feed of every TRADE-level fill — see the alert-scope decision this
- * was built against.
+ * Forwards `log` channel events at WARN/ERROR/SYSTEM level, plus TRADE
+ * events from `autonomy` specifically (auto-exit on SL/target/trailing, and
+ * the EOD square-off summary) — standalone "what just happened" alerts.
+ * Deliberately not a full feed of every fill — a multi-leg strategy deploy
+ * would otherwise ping once per leg.
+ *
+ * WARN/SYSTEM are repeat-throttled (see throttleRepeat): the same root
+ * cause recurring every scanner cycle sends once, then a count-annotated
+ * reminder at most every 30 minutes, not once per occurrence. ERROR and
+ * TRADE always send immediately — never throttle a kill switch or an
+ * actual fill/exit.
  */
 
 const TELEGRAM_API = 'https://api.telegram.org';
@@ -49,14 +55,52 @@ export function splitIntoChunks(text: string, maxLen = MAX_MESSAGE_LENGTH): stri
   return chunks;
 }
 
-const EOD_SUMMARY_PREFIX = 'Square-off complete:';
-
-/** WARN/ERROR/SYSTEM always forward; the one named TRADE exception is the
- * EOD square-off result, which is otherwise the only TRADE-level line that
- * reads as a standalone "here's what happened" alert. */
-export function shouldForwardLog(level: string, source: string, message: string): boolean {
+/** WARN/ERROR/SYSTEM forward (subject to the repeat throttle below); TRADE
+ * only forwards from `autonomy` — Auto-exit (SL/target/trailing hit) and
+ * Square-off complete are standalone "here's what happened" events a trader
+ * wants pushed. Per-leg fills (paper_engine/live_engine/portfolio deploy)
+ * stay excluded — a 4-leg strategy would otherwise ping 4 times per entry. */
+export function shouldForwardLog(level: string, source: string, _message: string): boolean {
   if (level === 'WARN' || level === 'ERROR' || level === 'SYSTEM') return true;
-  return level === 'TRADE' && source === 'autonomy' && message.startsWith(EOD_SUMMARY_PREFIX);
+  return level === 'TRADE' && source === 'autonomy';
+}
+
+// ── Repeat throttle ──────────────────────────────────────────────────────
+// The autonomous scanner can hit the exact same failure (e.g. a sizing bug
+// rejecting every attempt) every cycle for 30+ minutes straight. A trader
+// wants to know once, not 35 times. WARN/SYSTEM dedupe by a normalized key
+// (strategy ids and rupee amounts stripped, so the same root cause matches
+// regardless of which specific attempt or number); ERROR and TRADE always
+// send immediately — never throttle a kill-switch or an actual fill/exit.
+const REMINDER_INTERVAL_MS = 30 * 60 * 1000;
+const recentAlertKeys = new Map<string, { count: number; firstAt: number; lastSentAt: number }>();
+
+function normalizeForDedup(source: string, message: string): string {
+  return `${source}:${message
+    .replace(/strat_[a-z0-9_]+/gi, '<id>')
+    .replace(/₹[\d,]+(\.\d+)?/g, '<amt>')
+    .replace(/\d+(\.\d+)?/g, '<n>')}`;
+}
+
+/** Returns the message to actually send (possibly annotated with a repeat
+ * count), or null if this occurrence should be suppressed. */
+export function throttleRepeat(level: string, source: string, message: string, now = Date.now()): string | null {
+  if (level !== 'WARN' && level !== 'SYSTEM') return message;
+  const key = normalizeForDedup(source, message);
+  const entry = recentAlertKeys.get(key);
+  if (!entry) {
+    recentAlertKeys.set(key, { count: 1, firstAt: now, lastSentAt: now });
+    return message;
+  }
+  entry.count++;
+  if (now - entry.lastSentAt >= REMINDER_INTERVAL_MS) {
+    const suppressed = entry.count - 1;
+    entry.lastSentAt = now;
+    entry.count = 1;
+    entry.firstAt = now;
+    return `${message}\n\n(recurring — ${suppressed} more occurrence(s) suppressed since last notice)`;
+  }
+  return null;
 }
 
 function escapeHtml(text: string): string {
@@ -124,10 +168,12 @@ export function startTelegramNotifier(): () => void {
     log.info('Telegram notifications disabled (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set)');
     return () => {};
   }
-  log.info('Telegram notifications armed (WARN/ERROR/SYSTEM + EOD summary)');
+  log.info('Telegram notifications armed (WARN/ERROR/SYSTEM + trade exits, repeat-throttled)');
   return eventBus.on('log', (env) => {
     const { level, message, source } = env.payload || {};
     if (!shouldForwardLog(level, source, message)) return;
-    void sendTelegramMessage(formatLogMessage(level, source, message));
+    const toSend = throttleRepeat(level, source, message);
+    if (toSend === null) return;
+    void sendTelegramMessage(formatLogMessage(level, source, toSend));
   });
 }

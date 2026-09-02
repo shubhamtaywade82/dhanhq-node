@@ -7,10 +7,11 @@ import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules, g
 import { INDEX_INSTRUMENTS } from './marketData';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { LiveExecutionEngine } from '../engines/live';
-import { analyzeOptionChain } from './optionsAnalytics';
+import { analyzeOptionChain, recordIvSample, getIvRank, selectStrikeByDelta } from './optionsAnalytics';
 import {
-  buildIronCondor, buildCreditSpread, buildStraddle, buildOrbBuyingStrategy,
-  buildVwapPullbackStrategy, evaluateStrategyBacktest, calculateCapitalAllocationLots,
+  buildIronCondor, buildIronButterfly, buildCreditSpread, buildDebitSpread,
+  buildStraddle, buildStrangle, buildOrbBuyingStrategy, buildOrb30mStrategy,
+  buildVwapPullbackStrategy, evaluateStrategyBacktest, calculateCapitalAllocationLots, getLotSize,
   type ConstructedStrategy
 } from './strategyConstructor';
 import { analyzeOptionsBehavior } from '../routes/market';
@@ -242,7 +243,8 @@ export class AgentOrchestrator {
         if (rows.length === 0) continue;
 
         const analytics = analyzeOptionChain(target, rows, spot, expiry, vix);
-        const strat = this.synthesizeStrategy(objective, target, spot, rows, expiry, analytics, availableCapital);
+        recordIvSample(target, analytics.atmIv);
+        const strat = this.synthesizeStrategy(objective, target, spot, rows, expiry, analytics, availableCapital, vix);
         if (!strat) continue;
 
         const bt = await this.backtestCandidate(target, inst.securityId, strat);
@@ -266,7 +268,12 @@ export class AgentOrchestrator {
       const gate = this.risk.canTrade();
       const breakers = this.risk.snapshot().breakers || [];
       const tripped = breakers.filter((b) => b.state !== 'OK');
-      const isBacktestPassing = bt.passedValidation || bt.totalDays === 0 || bt.profitFactor >= 0.9;
+      // Single source of truth — evaluateStrategyBacktest already encodes the
+      // real win-rate/profit-factor/max-drawdown thresholds. The two escape
+      // hatches this used to have (totalDays===0 auto-passing, and a lower
+      // 0.9 PF bar bypassing the real validation) both let "we don't know"
+      // or "the real check said no" through as ALLOWED. Neither should.
+      const isBacktestPassing = bt.passedValidation;
       this.step(runId, 'risk', 'ACT', `Risk gate: ${gate.allowed && isBacktestPassing ? 'ALLOWED' : `BLOCKED (${!gate.allowed ? gate.reason : 'statistical edge below threshold'})`}`, {
         tool: 'risk_engine.evaluate', response: JSON.stringify({ allowed: gate.allowed, tripped: tripped.length, backtestPass: isBacktestPassing }),
       });
@@ -294,33 +301,88 @@ export class AgentOrchestrator {
     rows: any[],
     expiry: string,
     analytics: any,
-    capital = 1_000_000
+    capital = 1_000_000,
+    vix = 14
   ): ConstructedStrategy | null {
     const obj = objective.toLowerCase();
-    // PCR > 1 (more puts written than calls) reads bullish — put writers expect the strike to hold as support.
-    const direction = analytics.pcrOi > 1.1 ? 'BULLISH' : analytics.pcrOi < 0.9 ? 'BEARISH' : 'BULLISH';
+    
+    // Confluence-driven directional bias (PCR OI + PCR Vol + Max Pain pull)
+    const pcrBias = analytics.pcrOi > 1.15 ? 'BULLISH' : analytics.pcrOi < 0.85 ? 'BEARISH' : 'NEUTRAL';
+    const painBias = analytics.maxPain ? (spot < analytics.maxPain - 50 ? 'BULLISH' : spot > analytics.maxPain + 50 ? 'BEARISH' : 'NEUTRAL') : 'NEUTRAL';
+    const direction: 'BULLISH' | 'BEARISH' = pcrBias !== 'NEUTRAL' ? pcrBias : (painBias !== 'NEUTRAL' ? painBias : 'BULLISH');
 
-    // 30% capital allocation lot calculation for each strategy setup
-    const buyLots = calculateCapitalAllocationLots(capital, target, 'BUY', 0, 30);
+    // Conservative capital allocation (30% pool, ~1-1.5% max risk).
+    // The BUY estimate used to default to a flat ₹150/share guess (0 passed
+    // as unitCostOrMargin) regardless of symbol or strike — fine for a
+    // cheap OTM NIFTY option, wildly wrong for a near-ATM 0.55Δ BANKNIFTY/
+    // SENSEX one, which can run ₹500-900+. That undersized-premium guess
+    // sized lots as if the trade were 5x cheaper than it actually was,
+    // producing orders the account could never afford (rejected downstream
+    // with "insufficient margin" instead of being sized correctly upfront).
+    // Resolve the real strike the builder will actually pick and price lots
+    // off its live premium instead.
+    const buyOptType = direction === 'BULLISH' ? 'CALL' : 'PUT';
+    const buyStrikeRow = selectStrikeByDelta(rows, 0.55, buyOptType, spot, expiry);
+    const buyLeg = buyStrikeRow?.targetLeg;
+    const buyPremium = Number(buyLeg?.ltp || buyLeg?.lastPrice || buyLeg?.last_price || 0);
+    const buyUnitCost = buyPremium > 0 ? buyPremium * getLotSize(target) : 0;
+
+    const buyLots = calculateCapitalAllocationLots(capital, target, 'BUY', buyUnitCost, 30);
     const spreadLots = calculateCapitalAllocationLots(capital, target, 'SPREAD', 0, 30);
     const condorLots = calculateCapitalAllocationLots(capital, target, 'CONDOR', 0, 30);
     const straddleLots = calculateCapitalAllocationLots(capital, target, 'STRADDLE', 0, 30);
 
-    if (obj.includes('orb') || obj.includes('breakout')) return buildOrbBuyingStrategy(target, spot, rows, expiry, buyLots, direction);
-    if (obj.includes('vwap') || obj.includes('pullback')) return buildVwapPullbackStrategy(target, spot, rows, expiry, buyLots, direction);
+    // IV-rank gate: selling premium when this index's own IV already sits in
+    // the bottom quartile of its recent range means no cushion left — any
+    // expansion is unbounded loss against a small credit. null = not enough
+    // samples yet to know (process just started) — never gate on "unknown."
+    const ivRank = getIvRank(target);
+    const ivTooLowToSell = ivRank !== null && ivRank < 25;
+
+    // Explicit user-prompt overrides
+    if (obj.includes('butterfly')) return buildIronButterfly(target, spot, rows, expiry, condorLots);
+    if (obj.includes('condor')) return buildIronCondor(target, spot, rows, expiry, condorLots);
+    if (obj.includes('strangle')) return buildStrangle(target, spot, rows, expiry, straddleLots, obj.includes('buy') ? 'BUY' : 'SELL');
+    if (obj.includes('straddle')) return buildStraddle(target, spot, rows, expiry, straddleLots, obj.includes('buy') ? 'BUY' : 'SELL');
     if (obj.includes('bull') || obj.includes('put spread')) return buildCreditSpread(target, 'BULLISH', spot, rows, expiry, spreadLots);
     if (obj.includes('bear') || obj.includes('call spread')) return buildCreditSpread(target, 'BEARISH', spot, rows, expiry, spreadLots);
-    if (obj.includes('straddle')) return buildStraddle(target, spot, rows, expiry, straddleLots, obj.includes('buy') ? 'BUY' : 'SELL');
-    if (obj.includes('condor')) return buildIronCondor(target, spot, rows, expiry, condorLots);
+    if (obj.includes('orb 30') || obj.includes('orb_30')) return buildOrb30mStrategy(target, spot, rows, expiry, buyLots, direction);
+    if (obj.includes('orb') || obj.includes('breakout')) return buildOrbBuyingStrategy(target, spot, rows, expiry, buyLots, direction);
+    if (obj.includes('vwap') || obj.includes('pullback')) return buildVwapPullbackStrategy(target, spot, rows, expiry, buyLots, direction);
 
-    // Regime-adaptive selection:
-    // On expiry days (EXPIRY_GAMMA) or rangebound markets, deploy defined-risk Iron Condor / Credit Spreads
-    // During trending/breakout regimes, deploy directional ORB buying strategies
-    if (analytics.regime === 'EXPIRY_GAMMA' || analytics.regime === 'RANGE_BOUND' || analytics.regime === 'THETA_DECAY') {
-      return buildIronCondor(target, spot, rows, expiry, condorLots) || buildCreditSpread(target, direction, spot, rows, expiry, spreadLots);
+    // ── Professional Institutional Regime Dispatcher ──
+    // 1. Low IV / Rangebound / Theta Trap Regime: Maximize Theta Decay with defined risk wings
+    if (analytics.regime === 'THETA_DECAY' || analytics.regime === 'RANGE_BOUND' || vix < 13.5) {
+      // vix<13.5 is broad-market IV; this index's own IV rank can already be
+      // crushed even when overall VIX looks moderate — double-low means no
+      // edge left to sell. Skip rather than force a bad trade.
+      if (ivTooLowToSell) return null;
+      return buildIronButterfly(target, spot, rows, expiry, condorLots)
+        || buildCreditSpread(target, direction, spot, rows, expiry, spreadLots)
+        || buildIronCondor(target, spot, rows, expiry, condorLots);
     }
 
-    return buildOrbBuyingStrategy(target, spot, rows, expiry, buyLots, direction);
+    // 2. High IV / Breakout / Gamma Blast Regime: Exploit Directional Momentum with defined risk
+    if (analytics.regime === 'GAMMA_BLAST' || vix >= 15.5) {
+      return buildOrbBuyingStrategy(target, spot, rows, expiry, buyLots, direction)
+        || buildDebitSpread(target, direction, spot, rows, expiry, spreadLots);
+    }
+
+    // 3. Expiry Day Regime (0DTE Gamma Pin / Decay):
+    if (analytics.regime === 'EXPIRY_GAMMA') {
+      if (ivTooLowToSell) return null;
+      return buildIronButterfly(target, spot, rows, expiry, condorLots)
+        || buildCreditSpread(target, direction, spot, rows, expiry, spreadLots);
+    }
+
+    // 4. Trending Directional Drift Regime:
+    if (direction === 'BULLISH') {
+      return (!ivTooLowToSell && buildCreditSpread(target, 'BULLISH', spot, rows, expiry, spreadLots))
+        || buildOrbBuyingStrategy(target, spot, rows, expiry, buyLots, 'BULLISH');
+    } else {
+      return (!ivTooLowToSell && buildCreditSpread(target, 'BEARISH', spot, rows, expiry, spreadLots))
+        || buildOrbBuyingStrategy(target, spot, rows, expiry, buyLots, 'BEARISH');
+    }
   }
 
   private async executeStrategy(runId: string, objective: string, strat: ConstructedStrategy | null, allowed: boolean): Promise<any> {
@@ -365,8 +427,13 @@ export class AgentOrchestrator {
     try {
       const hist = await analyzeOptionsBehavior(this.client, { symbol: target, securityId: secId, daysCount: 5, interval: '1', expiryFlag: 'WEEK', expiryCode: 1 });
       return evaluateStrategyBacktest(target, strat.type, hist.days || [], { lots: strat.lots });
-    } catch {
-      return { winRate: 100, totalDays: 0, totalPnlInr: 0, profitFactor: 1.5, passedValidation: true };
+    } catch (e: any) {
+      // Absence of evidence is not consent to trade. This used to return a
+      // fabricated 100% win rate on ANY failure (rate limit, timeout, no
+      // data for the window) — the exact opposite of what a failed backtest
+      // should mean, and it fed the execution gate below directly.
+      eventBus.log('WARN', `Backtest unavailable for ${target} (${e?.message || e}) — treating as no edge, blocking entry`, 'agent');
+      return { winRate: 0, totalDays: 0, totalPnlInr: 0, profitFactor: 0, passedValidation: false };
     }
   }
 }

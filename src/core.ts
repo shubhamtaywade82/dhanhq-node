@@ -31,6 +31,23 @@ export interface Core {
 import { seedStandardStrategies } from './services/strategyConstructor';
 
 export async function startCore(): Promise<Core> {
+  // LiveExecutionEngine places real broker orders but writes no position/
+  // wallet state of its own — RiskEngine, AutonomyEngine, the kill switch
+  // and EOD square-off all read/act on the PAPER tables regardless of
+  // TRADING_MODE. In live mode that means real capital trades with the
+  // entire risk layer blind to it: the daily-loss breaker sees ₹0, EOD
+  // square-off closes paper positions while real ones stay open, and the
+  // kill switch's "positions closed" count is fabricated from an empty
+  // paper book. Refusing to boot is safer than an unmonitored live book —
+  // this must be resolved (a real PortfolioSource behind risk/autonomy)
+  // before TRADING_MODE=live is usable again.
+  if (process.env.TRADING_MODE === 'live') {
+    throw new Error(
+      'TRADING_MODE=live is currently unsafe: risk engine, autonomy loop, EOD square-off, and the kill switch ' +
+      'all operate on paper position/wallet state, not the live broker book. Live orders would execute ' +
+      'completely unmonitored. Set TRADING_MODE=paper until a live PortfolioSource is wired through.'
+    );
+  }
   await initDatabase();
   const client = await createDhanClient();
 
