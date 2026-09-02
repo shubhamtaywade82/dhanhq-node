@@ -6,13 +6,14 @@ const log = moduleLogger('db');
 /**
  * Paper-trading persistence layer.
  *
- * Primary mode: PostgreSQL (paper_wallet / paper_orders / paper_positions /
- * paper_strategies / options_behavior_analysis + new operational tables).
- *
- * Fallback mode: when PostgreSQL is unreachable the layer degrades to an
- * in-memory store with the identical function surface so the autonomous
- * backend still runs (state is simply not durable across restarts). The
- * active mode is exposed via `dbMode()` and reported by /api/health.
+ * Postgres is the durable ledger — every fill is a committed transaction.
+ * `mem` is an always-on in-memory mirror of `paper_wallet`/`paper_positions`
+ * that every position/wallet READ goes through (`listPaperPositions`,
+ * `getPaperWallet`, `markPositionsToMarket`): mark-to-market on every tick
+ * must not round-trip the connection pool. `mem` is warmed from Postgres on
+ * boot and updated from the same computed result as every Postgres write, so
+ * it never drifts. In fully offline mode (Postgres unreachable) `mem` is also
+ * the only copy, exposed via `dbMode()` and reported by /api/health.
  */
 
 const connectionString = process.env.DATABASE_URL || 'postgres://nemesis@localhost:5432/dhanhq_node_development';
@@ -28,9 +29,9 @@ export function dbMode(): 'postgres' | 'memory' {
   return mode;
 }
 
-// ── in-memory fallback store ────────────────────────────────────────────
+// ── in-memory wallet/position cache (always-on, see header) ───────────────
 const mem = {
-  wallet: { id: 'default', initial_balance: 100000, available_margin: 100000, used_margin: 0, realized_pnl: 0, updated_at: new Date() },
+  wallet: { id: 'default', initial_balance: 100000, available_margin: 100000, used_margin: 0, realized_pnl: 0, total_charges: 0, updated_at: new Date() },
   orders: [] as any[],
   positions: new Map<string, any>(),
   strategies: [] as any[],
@@ -108,9 +109,13 @@ const SCHEMA_SQL = `
   ON CONFLICT (id) DO NOTHING;
   ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS latency_ms INTEGER;
   ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
+  ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS charges NUMERIC(12, 2) NOT NULL DEFAULT 0.00;
   ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS stop_loss NUMERIC(12, 2);
   ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS target NUMERIC(12, 2);
   ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS trailing_stop NUMERIC(12, 2);
+  ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS margin_blocked NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
+  ALTER TABLE paper_wallet ADD COLUMN IF NOT EXISTS total_charges NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
+  ALTER TABLE paper_strategies ADD COLUMN IF NOT EXISTS margin_hedge_credit NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
 `;
 
 export async function initDatabase(): Promise<void> {
@@ -133,6 +138,25 @@ export async function initDatabase(): Promise<void> {
     log.warn({ err: { message: e.message } }, 'Schema init failed — falling back to in-memory mode');
   } finally {
     client.release();
+  }
+  if (mode === 'postgres') await warmMemCache();
+}
+
+/** One-time load of the wallet/positions/today's-orders ledger into the
+ * in-memory cache on boot — orders are warmed so the risk engine's
+ * same-day consecutive-loss counter survives a restart. */
+async function warmMemCache(): Promise<void> {
+  try {
+    const walletRes = await pool.query('SELECT * FROM paper_wallet WHERE id = $1', ['default']);
+    if (walletRes.rows[0]) mem.wallet = walletRes.rows[0];
+    const posRes = await pool.query('SELECT * FROM paper_positions');
+    mem.positions.clear();
+    for (const row of posRes.rows) mem.positions.set(row.id, row);
+    const ordersRes = await pool.query('SELECT * FROM paper_orders WHERE created_at >= CURRENT_DATE ORDER BY created_at DESC LIMIT 500');
+    mem.orders = ordersRes.rows;
+    log.info({ positions: mem.positions.size, orders: mem.orders.length }, 'Warmed in-memory paper-trading cache from PostgreSQL');
+  } catch (e: any) {
+    log.warn({ err: { message: e.message } }, 'Failed to warm in-memory paper-trading cache from PostgreSQL');
   }
 }
 
@@ -332,26 +356,45 @@ export async function listPaperStrategies() {
     lots: Number(r.lots),
     entryTime: new Date(r.entry_time).toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Kolkata' }),
     legs: r.legs || [], pnl: 0,
+    marginHedgeCredit: Number(r.margin_hedge_credit || 0),
   }));
 }
 
-export async function createPaperStrategy(s: { id?: string; name: string; symbol: string; type: string; lots: number; legs: any[]; status?: string }) {
+export async function createPaperStrategy(s: { id?: string; name: string; symbol: string; type: string; lots: number; legs: any[]; status?: string; marginHedgeCredit?: number }) {
   const id = s.id || `strat_${Date.now().toString(36)}`;
   const status = s.status || 'RUNNING';
+  const marginHedgeCredit = s.marginHedgeCredit || 0;
   if (mode === 'postgres') {
     await pool.query(
-      `INSERT INTO paper_strategies (id, name, symbol, strategy_type, status, lots, legs, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       ON CONFLICT (id) DO UPDATE SET name = $2, symbol = $3, strategy_type = $4, status = $5, lots = $6, legs = $7, updated_at = NOW()`,
-      [id, s.name, s.symbol, s.type, status, s.lots, JSON.stringify(s.legs)],
+      `INSERT INTO paper_strategies (id, name, symbol, strategy_type, status, lots, legs, margin_hedge_credit, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       ON CONFLICT (id) DO UPDATE SET name = $2, symbol = $3, strategy_type = $4, status = $5, lots = $6, legs = $7, margin_hedge_credit = $8, updated_at = NOW()`,
+      [id, s.name, s.symbol, s.type, status, s.lots, JSON.stringify(s.legs), marginHedgeCredit],
     );
   } else {
-    mem.strategies.unshift({ id, name: s.name, symbol: s.symbol, strategy_type: s.type, status, lots: s.lots, legs: s.legs, entry_time: new Date(), updated_at: new Date() });
+    mem.strategies.unshift({ id, name: s.name, symbol: s.symbol, strategy_type: s.type, status, lots: s.lots, legs: s.legs, margin_hedge_credit: marginHedgeCredit, entry_time: new Date(), updated_at: new Date() });
   }
   return { id, status };
 }
 
+// Centralized so every close path (manual close route, autonomy's
+// loss-limit stop, the kill switch) reverses a strategy's hedge-margin
+// credit exactly once — callers never need to remember to do it themselves.
 export async function updatePaperStrategyStatus(id: string, status: string) {
+  if (status === 'STOPPED') {
+    const hedgeCredit = mode === 'postgres'
+      ? Number((await pool.query('SELECT margin_hedge_credit FROM paper_strategies WHERE id = $1', [id]).catch(() => ({ rows: [] }))).rows[0]?.margin_hedge_credit || 0)
+      : Number(mem.strategies.find((x) => x.id === id)?.margin_hedge_credit || 0);
+    if (hedgeCredit > 0) {
+      await adjustWalletMargin(-hedgeCredit);
+      if (mode === 'postgres') {
+        await pool.query('UPDATE paper_strategies SET margin_hedge_credit = 0 WHERE id = $1', [id]).catch(() => {});
+      } else {
+        const s = mem.strategies.find((x) => x.id === id);
+        if (s) s.margin_hedge_credit = 0;
+      }
+    }
+  }
   if (mode === 'postgres') {
     await pool.query('UPDATE paper_strategies SET status = $2, updated_at = NOW() WHERE id = $1', [id, status]);
   } else {
@@ -371,22 +414,52 @@ export async function deletePaperStrategy(id: string) {
 }
 
 // ── wallet ──────────────────────────────────────────────────────────────
+// Reads always come from `mem` (see header) — Postgres is written to on every
+// fill but never read back on the hot path.
 export async function getPaperWallet() {
-  const w = mode === 'postgres'
-    ? (await pool.query('SELECT * FROM paper_wallet WHERE id = $1', ['default']).catch(() => ({ rows: [] }))).rows[0]
-    : (mem.wallet as any);
+  const w = mem.wallet as any;
   if (!w) {
-    return { availableMargin: 100000, usedMargin: 0, realizedPnl: 0, totalBalance: 100000, spanMargin: 0, exposureMargin: 0 };
+    return { availableMargin: 100000, usedMargin: 0, realizedPnl: 0, unrealizedPnl: 0, totalCharges: 0, netRealizedPnl: 0, totalBalance: 100000, equity: 100000, spanMargin: 0, exposureMargin: 0 };
   }
   const availableMargin = Number(w.available_margin);
   const usedMargin = Number(w.used_margin);
   const realizedPnl = Number(w.realized_pnl);
+  const totalCharges = Number(w.total_charges || 0);
+  const initialBalance = Number(w.initial_balance);
+  let unrealizedPnl = 0;
+  for (const pos of mem.positions.values()) {
+    const netQty = Number(pos.net_qty);
+    if (netQty === 0) continue;
+    unrealizedPnl += computeUnrealized(netQty, Number(pos.buy_avg), Number(pos.sell_avg), Number(pos.ltp));
+  }
   return {
-    availableMargin, usedMargin, realizedPnl,
+    availableMargin, usedMargin, realizedPnl, unrealizedPnl, totalCharges,
+    netRealizedPnl: Number((realizedPnl - totalCharges).toFixed(2)),
     totalBalance: availableMargin + usedMargin,
+    // Net worth: capital + booked P&L + open P&L, net of charges — distinct
+    // from availableMargin (the trading-gate number margin blocks reduce).
+    equity: Number((initialBalance + realizedPnl + unrealizedPnl - totalCharges).toFixed(2)),
     spanMargin: Number((usedMargin * 0.7).toFixed(2)),
     exposureMargin: Number((usedMargin * 0.3).toFixed(2)),
   };
+}
+
+/** One-off adjustment to blocked margin outside the per-fill delta flow —
+ * used to apply/reverse a multi-leg strategy's hedge-margin benefit (the
+ * combined SPAN requirement across legs is usually less than the sum of
+ * each leg's standalone margin). Positive `delta` releases margin back to
+ * available; negative re-blocks it. */
+export async function adjustWalletMargin(delta: number): Promise<void> {
+  if (!delta) return;
+  mem.wallet.used_margin = Number(mem.wallet.used_margin) - delta;
+  mem.wallet.available_margin = Number(mem.wallet.available_margin) + delta;
+  mem.wallet.updated_at = new Date();
+  if (mode === 'postgres') {
+    await pool.query(
+      `UPDATE paper_wallet SET used_margin = used_margin - $1, available_margin = available_margin + $1, updated_at = NOW() WHERE id = 'default'`,
+      [delta],
+    ).catch(() => {});
+  }
 }
 
 export async function resetPaperWallet(initialBalance = 100000) {
@@ -395,7 +468,7 @@ export async function resetPaperWallet(initialBalance = 100000) {
     try {
       await client.query('BEGIN');
       await client.query(
-        `UPDATE paper_wallet SET initial_balance = $1, available_margin = $1, used_margin = 0, realized_pnl = 0, updated_at = NOW() WHERE id = 'default'`,
+        `UPDATE paper_wallet SET initial_balance = $1, available_margin = $1, used_margin = 0, realized_pnl = 0, total_charges = 0, updated_at = NOW() WHERE id = 'default'`,
         [initialBalance],
       );
       await client.query('DELETE FROM paper_positions');
@@ -411,23 +484,25 @@ export async function resetPaperWallet(initialBalance = 100000) {
     } finally {
       client.release();
     }
-  } else {
-    mem.wallet = { ...mem.wallet, initial_balance: initialBalance, available_margin: initialBalance, used_margin: 0, realized_pnl: 0, updated_at: new Date() };
-    mem.orders = [];
-    mem.positions.clear();
-    mem.strategies = [];
-    mem.alerts = [];
-    mem.agentEvents = [];
-    mem.riskState = { killed: false, killedReason: null, limits: {}, consecutiveLosses: 0 };
   }
+  // The in-memory cache is the read path in both modes — always reset it.
+  mem.wallet = { id: 'default', initial_balance: initialBalance, available_margin: initialBalance, used_margin: 0, realized_pnl: 0, total_charges: 0, updated_at: new Date() };
+  mem.orders = [];
+  mem.positions.clear();
+  mem.strategies = [];
+  mem.alerts = [];
+  mem.agentEvents = [];
+  mem.riskState = { killed: false, killedReason: null, limits: {}, consecutiveLosses: 0 };
   return { status: 'ok', initialBalance };
 }
 
 // ── orders ──────────────────────────────────────────────────────────────
+// Full order history — not a hot-path read (no per-tick caller), so this
+// still queries Postgres for durability beyond `mem`'s same-day window.
 export async function listPaperOrders() {
   const rows = mode === 'postgres'
     ? (await pool.query('SELECT * FROM paper_orders ORDER BY created_at DESC LIMIT 100').catch(() => ({ rows: [] }))).rows
-    : [...mem.orders].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).slice(0, 100);
+    : mem.orders.slice(0, 100);
   return rows.map((r: any) => ({
     id: r.id,
     corr: r.correlation_id,
@@ -439,6 +514,7 @@ export async function listPaperOrders() {
     price: Number(r.price),
     filled: Number(r.filled_qty),
     avg: Number(r.avg_price),
+    charges: Number(r.charges || 0),
     leg: 'ENTRY_LEG',
     status: r.status,
     jid: r.correlation_id || r.id,
@@ -448,9 +524,10 @@ export async function listPaperOrders() {
 }
 
 export async function getTodayOrderStats() {
-  const rows = mode === 'postgres'
-    ? (await pool.query(`SELECT * FROM paper_orders WHERE created_at >= CURRENT_DATE ORDER BY created_at ASC`).catch(() => ({ rows: [] }))).rows
-    : mem.orders.filter((o: any) => new Date(o.created_at).toDateString() === new Date().toDateString());
+  const today = new Date().toDateString();
+  // Oldest-first, matching the original ORDER BY ASC — the loop below reads
+  // backwards from the most recent order.
+  const rows = mem.orders.filter((o: any) => new Date(o.created_at).toDateString() === today).slice().reverse();
   let consecutiveLosses = 0;
   for (let i = rows.length - 1; i >= 0; i--) {
     const realized = Number(rows[i].realized_pnl || 0);
@@ -479,6 +556,46 @@ export interface PaperOrderInput {
   stopLoss?: number;
   target?: number;
   trailingStop?: number;
+}
+
+/** Resolves the margin required to hold a position, given price/quantity. */
+export type MarginResolver = (params: { side: 'BUY' | 'SELL'; securityId: string; exchangeSegment: string; productType: string; quantity: number; price: number }) => Promise<number>;
+
+// Last-resort placeholder for when the live DhanHQ margin API is unreachable.
+// Real SPAN + exposure margin for a short option is not a fixed multiple of
+// premium — this only ever runs if the caller's real-margin-API resolver
+// (see PaperExecutionEngine) throws. ponytail: revisit if this path is ever
+// observed to actually fire in practice; until then it's a safety net, not a
+// pricing model.
+const FALLBACK_SHORT_MARGIN_MULTIPLE = 10;
+
+export const defaultMarginResolver: MarginResolver = async ({ side, quantity, price }) => {
+  if (side === 'BUY') return quantity * price; // long options: full premium, no leverage
+  return quantity * price * FALLBACK_SHORT_MARGIN_MULTIPLE;
+};
+
+type PositionUpdate = ReturnType<typeof calculateBuyUpdate>;
+
+/** Margin required to hold the *resulting* position after this fill. Long
+ * legs are deterministic (full premium); short legs go through the resolver
+ * so short-margin math lives with whoever holds the broker client, not here. */
+async function resolveMarginRequired(u: PositionUpdate, securityId: string, exchangeSegment: string, productType: string, resolver: MarginResolver): Promise<number> {
+  if (u.netQty === 0) return 0;
+  if (u.netQty > 0) return u.netQty * u.buyAvg;
+  return resolver({ side: 'SELL', securityId, exchangeSegment, productType, quantity: Math.abs(u.netQty), price: u.sellAvg });
+}
+
+/** Per-fill F&O charges (not round-trip): brokerage on every fill, STT only
+ * on the sell leg, stamp duty only on the buy leg — Indian options rules. */
+function calculateOrderCharges(side: 'BUY' | 'SELL', price: number, qty: number): number {
+  const turnover = price * qty;
+  const brokerage = 20;
+  const stt = side === 'SELL' ? Number((turnover * 0.0010).toFixed(2)) : 0;
+  const stampDuty = side === 'BUY' ? Number((turnover * 0.00003).toFixed(2)) : 0;
+  const exchange = Number((turnover * 0.0005).toFixed(2));
+  const sebiFee = Number((turnover * 0.0000001).toFixed(2)); // ~₹10/crore
+  const gst = Number(((brokerage + exchange) * 0.18).toFixed(2));
+  return Number((brokerage + stt + stampDuty + exchange + sebiFee + gst).toFixed(2));
 }
 
 function calculateBuyUpdate(pos: any, qty: number, price: number) {
@@ -519,21 +636,65 @@ function calculateSellUpdate(pos: any, qty: number, price: number) {
   return { buyQty: Number(pos?.buy_qty || 0), buyAvg: curBuyAvg, sellQty: newSellQty, sellAvg: newSellAvg, netQty: curNet - qty, realized };
 }
 
-export async function executePaperOrder(input: PaperOrderInput) {
+/** Records one fill in the in-memory order log — the read path for
+ * `listPaperOrders`/`getTodayOrderStats` regardless of mode (see header). */
+function pushOrderToMem(orderId: string, sym: string, securityId: string, exchangeSegment: string, input: PaperOrderInput, qty: number, fillPrice: number, latencyMs: number, realizedDelta: number, charges: number): void {
+  mem.orders.unshift({
+    id: orderId, correlation_id: input.correlationId || `corr_${orderId}`, symbol: sym,
+    security_id: securityId, exchange_segment: exchangeSegment,
+    transaction_type: input.transactionType, order_type: input.orderType || 'MARKET',
+    product_type: input.productType || 'INTRADAY', quantity: qty, price: fillPrice,
+    status: 'TRADED', filled_qty: qty, avg_price: fillPrice, latency_ms: latencyMs,
+    realized_pnl: realizedDelta, charges, created_at: new Date(), updated_at: new Date(),
+  });
+  if (mem.orders.length > 500) mem.orders.pop();
+}
+
+/** Applies one fill's computed result to the in-memory cache — the single
+ * write path for both Postgres mode (mirror after commit) and memory mode
+ * (the only write). Never recomputed independently from the Postgres write. */
+function applyFillToMem(sym: string, u: PositionUpdate, newRealized: number, ltp: number, marginRequired: number, input: PaperOrderInput, charges: number): void {
+  const curPos = mem.positions.get(sym);
+  const marginDelta = marginRequired - Number(curPos?.margin_blocked || 0);
+  mem.positions.set(sym, {
+    id: sym, symbol: sym,
+    security_id: input.securityId || curPos?.security_id || '0',
+    exchange_segment: input.exchangeSegment || curPos?.exchange_segment || 'NSE_FNO',
+    product_type: input.productType || curPos?.product_type || 'INTRADAY',
+    buy_qty: u.buyQty, buy_avg: u.buyAvg, sell_qty: u.sellQty, sell_avg: u.sellAvg, net_qty: u.netQty,
+    realized_pnl: newRealized, ltp, margin_blocked: marginRequired,
+    unrealized_pnl: curPos?.unrealized_pnl ?? 0,
+    stop_loss: input.stopLoss ?? curPos?.stop_loss ?? null,
+    target: input.target ?? curPos?.target ?? null,
+    trailing_stop: input.trailingStop ?? curPos?.trailing_stop ?? null,
+    updated_at: new Date(),
+  });
+  mem.wallet.realized_pnl = Number(mem.wallet.realized_pnl) + u.realized;
+  mem.wallet.available_margin = Number(mem.wallet.available_margin) + u.realized - marginDelta - charges;
+  mem.wallet.used_margin = Number(mem.wallet.used_margin) + marginDelta;
+  mem.wallet.total_charges = Number(mem.wallet.total_charges || 0) + charges;
+  mem.wallet.updated_at = new Date();
+}
+
+export async function executePaperOrder(input: PaperOrderInput, marginResolver: MarginResolver = defaultMarginResolver) {
   const t0 = Date.now();
   const orderId = `ORD-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random() * 900 + 100)}`;
   const fillPrice = Number(input.price || 0);
   const qty = Number(input.quantity);
   const sym = input.symbol.toUpperCase();
+  const securityId = input.securityId || '0';
+  const exchangeSegment = input.exchangeSegment || 'NSE_FNO';
 
   if (!fillPrice || fillPrice <= 0) {
     throw new Error('Fill price required — paper orders must be priced from live market LTP (pass explicit price for LIMIT orders)');
   }
 
   const latencyMs = Math.max(1, Date.now() - t0 + Math.floor(Math.random() * 20));
+  const charges = calculateOrderCharges(input.transactionType, fillPrice, qty);
 
   if (mode === 'postgres') {
     const client = await pool.connect();
+    let u: PositionUpdate, newRealized: number, marginRequired: number;
     try {
       await client.query('BEGIN');
 
@@ -541,26 +702,27 @@ export async function executePaperOrder(input: PaperOrderInput) {
       // (used by the risk engine's consecutive-loss breaker).
       const posRes = await client.query('SELECT * FROM paper_positions WHERE id = $1', [sym]);
       const curPos = posRes.rows[0];
-      const u = input.transactionType === 'BUY' ? calculateBuyUpdate(curPos, qty, fillPrice) : calculateSellUpdate(curPos, qty, fillPrice);
-      const newRealized = Number(curPos?.realized_pnl || 0) + u.realized;
+      u = input.transactionType === 'BUY' ? calculateBuyUpdate(curPos, qty, fillPrice) : calculateSellUpdate(curPos, qty, fillPrice);
+      newRealized = Number(curPos?.realized_pnl || 0) + u.realized;
+      marginRequired = await resolveMarginRequired(u, securityId, exchangeSegment, input.productType || 'INTRADAY', marginResolver);
+      const marginDelta = marginRequired - Number(curPos?.margin_blocked || 0);
 
       await client.query(
-        `INSERT INTO paper_orders (id, correlation_id, symbol, security_id, exchange_segment, transaction_type, order_type, product_type, quantity, price, status, filled_qty, avg_price, latency_ms, realized_pnl)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'TRADED', $9, $10, $11, $12)`,
-        [orderId, input.correlationId || `corr_${orderId}`, sym, input.securityId || '0', input.exchangeSegment || 'NSE_FNO', input.transactionType, input.orderType || 'MARKET', input.productType || 'INTRADAY', qty, fillPrice, latencyMs, u.realized],
+        `INSERT INTO paper_orders (id, correlation_id, symbol, security_id, exchange_segment, transaction_type, order_type, product_type, quantity, price, status, filled_qty, avg_price, latency_ms, realized_pnl, charges)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'TRADED', $9, $10, $11, $12, $13)`,
+        [orderId, input.correlationId || `corr_${orderId}`, sym, securityId, exchangeSegment, input.transactionType, input.orderType || 'MARKET', input.productType || 'INTRADAY', qty, fillPrice, latencyMs, u.realized, charges],
       );
 
       await client.query(
-        `INSERT INTO paper_positions (id, symbol, security_id, exchange_segment, product_type, buy_qty, buy_avg, sell_qty, sell_avg, net_qty, realized_pnl, ltp, stop_loss, target, trailing_stop, updated_at)
-         VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
-         ON CONFLICT (id) DO UPDATE SET buy_qty = $5, buy_avg = $6, sell_qty = $7, sell_avg = $8, net_qty = $9, realized_pnl = $10, ltp = $11, stop_loss = COALESCE($12, paper_positions.stop_loss), target = COALESCE($13, paper_positions.target), trailing_stop = COALESCE($14, paper_positions.trailing_stop), updated_at = NOW()`,
-        [sym, input.securityId || '0', input.exchangeSegment || 'NSE_FNO', input.productType || 'INTRADAY', u.buyQty, u.buyAvg, u.sellQty, u.sellAvg, u.netQty, newRealized, fillPrice, input.stopLoss ?? null, input.target ?? null, input.trailingStop ?? null],
+        `INSERT INTO paper_positions (id, symbol, security_id, exchange_segment, product_type, buy_qty, buy_avg, sell_qty, sell_avg, net_qty, realized_pnl, ltp, margin_blocked, stop_loss, target, trailing_stop, updated_at)
+         VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+         ON CONFLICT (id) DO UPDATE SET buy_qty = $5, buy_avg = $6, sell_qty = $7, sell_avg = $8, net_qty = $9, realized_pnl = $10, ltp = $11, margin_blocked = $12, stop_loss = COALESCE($13, paper_positions.stop_loss), target = COALESCE($14, paper_positions.target), trailing_stop = COALESCE($15, paper_positions.trailing_stop), updated_at = NOW()`,
+        [sym, securityId, exchangeSegment, input.productType || 'INTRADAY', u.buyQty, u.buyAvg, u.sellQty, u.sellAvg, u.netQty, newRealized, fillPrice, marginRequired, input.stopLoss ?? null, input.target ?? null, input.trailingStop ?? null],
       );
 
-      const marginReq = u.netQty !== 0 ? Math.abs(u.netQty) * fillPrice * 0.15 : 0;
       await client.query(
-        `UPDATE paper_wallet SET realized_pnl = realized_pnl + $1, available_margin = available_margin + $1 - $2, used_margin = used_margin + $2, updated_at = NOW() WHERE id = 'default'`,
-        [u.realized, marginReq],
+        `UPDATE paper_wallet SET realized_pnl = realized_pnl + $1, available_margin = available_margin + $1 - $2 - $3, used_margin = used_margin + $2, total_charges = total_charges + $3, updated_at = NOW() WHERE id = 'default'`,
+        [u.realized, marginDelta, charges],
       );
       await client.query('COMMIT');
     } catch (e) {
@@ -569,45 +731,24 @@ export async function executePaperOrder(input: PaperOrderInput) {
     } finally {
       client.release();
     }
+    pushOrderToMem(orderId, sym, securityId, exchangeSegment, input, qty, fillPrice, latencyMs, u.realized, charges);
+    applyFillToMem(sym, u, newRealized, fillPrice, marginRequired, input, charges);
   } else {
-    // Position first (same reason as PG branch), then order row.
     const curPos = mem.positions.get(sym);
     const u = input.transactionType === 'BUY' ? calculateBuyUpdate(curPos, qty, fillPrice) : calculateSellUpdate(curPos, qty, fillPrice);
+    const newRealized = Number(curPos?.realized_pnl || 0) + u.realized;
+    const marginRequired = await resolveMarginRequired(u, securityId, exchangeSegment, input.productType || 'INTRADAY', marginResolver);
 
-    mem.orders.unshift({
-      id: orderId, correlation_id: input.correlationId || `corr_${orderId}`, symbol: sym,
-      security_id: input.securityId || '0', exchange_segment: input.exchangeSegment || 'NSE_FNO',
-      transaction_type: input.transactionType, order_type: input.orderType || 'MARKET',
-      product_type: input.productType || 'INTRADAY', quantity: qty, price: fillPrice,
-      status: 'TRADED', filled_qty: qty, avg_price: fillPrice, latency_ms: latencyMs,
-      realized_pnl: u.realized, created_at: new Date(), updated_at: new Date(),
-    });
-    if (mem.orders.length > 500) mem.orders.pop();
-
-    mem.positions.set(sym, {
-      id: sym, symbol: sym, security_id: input.securityId || '0', exchange_segment: input.exchangeSegment || 'NSE_FNO',
-      product_type: input.productType || 'INTRADAY', buy_qty: u.buyQty, buy_avg: u.buyAvg,
-      sell_qty: u.sellQty, sell_avg: u.sellAvg, net_qty: u.netQty,
-      realized_pnl: Number(curPos?.realized_pnl || 0) + u.realized, ltp: fillPrice,
-      stop_loss: input.stopLoss ?? curPos?.stop_loss,
-      target: input.target ?? curPos?.target,
-      trailing_stop: input.trailingStop ?? curPos?.trailing_stop,
-      updated_at: new Date(),
-    });
-    const marginReq = u.netQty !== 0 ? Math.abs(u.netQty) * fillPrice * 0.15 : 0;
-    mem.wallet.realized_pnl = Number(mem.wallet.realized_pnl) + u.realized;
-    mem.wallet.available_margin = Number(mem.wallet.available_margin) + u.realized - marginReq;
-    mem.wallet.used_margin = Number(mem.wallet.used_margin) + marginReq;
+    pushOrderToMem(orderId, sym, securityId, exchangeSegment, input, qty, fillPrice, latencyMs, u.realized, charges);
+    applyFillToMem(sym, u, newRealized, fillPrice, marginRequired, input, charges);
   }
 
-  return { orderId, symbol: sym, side: input.transactionType, quantity: qty, fillPrice, status: 'TRADED', latencyMs };
+  return { orderId, symbol: sym, side: input.transactionType, quantity: qty, fillPrice, charges, status: 'TRADED', latencyMs };
 }
 
-export async function closePaperPosition(symbol: string, currentLtp?: number) {
+export async function closePaperPosition(symbol: string, currentLtp?: number, marginResolver?: MarginResolver) {
   const sym = symbol.toUpperCase();
-  const pos = mode === 'postgres'
-    ? (await pool.query('SELECT * FROM paper_positions WHERE id = $1', [sym]).catch(() => ({ rows: [] }))).rows[0]
-    : mem.positions.get(sym);
+  const pos = mem.positions.get(sym);
   if (!pos || Number(pos.net_qty) === 0) return { status: 'noop', message: 'No open position found' };
   const netQty = Number(pos.net_qty);
   return executePaperOrder({
@@ -620,57 +761,47 @@ export async function closePaperPosition(symbol: string, currentLtp?: number) {
     quantity: Math.abs(netQty),
     price: currentLtp || Number(pos.ltp || (netQty > 0 ? pos.buy_avg : pos.sell_avg)),
     correlationId: `close_${sym}_${Date.now()}`,
-  });
+  }, marginResolver);
 }
 
-/** Mark open positions to market — called by the autonomy loop from live ticks. */
+/** Mark open positions to market — pure in-memory, called every autonomy
+ * cycle. No Postgres access: `mem` is the live read path (see header). */
+/** Shared unrealized-PnL formula — long gains as LTP rises, short gains as it falls. */
+function computeUnrealized(netQty: number, buyAvg: number, sellAvg: number, ltp: number): number {
+  if (netQty === 0) return 0;
+  return netQty > 0 ? (ltp - buyAvg) * netQty : (sellAvg - ltp) * Math.abs(netQty);
+}
+
 export async function markPositionsToMarket(ltpResolver: (securityId: string, symbol: string) => number | null): Promise<number> {
-  const rows = mode === 'postgres'
-    ? (await pool.query(`SELECT * FROM paper_positions WHERE net_qty <> 0`).catch(() => ({ rows: [] }))).rows
-    : [...mem.positions.values()].filter((p: any) => Number(p.net_qty) !== 0);
-
   let totalUnrealized = 0;
-  for (const pos of rows) {
-    const ltp = ltpResolver(pos.security_id, pos.symbol);
-    if (ltp == null) {
-      // keep last known ltp
-      const netQty = Number(pos.net_qty);
-      const cost = netQty > 0 ? Number(pos.buy_avg) : Number(pos.sell_avg);
-      const lastLtp = Number(pos.ltp || cost);
-      totalUnrealized += netQty > 0 ? (lastLtp - cost) * netQty : (Number(pos.sell_avg) - lastLtp) * Math.abs(netQty);
-      continue;
-    }
+  for (const pos of mem.positions.values()) {
     const netQty = Number(pos.net_qty);
+    if (netQty === 0) continue;
     const buyAvg = Number(pos.buy_avg), sellAvg = Number(pos.sell_avg);
-    const cost = netQty > 0 ? buyAvg : sellAvg;
-    const unrealized = netQty > 0 ? (ltp - buyAvg) * netQty : (sellAvg - ltp) * Math.abs(netQty);
+    const ltp = ltpResolver(pos.security_id, pos.symbol);
+    const effectiveLtp = ltp ?? Number(pos.ltp || (netQty > 0 ? buyAvg : sellAvg));
+    const unrealized = computeUnrealized(netQty, buyAvg, sellAvg, effectiveLtp);
     totalUnrealized += unrealized;
-
-    if (mode === 'postgres') {
-      await pool.query('UPDATE paper_positions SET ltp = $2, unrealized_pnl = $3, updated_at = NOW() WHERE id = $1', [pos.id, ltp, unrealized]).catch(() => {});
-    } else {
-      pos.ltp = ltp;
-      pos.unrealized_pnl = unrealized;
-      pos.updated_at = new Date();
-    }
+    if (ltp != null) pos.ltp = ltp;
+    pos.unrealized_pnl = unrealized;
+    pos.updated_at = new Date();
   }
   return totalUnrealized;
 }
 
 export async function listPaperPositions() {
-  const rows = mode === 'postgres'
-    ? (await pool.query('SELECT * FROM paper_positions ORDER BY updated_at DESC').catch(() => ({ rows: [] }))).rows
-    : [...mem.positions.values()];
+  const rows = [...mem.positions.values()];
   return rows.map((r: any) => {
     const netQty = Number(r.net_qty), buyAvg = Number(r.buy_avg), sellAvg = Number(r.sell_avg);
     const cost = netQty >= 0 ? buyAvg : sellAvg, ltp = Number(r.ltp || cost);
-    const unrealized = netQty !== 0 ? (netQty > 0 ? (ltp - buyAvg) * netQty : (sellAvg - ltp) * Math.abs(netQty)) : 0;
+    const unrealized = computeUnrealized(netQty, buyAvg, sellAvg, ltp);
     const realized = Number(r.realized_pnl);
     return {
       id: r.id, tradingSymbol: r.symbol, securityId: r.security_id, exchangeSegment: r.exchange_segment,
       productType: r.product_type, buyQty: Number(r.buy_qty), buyAvg, sellQty: Number(r.sell_qty), sellAvg,
       netQty, realizedProfit: realized, unrealizedProfit: unrealized, rnl: realized, unrealizedPnl: unrealized,
       pnl: realized + unrealized, costPrice: cost, ltp, positionType: r.product_type, crossCurrency: false,
+      marginBlocked: Number(r.margin_blocked || 0),
       stopLoss: r.stop_loss ? Number(r.stop_loss) : null,
       target: r.target ? Number(r.target) : null,
       trailingStop: r.trailing_stop ? Number(r.trailing_stop) : null,

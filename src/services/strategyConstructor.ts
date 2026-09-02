@@ -50,7 +50,9 @@ export interface ConstructedStrategy {
   lotSize: number;
 }
 
-// SEBI revised lot sizes effective 2025–2026 (target ₹15–20L contract value).
+// Last-resort fallback only — real lot size comes from the DhanHQ instrument
+// (scrip master) via warmLotSizeCache(). These values are not independently
+// verified and only apply if that lookup has never succeeded for a symbol.
 const LOT_SIZES: Record<string, number> = {
   NIFTY: 65,
   BANKNIFTY: 30,
@@ -59,26 +61,51 @@ const LOT_SIZES: Record<string, number> = {
   MIDCPNIFTY: 120,
 };
 
+const LOT_SIZE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // lot size doesn't change intraday
+const lotSizeCache = new Map<string, { value: number; expiresAt: number }>();
+
+/** Resolves and caches a symbol's real lot size from the DhanHQ instrument
+ * (scrip master). Call once per symbol wherever the option chain is already
+ * being fetched with a live client — cheap no-op once cached. */
+export async function warmLotSizeCache(client: any, symbol: string, exchangeSegment = 'NSE_FNO'): Promise<void> {
+  const sym = symbol.toUpperCase();
+  const cached = lotSizeCache.get(sym);
+  if (cached && cached.expiresAt > Date.now()) return;
+  try {
+    const instrument = await client?.instruments?.find?.(exchangeSegment, sym);
+    if (instrument?.lotSize) {
+      lotSizeCache.set(sym, { value: Number(instrument.lotSize), expiresAt: Date.now() + LOT_SIZE_CACHE_TTL_MS });
+    }
+  } catch { /* keep the hardcoded fallback */ }
+}
+
 export function getLotSize(symbol: string): number {
-  return LOT_SIZES[symbol.toUpperCase()] || 65;
+  const sym = symbol.toUpperCase();
+  const cached = lotSizeCache.get(sym);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  return LOT_SIZES[sym] || 65;
 }
 
 /**
- * Calculates accurate Indian F&O frictions (STT 0.10% on sell, ₹20 brokerage, 18% GST, 0.20% slippage).
+ * Calculates accurate Indian F&O round-trip frictions (STT 0.10% on sell,
+ * stamp duty 0.003% on buy, SEBI turnover fee, ₹20 brokerage, 18% GST, 0.20% slippage).
  */
 export function calculateFnoFrictions(entryPrem: number, exitPrem: number, qty: number) {
+  const buyTurnover = entryPrem * qty;
   const sellTurnover = exitPrem * qty;
-  const totalTurnover = (entryPrem + exitPrem) * qty;
+  const totalTurnover = buyTurnover + sellTurnover;
 
   // STT: 0.10% charged on SELL side of options premium (post Oct 1, 2024).
   const stt = Number((sellTurnover * 0.0010).toFixed(2));
+  const stampDuty = Number((buyTurnover * 0.00003).toFixed(2)); // 0.003% on buy side only
+  const sebiFee = Number((totalTurnover * 0.0000001).toFixed(2)); // ~₹10/crore turnover
   const brokerage = 40; // ₹20 entry + ₹20 exit
   const exchange = Number((totalTurnover * 0.0005).toFixed(2)); // ~0.05% turnover
   const gst = Number(((brokerage + exchange) * 0.18).toFixed(2));
   const slippage = Number((totalTurnover * 0.0020).toFixed(2)); // 0.20% realistic slippage
-  const totalFriction = Number((stt + brokerage + gst + exchange + slippage).toFixed(2));
+  const totalFriction = Number((stt + stampDuty + sebiFee + brokerage + gst + exchange + slippage).toFixed(2));
 
-  return { stt, brokerage, gst, exchange, slippage, totalFriction };
+  return { stt, stampDuty, sebiFee, brokerage, gst, exchange, slippage, totalFriction };
 }
 
 /**
@@ -741,6 +768,11 @@ export async function seedStandardStrategies(
   market: any,
   paper: any
 ): Promise<number> {
+  // Warm the real lot-size cache for every watchlist symbol on every boot —
+  // before the early-return below, so a restart with strategies already
+  // seeded (the normal case) still primes it for the autonomous scanner's
+  // first strategy build, not just a fresh seed.
+  await Promise.all(Object.keys(INDEX_INSTRUMENTS).map((sym) => warmLotSizeCache(client, sym)));
   try {
     const existing = await listPaperStrategies();
     if (existing && existing.length >= 4) return 0;

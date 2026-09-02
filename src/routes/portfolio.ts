@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import {
-  listPaperPositions, listPaperOrders, getPaperWallet, resetPaperWallet, executePaperOrder,
+  listPaperPositions, listPaperOrders, getPaperWallet, resetPaperWallet,
   closePaperPosition, listPaperStrategies, createPaperStrategy, updatePaperStrategyStatus,
+  defaultMarginResolver, adjustWalletMargin,
 } from '../db';
 import type { MarketDataService } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
@@ -119,36 +120,31 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       if (!symbol || !quantity || !transactionType) {
         return res.status(400).json({ error: 'symbol, quantity, and transactionType are required' });
       }
-
-      // Kill switch / EOD window gate applies to manual orders too.
-      const gate = risk?.canTrade();
-      if (gate && !gate.allowed) {
-        return res.status(423).json({ error: `Order blocked by risk engine: ${gate.reason}` });
+      if (!paper) {
+        return res.status(503).json({ error: 'Paper execution engine not available' });
       }
 
-      // Resolve fill price: explicit LIMIT price, else live LTP.
-      let fillPrice = Number(price || 0);
-      if (!fillPrice) {
-        const ltp = market.getLtp(securityId || '0') ?? market.getLtp(String(symbol));
-        if (!ltp) {
-          return res.status(422).json({
-            error: `No live LTP for ${symbol}${securityId ? ` (security ${securityId})` : ''} — provide an explicit price or wait for the market data feed`,
-          });
-        }
-        fillPrice = ltp;
-      }
-
-      const result = await executePaperOrder({
-        symbol,
-        securityId,
-        exchangeSegment,
-        quantity: Number(quantity),
-        transactionType,
-        price: fillPrice,
-        orderType: orderType || 'MARKET',
-        productType: productType || 'INTRADAY',
+      // Route through PaperExecutionEngine so manual orders get the same
+      // risk gate, LTP/LIMIT marketability check, slippage, latency, and
+      // margin/fee handling as every other paper fill — no second path.
+      const result = await paper.placeOrder({
+        correlation_id: `manual_${Date.now().toString(36)}`,
+        intent_id: 'manual_order',
+        params: {
+          security_id: securityId || '0',
+          symbol,
+          quantity: Number(quantity),
+          transaction_type: transactionType,
+          order_type: orderType || 'MARKET',
+          exchange_segment: exchangeSegment || 'NSE_FNO',
+          product_type: productType || 'INTRADAY',
+          price: Number(price || 0),
+        },
       });
-      eventBus.emit('order', { kind: 'fill', is_paper: true, symbol: String(symbol).toUpperCase(), fillPrice: result.fillPrice, quantity: Number(quantity), correlationId: result.orderId, source: 'manual' });
+      if (result.status === 'REJECTED') {
+        return res.status(422).json({ error: result.reason });
+      }
+      eventBus.emit('order', { kind: 'fill', is_paper: true, symbol: String(symbol).toUpperCase(), fillPrice: result.fill_price, quantity: Number(quantity), correlationId: result.correlation_id, source: 'manual' });
       res.json(result);
     } catch (e: any) {
       res.status(422).json({ error: e.message });
@@ -211,27 +207,69 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       if (gate && !gate.allowed) {
         return res.status(423).json({ error: `Deployment blocked by risk engine: ${gate.reason}` });
       }
+      if (!paper) {
+        return res.status(503).json({ error: 'Paper execution engine not available' });
+      }
       const strategyId = `s_${Date.now().toString(36)}`;
-      let filled = 0;
-      const legsWithPx = [];
-      for (const leg of legs || []) {
-        // Price each leg from the live feed when possible.
+
+      // Price every leg up front so a multi-leg strategy's combined margin
+      // (with hedge benefit) can be resolved before any leg fills.
+      const pricedLegs = (legs || []).map((leg: any) => {
         const liveLtp = market.getLtp(leg.securityId || '0');
         const legPrice = liveLtp || Number(leg.bAvg || leg.sAvg || leg.price || 0);
-        if (!legPrice) {
-          eventBus.log('WARN', `Strategy ${name}: leg ${leg.instrument} has no live price — leg skipped`, 'portfolio');
+        return { leg, legPrice };
+      }).filter((p: any) => {
+        if (!p.legPrice) eventBus.log('WARN', `Strategy ${name}: leg ${p.leg.instrument} has no live price — leg skipped`, 'portfolio');
+        return p.legPrice > 0;
+      });
+      if (pricedLegs.length === 0) {
+        return res.status(422).json({ error: 'No leg could be priced from the live market feed — strategy not deployed' });
+      }
+
+      let combinedMargin: number | null = null;
+      if (pricedLegs.length > 1) {
+        try {
+          const resp: any = await (client as any).marginCalculator.calculateMulti(
+            pricedLegs.map(({ leg, legPrice }: any) => ({
+              exchangeSegment: leg.exchangeSegment || 'NSE_FNO',
+              productType: 'INTRADAY',
+              transactionType: leg.side,
+              securityId: leg.securityId,
+              quantity: leg.qty,
+              price: legPrice,
+            })),
+          );
+          const total = Number(resp?.totalMargin ?? resp?.data?.totalMargin);
+          if (total > 0) combinedMargin = total;
+        } catch { /* hedge-netted margin unavailable — each leg blocks its own standalone margin */ }
+      }
+
+      const usedMarginBefore = (await getPaperWallet()).usedMargin;
+      let filled = 0;
+      const legsWithPx = [];
+      for (const { leg, legPrice } of pricedLegs) {
+        // Route through PaperExecutionEngine — same risk/margin/fee/slippage
+        // handling as every other paper fill, no second path.
+        const result = await paper.placeOrder({
+          correlation_id: `${strategyId}_${leg.instrument}`,
+          intent_id: strategyId,
+          params: {
+            security_id: leg.securityId || '0',
+            symbol: leg.instrument,
+            quantity: leg.qty,
+            transaction_type: leg.side,
+            order_type: 'MARKET',
+            exchange_segment: leg.exchangeSegment || 'NSE_FNO',
+            product_type: 'INTRADAY',
+            price: legPrice,
+          },
+        });
+        if (result.status !== 'TRADED') {
+          eventBus.log('WARN', `Strategy ${name}: leg ${leg.instrument} rejected — ${result.reason}`, 'portfolio');
           continue;
         }
-        await executePaperOrder({
-          symbol: leg.instrument,
-          securityId: leg.securityId,
-          transactionType: leg.side,
-          quantity: leg.qty,
-          price: legPrice,
-          correlationId: strategyId,
-        });
         filled++;
-        legsWithPx.push({ ...leg, ltp: legPrice });
+        legsWithPx.push({ ...leg, ltp: result.fill_price });
         // Keep tracking this instrument for mark-to-market.
         if (leg.securityId) {
           market.addInstruments([{ securityId: String(leg.securityId), exchangeSegment: leg.exchangeSegment || 'NSE_FNO' }]);
@@ -240,9 +278,20 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       if (filled === 0) {
         return res.status(422).json({ error: 'No leg could be priced from the live market feed — strategy not deployed' });
       }
-      await createPaperStrategy({ id: strategyId, name, symbol, type, lots, legs: legsWithPx });
-      eventBus.log('TRADE', `Strategy "${name}" deployed (${filled} leg(s) filled at live prices)`, 'portfolio');
-      res.json({ status: 'ok', strategyId, legsFilled: filled });
+
+      // Release the hedge benefit: legs above each blocked their own
+      // standalone margin, but a hedged combo needs less than the sum.
+      let marginHedgeCredit = 0;
+      if (combinedMargin != null) {
+        const usedMarginAfter = (await getPaperWallet()).usedMargin;
+        const standaloneAdded = usedMarginAfter - usedMarginBefore;
+        marginHedgeCredit = Math.max(0, Number((standaloneAdded - combinedMargin).toFixed(2)));
+        if (marginHedgeCredit > 0) await adjustWalletMargin(marginHedgeCredit);
+      }
+
+      await createPaperStrategy({ id: strategyId, name, symbol, type, lots, legs: legsWithPx, marginHedgeCredit });
+      eventBus.log('TRADE', `Strategy "${name}" deployed (${filled} leg(s) filled at live prices${marginHedgeCredit > 0 ? `, ₹${marginHedgeCredit.toFixed(2)} hedge margin released` : ''})`, 'portfolio');
+      res.json({ status: 'ok', strategyId, legsFilled: filled, marginHedgeCredit });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -265,6 +314,9 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       const strat = strategies.find((s) => s.id === id);
       if (!strat) return res.status(404).json({ error: 'Strategy not found' });
 
+      if (!paper) {
+        return res.status(503).json({ error: 'Paper execution engine not available' });
+      }
       const gate = risk?.canTrade();
       if (gate && !gate.allowed) {
         return res.status(423).json({ error: `Execution blocked by risk engine: ${gate.reason}` });
@@ -276,39 +328,25 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
         const legPrice = liveLtp || Number(leg.bAvg || leg.sAvg || leg.price || 0);
         if (!legPrice) continue;
 
-        if (paper) {
-          await paper.placeOrder({
-            correlation_id: `${strat.id}_${leg.optionType || 'OPT'}_${leg.strike || '0'}`,
-            intent_id: `trigger_${strat.id}`,
-            params: {
-              security_id: leg.securityId,
-              symbol: leg.instrument,
-              quantity: leg.qty,
-              transaction_type: leg.side,
-              order_type: 'MARKET',
-              exchange_segment: leg.exchangeSegment || 'NSE_FNO',
-              product_type: 'INTRADAY',
-              price: legPrice,
-            },
-            risk_limits: {
-              stop_loss: leg.stopLoss,
-              target: leg.target,
-              trailing_stop: leg.trailingStop,
-            },
-          });
-        } else {
-          await executePaperOrder({
+        await paper.placeOrder({
+          correlation_id: `${strat.id}_${leg.optionType || 'OPT'}_${leg.strike || '0'}`,
+          intent_id: `trigger_${strat.id}`,
+          params: {
+            security_id: leg.securityId,
             symbol: leg.instrument,
-            securityId: leg.securityId,
-            transactionType: leg.side,
             quantity: leg.qty,
+            transaction_type: leg.side,
+            order_type: 'MARKET',
+            exchange_segment: leg.exchangeSegment || 'NSE_FNO',
+            product_type: 'INTRADAY',
             price: legPrice,
-            correlationId: strat.id,
-            stopLoss: leg.stopLoss,
+          },
+          risk_limits: {
+            stop_loss: leg.stopLoss,
             target: leg.target,
-            trailingStop: typeof leg.trailingStop === 'object' ? leg.trailingStop.distance : leg.trailingStop,
-          });
-        }
+            trailing_stop: leg.trailingStop,
+          },
+        });
         filled++;
       }
 
@@ -326,6 +364,8 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       const strategies = await listPaperStrategies();
       const strat = strategies.find((s) => s.id === id);
       if (strat) {
+        // updatePaperStrategyStatus('STOPPED') below reverses any
+        // hedge-margin credit exactly once — don't duplicate it here.
         for (const leg of strat.legs) {
           const positions = await listPaperPositions();
           const pos = positions.find((p) => p.tradingSymbol === leg.instrument);
@@ -351,13 +391,17 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
         return res.json(resp.data || resp);
       } catch (e: any) {
         // DhanHQ margin calculator unavailable — report the estimate AND
-        // the reason, instead of silently pretending it was real.
+        // the reason, instead of silently pretending it was real. Uses the
+        // same conservative fallback as paper order execution (db.ts):
+        // BUY = full premium (correct, no leverage on long options), SELL =
+        // a conservative multiple, since SPAN+exposure isn't a fixed
+        // fraction of premium and this only runs if the real API fails.
         let total = 0;
         for (const it of items) {
           const px = Number(it.price || 0);
           const qty = Number(it.quantity || 0);
           if (px > 0 && qty > 0) {
-            total += it.transactionType === 'SELL' ? px * qty * 0.18 : px * qty;
+            total += await defaultMarginResolver({ side: it.transactionType, securityId: String(it.securityId || '0'), exchangeSegment: it.exchangeSegment || 'NSE_FNO', productType: it.productType || 'INTRADAY', quantity: qty, price: px });
           }
         }
         return res.json({

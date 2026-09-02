@@ -5,6 +5,7 @@ import { getOptionsAnalysisCache, saveOptionsAnalysisCache } from '../db';
 import { eventBus } from '../services/eventBus';
 import { analyzeOptionChain, toChainRowView } from '../services/optionsAnalytics';
 import { nearestIndexExpiry } from '../services/marketHours';
+import { warmLotSizeCache } from '../services/strategyConstructor';
 
 /**
  * Market data routes — every response is sourced from live DhanHQ data.
@@ -40,6 +41,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
       const spotSnap = market.getQuote(securityIdFor(symbol));
       const spot = spotSnap?.ltp || 0;
       subscribeAtmOptionLegs(market, symbol, rows, spot);
+      void warmLotSizeCache(client, symbol).catch(() => {});
       res.json({ strikes: toChainRowView(rows), underlying: symbol, expiry, source: 'dhanhq' });
     } catch (e: any) {
       res.status(502).json({ error: `Option chain unavailable: ${e.message}`, strikes: [], underlying: req.params.symbol?.toUpperCase() });

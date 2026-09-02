@@ -5,6 +5,7 @@ import type { MarketDataService } from './marketData';
 import {
   getPaperWallet, listPaperPositions, getTodayOrderStats,
   pushAlert, getRiskState, saveRiskState, closeAllPaperPositions,
+  listPaperStrategies, updatePaperStrategyStatus,
 } from '../db';
 
 /**
@@ -135,6 +136,12 @@ export class RiskEngine {
         if (c && c.status === 'TRADED') {
           eventBus.emit('order', { kind: 'kill_switch_fill', orderId: c.orderId, symbol: c.symbol, side: c.side, fillPrice: c.fillPrice });
         }
+      }
+      // Stop every RUNNING strategy too — this also reverses any multi-leg
+      // hedge-margin credit (see updatePaperStrategyStatus), which the raw
+      // position closes above don't know about.
+      for (const s of await listPaperStrategies()) {
+        if (s.status === 'RUNNING') await updatePaperStrategyStatus(s.id, 'STOPPED');
       }
     } catch (e: any) {
       details.error = e.message;

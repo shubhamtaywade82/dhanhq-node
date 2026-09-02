@@ -151,7 +151,7 @@ function StrategyCard({ strategy: s, onExecute, onPause, onResume, onStop }: { s
       <div className="text-[9px] font-mono text-muted uppercase tracking-wider mb-1.5 font-semibold">Legs Breakdown</div>
       <div className="space-y-1 mb-4">
         {legs.map((l, i) => {
-          const legPnl = (l.ltp - (l.bAvg || l.sAvg || l.ltp)) * l.qty * (l.side === 'SELL' ? -1 : 1);
+          const legPnl = l.pnl ?? 0;
           return (
             <div key={i} className="flex items-center justify-between text-[10px] font-mono p-1.5 rounded bg-surface-50 border border-border">
               <div className="flex items-center gap-2">

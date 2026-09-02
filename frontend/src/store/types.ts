@@ -20,6 +20,7 @@ export interface OptionLeg {
   gamma: number;
   theta: number;
   vega: number;
+  pnl?: number;
 }
 
 export interface Strategy {

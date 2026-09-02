@@ -1,6 +1,6 @@
 import type { DhanClient, PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
 import { redisPublisher } from '../auth';
-import { executePaperOrder } from '../db';
+import { executePaperOrder, defaultMarginResolver, type MarginResolver } from '../db';
 import { eventBus } from '../services/eventBus';
 import type { MarketDataService } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
@@ -13,6 +13,12 @@ import type { RiskEngine } from '../services/riskEngine';
  * model (ticks adverse to the aggressor) is applied on top of the real
  * price. If no live price is known for the instrument the order is
  * REJECTED, exactly like a broker would reject an unpriceable order.
+ *
+ * LIMIT orders never rest — there is no order book (deliberately: paper
+ * trading here only ever deals in liquid ATM CE/PE, so immediate-fill is
+ * realistic). A LIMIT is filled only if it is already marketable against
+ * the live LTP; otherwise it is REJECTED rather than filled at an
+ * arbitrary price.
  */
 export class PaperExecutionEngine {
   private client: DhanClient;
@@ -32,6 +38,26 @@ export class PaperExecutionEngine {
     this.slippageTicks = slippageTicks;
   }
 
+  /** Real DhanHQ margin calculator — the same one the live margin endpoint
+   * uses — so paper margin (long premium and short SPAN+exposure alike)
+   * tracks the actual broker's numbers instead of a hand-rolled formula.
+   * Falls back to the conservative default only if the call itself fails. */
+  private resolveMargin: MarginResolver = async (params) => {
+    try {
+      const resp: any = await (this.client as any).marginCalculator.calculateSingle({
+        exchangeSegment: params.exchangeSegment,
+        productType: params.productType,
+        transactionType: params.side,
+        securityId: params.securityId,
+        quantity: params.quantity,
+        price: params.price,
+      });
+      const total = Number(resp?.totalMargin ?? resp?.data?.totalMargin);
+      if (total > 0) return total;
+    } catch { /* DhanHQ margin API unavailable — use the conservative default */ }
+    return defaultMarginResolver(params);
+  };
+
   async placeOrder(intent: any): Promise<any> {
     const { correlation_id, intent_id, params, risk_limits } = intent;
     const { security_id, quantity, transaction_type, order_type = 'MARKET', price = 0 } = params;
@@ -45,10 +71,23 @@ export class PaperExecutionEngine {
       return { status: 'REJECTED', reason: gate.reason };
     }
 
-    // Resolve the fill price from the live market.
-    let referencePrice = price > 0 ? Number(price) : this.market.getLtp(security_id);
+    // Resolve the live LTP — needed for MARKET pricing and to check whether
+    // a LIMIT order is marketable.
+    const liveLtp = this.market.getLtp(security_id);
+    let referencePrice: number | null;
     if (order_type === 'MARKET') {
-      referencePrice = this.market.getLtp(security_id) ?? (price > 0 ? Number(price) : null);
+      referencePrice = liveLtp ?? (price > 0 ? Number(price) : null);
+    } else if (liveLtp == null || price <= 0) {
+      referencePrice = null;
+    } else {
+      const marketable = transaction_type === 'BUY' ? liveLtp <= price : liveLtp >= price;
+      if (!marketable) {
+        const reason = `LIMIT price ${price} not marketable vs LTP ${liveLtp}`;
+        eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${reason}`, 'paper_engine');
+        eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason });
+        return { status: 'REJECTED', reason };
+      }
+      referencePrice = transaction_type === 'BUY' ? Math.min(liveLtp, price) : Math.max(liveLtp, price);
     }
     if (referencePrice == null || referencePrice <= 0) {
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: no live LTP for ${symbol} (security ${security_id})`, 'paper_engine');
@@ -82,7 +121,7 @@ export class PaperExecutionEngine {
       stopLoss: risk_limits?.stop_loss ? Number(risk_limits.stop_loss) : undefined,
       target: risk_limits?.target ? Number(risk_limits.target) : undefined,
       trailingStop: trailDist,
-    });
+    }, this.resolveMargin);
 
     const fillPayload = {
       intent_id,
@@ -93,6 +132,7 @@ export class PaperExecutionEngine {
       security_id,
       symbol,
       latency_ms: result.latencyMs,
+      charges: result.charges,
       filled_at: new Date().toISOString(),
     };
 
