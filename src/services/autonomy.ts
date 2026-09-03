@@ -167,7 +167,11 @@ export class AutonomyEngine {
       const pos = positions.find((x: any) => String(x.securityId) === String(p.securityId) && x.netQty !== 0);
       if (pos) {
         const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
-        const res = await closePaperPosition(pos.tradingSymbol, ltp);
+        // A triggered stop (hard SL or trailing) crosses the spread on the
+        // adverse move that fired it — priced with extra slippage vs. a
+        // target hit or a manual close, which fill more like a resting order.
+        const kind = p.reason === 'stop_loss' || p.reason === 'trailing_stop' ? 'STOP' : 'EXIT';
+        const res = await closePaperPosition(pos.tradingSymbol, ltp, undefined, kind);
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         eventBus.log('TRADE', `Auto-exit ${pos.tradingSymbol}: ${res.status} @ ₹${ltp} (${p.reason})`, 'autonomy');
         await this.closeParentStrategyIfFlat(pos.tradingSymbol);

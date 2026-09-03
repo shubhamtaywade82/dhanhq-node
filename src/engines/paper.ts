@@ -2,6 +2,7 @@ import type { DhanClient, PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
 import { redisPublisher } from '../auth';
 import { executePaperOrder, defaultMarginResolver, type MarginResolver } from '../db';
 import { eventBus } from '../services/eventBus';
+import { applyFillSlippage } from '../services/fillModel';
 import type { MarketDataService } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 
@@ -9,10 +10,12 @@ import type { RiskEngine } from '../services/riskEngine';
  * Paper execution engine.
  *
  * Fills are priced from the LIVE market LTP served by MarketDataService
- * (DhanHQ binary WS or REST quotes) — never from a constant. A slippage
- * model (ticks adverse to the aggressor) is applied on top of the real
- * price. If no live price is known for the instrument the order is
- * REJECTED, exactly like a broker would reject an unpriceable order.
+ * (DhanHQ binary WS or REST quotes) — never from a constant. A premium-
+ * scaled spread model (fillModel.ts) is applied on top of the real price,
+ * shared with every exit path (db.ts closePaperPosition) so entries and
+ * exits pay a consistent, realistic cost rather than drifting apart. If no
+ * live price is known for the instrument the order is REJECTED, exactly
+ * like a broker would reject an unpriceable order.
  *
  * LIMIT orders never rest — there is no order book (deliberately: paper
  * trading here only ever deals in liquid ATM CE/PE, so immediate-fill is
@@ -26,16 +29,13 @@ export class PaperExecutionEngine {
   private market: MarketDataService;
   private risk: RiskEngine;
   private latencyMs: number;
-  private slippageTicks: number;
-  private tickSize = 0.05;
 
-  constructor(client: DhanClient, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine, latencyMs = 50, slippageTicks = 1) {
+  constructor(client: DhanClient, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine, latencyMs = 50) {
     this.client = client;
     this.monitor = monitor;
     this.market = market;
     this.risk = risk;
     this.latencyMs = latencyMs;
-    this.slippageTicks = slippageTicks;
   }
 
   /** Real DhanHQ margin calculator — the same one the live margin endpoint
@@ -102,9 +102,7 @@ export class PaperExecutionEngine {
       await new Promise((resolve) => setTimeout(resolve, this.latencyMs));
     }
 
-    const fillPrice = transaction_type === 'BUY'
-      ? referencePrice + this.slippageTicks * this.tickSize
-      : referencePrice - this.slippageTicks * this.tickSize;
+    const fillPrice = applyFillSlippage(referencePrice, transaction_type, 'ENTRY');
 
     const trailDist = typeof risk_limits?.trailing_stop === 'object'
       ? Number(risk_limits.trailing_stop.distance)

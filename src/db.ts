@@ -1,6 +1,9 @@
 import { Pool } from 'pg';
 import { moduleLogger } from './lib/logger';
 import { marketClock } from './services/marketHours';
+import { eventBus } from './services/eventBus';
+import { applyFillSlippage, type FillKind } from './services/fillModel';
+import { redisPublisher } from './auth';
 
 const log = moduleLogger('db');
 
@@ -793,22 +796,54 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
   };
 }
 
-export async function closePaperPosition(symbol: string, currentLtp?: number, marginResolver?: MarginResolver) {
+/**
+ * Closes an open paper position at a slipped fill price and emits the same
+ * 'order' fill telemetry as PaperExecutionEngine.placeOrder.
+ *
+ * Every exit path in the system — autonomy's auto-exit on a PositionMonitor
+ * signal, strategy loss-limit stops, EOD square-off, the kill switch, and
+ * the manual/strategy close routes — calls this function directly rather
+ * than going through PaperExecutionEngine. It used to fill at the exact
+ * reference price with zero slippage and emit nothing onto the event bus,
+ * so every exit was invisible to the risk engine's on-fill re-evaluation,
+ * the frontend's live Orders/Positions feed, and the Redis fill bridge —
+ * only entries participated in any of that. `kind` lets a caller that knows
+ * this is a triggered stop (vs. a target/manual close) price the extra
+ * adverse-crossing cost a real stop pays; callers that don't care default
+ * to the plain exit cost.
+ */
+export async function closePaperPosition(symbol: string, currentLtp?: number, marginResolver?: MarginResolver, kind: FillKind = 'EXIT') {
   const sym = symbol.toUpperCase();
   const pos = mem.positions.get(sym);
   if (!pos || Number(pos.net_qty) === 0) return { status: 'noop', message: 'No open position found' };
   const netQty = Number(pos.net_qty);
-  return executePaperOrder({
+  const transactionType: 'BUY' | 'SELL' = netQty > 0 ? 'SELL' : 'BUY';
+  const referencePrice = currentLtp || Number(pos.ltp || (netQty > 0 ? pos.buy_avg : pos.sell_avg));
+  const fillPrice = applyFillSlippage(referencePrice, transactionType, kind);
+
+  const result: any = await executePaperOrder({
     symbol: sym,
     securityId: pos.security_id,
     exchangeSegment: pos.exchange_segment,
-    transactionType: netQty > 0 ? 'SELL' : 'BUY',
+    transactionType,
     orderType: 'MARKET',
     productType: pos.product_type,
     quantity: Math.abs(netQty),
-    price: currentLtp || Number(pos.ltp || (netQty > 0 ? pos.buy_avg : pos.sell_avg)),
+    price: fillPrice,
     correlationId: `close_${sym}_${Date.now()}`,
   }, marginResolver);
+
+  if (result.status === 'TRADED') {
+    const fillPayload = {
+      correlation_id: result.orderId, is_paper: true, fill_price: result.fillPrice,
+      quantity: result.quantity, security_id: pos.security_id, symbol: sym,
+      latency_ms: result.latencyMs, charges: result.charges, filled_at: new Date().toISOString(),
+    };
+    eventBus.log('TRADE', `Paper close ${transactionType} ${result.quantity} ${sym} @ ₹${result.fillPrice.toFixed(2)}`, 'paper_engine');
+    eventBus.emit('order', { kind: 'fill', ...fillPayload });
+    redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
+  }
+  return result;
 }
 
 /** Mark open positions to market — pure in-memory, called every autonomy

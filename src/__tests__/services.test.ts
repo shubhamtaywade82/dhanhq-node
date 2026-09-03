@@ -80,8 +80,9 @@ describe('Paper execution engine — real-LTP pricing policy', () => {
         params: { security_id: '44000', quantity: 50, transaction_type: 'BUY', order_type: 'MARKET', price: 555 },
       });
       expect(result.status).toBe('TRADED');
-      // BUY slippage = +1 tick (0.05) over the live LTP of 100, NOT price 555.
-      expect(result.fill_price).toBeCloseTo(100.05, 2);
+      // BUY slippage = premium-scaled half-spread over the live LTP of 100
+      // (100 falls in the <300 bracket: half-spread 0.50), NOT price 555.
+      expect(result.fill_price).toBeCloseTo(100.5, 2);
     } finally {
       jest.useRealTimers();
     }
@@ -190,7 +191,7 @@ describe('Money-path math — fees, margin, sign flips', () => {
         params: { security_id: '44000', quantity: 50, transaction_type: 'BUY', order_type: 'LIMIT', price: 105 }, // BUY limit above LTP — marketable
       });
       expect(marketable.status).toBe('TRADED');
-      expect((marketable as any).fill_price).toBeLessThanOrEqual(100.05); // filled at the better of {LTP, limit} + slippage, not at 105
+      expect((marketable as any).fill_price).toBeLessThanOrEqual(100.5); // filled at the better of {LTP, limit} + slippage, not at 105
     } finally {
       jest.useRealTimers();
     }
