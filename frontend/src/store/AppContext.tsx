@@ -11,6 +11,154 @@ interface Toast {
   type: ToastType;
 }
 
+/** Side effects an envelope wants fired after the batch it arrived in is
+ * applied — accumulated across a whole rAF batch and coalesced to at most
+ * one call each, rather than once per envelope (a batch of several fills
+ * in one frame previously meant several redundant refreshPortfolio calls). */
+interface PendingEffects {
+  refreshPortfolio: boolean;
+  refreshControlState: boolean;
+}
+
+/**
+ * Pure state transition for one backend envelope — no setState call of its
+ * own. Every WS message used to call setState directly in the hook's
+ * onmessage handler, one React commit per envelope; under DhanHQ's 'full'
+ * feed mode with option legs subscribed this could re-render the tree
+ * hundreds of times a second. AppProvider now buffers incoming envelopes
+ * and reduces a whole batch through this function in a single setState per
+ * animation frame (see onEnvelope below) — this function is what makes
+ * that reduction possible without duplicating the per-channel logic.
+ */
+function applyEnvelope(prev: AppState, env: Envelope, effects: PendingEffects): AppState {
+  switch (env.channel) {
+    case 'tick': {
+      const p = env.payload || {};
+      const ltp = Number(p.data?.ltp ?? p.ltp ?? 0);
+      if (!ltp || ltp <= 0) return prev;
+      const secId = String(p.securityId || p.data?.securityId || '');
+      const sym = p.symbol || (secId === '13' ? 'NIFTY' : secId === '25' ? 'BANKNIFTY' : secId === '51' ? 'SENSEX' : secId === '26' ? 'INDIAVIX' : secId === '27' ? 'FINNIFTY' : secId === '442' ? 'MIDCPNIFTY' : undefined);
+
+      const nextIndices = sym ? {
+        ...prev.indices,
+        [sym]: {
+          ltp,
+          change: p.data?.change ?? 0,
+          pct: p.data?.pctChange ?? p.data?.pct ?? 0,
+          high: p.data?.high ?? 0,
+          low: p.data?.low ?? 0,
+          open: p.data?.open ?? 0,
+          prevClose: p.data?.prevClose ?? 0,
+          spot: ltp,
+        },
+      } : prev.indices;
+
+      const nextPositions = secId ? prev.positions.map((pos) => {
+        if (String(pos.securityId) === secId) {
+          const net = Number(pos.netQty ?? pos.net_qty ?? 0);
+          const buyAvg = Number(pos.buyAvg ?? pos.buy_avg ?? 0);
+          const sellAvg = Number(pos.sellAvg ?? pos.sell_avg ?? 0);
+          const unrealized = net !== 0 ? (net > 0 ? (ltp - buyAvg) * net : (sellAvg - ltp) * Math.abs(net)) : 0;
+          const realized = Number(pos.realizedProfit ?? pos.realized_pnl ?? 0);
+          const pnl = Number((realized + unrealized).toFixed(2));
+          return { ...pos, ltp, pnl, unrealizedPnl: unrealized, unrealizedProfit: unrealized };
+        }
+        return pos;
+      }) : prev.positions;
+
+      const nextQuotes = secId ? {
+        ...(prev.quotes || {}),
+        [secId]: {
+          ltp,
+          oi: p.data?.oi,
+          volume: p.data?.volume,
+          change: p.data?.change,
+          pct: p.data?.pctChange,
+        },
+      } : prev.quotes;
+
+      return { ...prev, indices: nextIndices, positions: nextPositions, quotes: nextQuotes };
+    }
+    case 'log': {
+      const p = env.payload || {};
+      const id = env.ts + prev.logIdCounter;
+      const logs = [...prev.logs, { id, time: p.time || new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', message: p.message || '', source: p.source || 'system', reqId: p.reqId || '-' }];
+      return { ...prev, logs: logs.length > 400 ? logs.slice(-400) : logs, logIdCounter: prev.logIdCounter + 1 };
+    }
+    case 'alert': {
+      const p = env.payload || {};
+      const alert = { id: env.ts + prev.alertIdCounter, time: new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', msg: p.msg || p.message || '', read: false };
+      const alerts = [...prev.alerts, alert];
+      return { ...prev, alerts: alerts.length > 200 ? alerts.slice(-200) : alerts, alertIdCounter: prev.alertIdCounter + 1 };
+    }
+    case 'telemetry': {
+      const p = env.payload || {};
+      return {
+        ...prev,
+        telemetryEvents: [...prev.telemetryEvents.slice(-399), {
+          id: p.id || `ev_${env.ts}`,
+          agent: p.agent || 'planner',
+          type: p.type || 'ACT',
+          time: p.time || new Date().toLocaleTimeString('en-GB', { hour12: false }),
+          summary: p.summary,
+          tool: p.tool,
+          response: p.response,
+          duration: p.duration,
+        }],
+        agentTokens: prev.agentTokens + Math.ceil((p.summary || '').length / 4),
+        agentDhanCalls: prev.agentDhanCalls + (p.tool ? 1 : 0),
+      };
+    }
+    case 'risk': {
+      const p = env.payload || {};
+      return {
+        ...prev,
+        killed: !!p.killed,
+        live: !p.killed,
+        circuitBreakers: (p.breakers || []).map((b: any) => ({
+          rule: b.rule, threshold: b.threshold, current: b.current, state: b.state, action: b.action,
+        })),
+      };
+    }
+    case 'portfolio': {
+      const p = env.payload || {};
+      if (!p.positions) return prev;
+      return {
+        ...prev,
+        positions: p.positions,
+        funds: p.funds ? { ...prev.funds, ...p.funds } : prev.funds,
+      };
+    }
+    case 'order': {
+      const p = env.payload || {};
+      if (p.kind === 'fill') {
+        effects.refreshPortfolio = true;
+        effects.refreshControlState = true;
+      }
+      return prev;
+    }
+    case 'system': {
+      const p = env.payload || {};
+      if (p.type === 'connected' || p.type === 'pong') return prev;
+      if (p.type === 'kill_switch') {
+        effects.refreshPortfolio = true;
+        effects.refreshControlState = true;
+        return { ...prev, killed: p.state === 'ENGAGED', live: p.state !== 'ENGAGED' };
+      }
+      if (p.type === 'agent_run_complete') {
+        effects.refreshPortfolio = true;
+        return { ...prev, agentRunning: false };
+      }
+      if (p.type === 'autonomy') {
+        effects.refreshControlState = true;
+      }
+      return prev;
+    }
+    default:
+      return prev;
+  }
+}
+
 interface AppContextValue {
   state: AppState;
   setState: React.Dispatch<React.SetStateAction<AppState>>;
@@ -182,144 +330,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
   streamConnectedRef.current = streamConnected;
 
   // ── WS envelope dispatch ────────────────────────────────────────────
+  // Envelopes are buffered and reduced through applyEnvelope() in a single
+  // setState per animation frame, rather than once per envelope. The
+  // backend already conflates ticks server-side (~10Hz per instrument,
+  // see BUS-01/02), but a burst of several envelopes across ticks/orders/
+  // logs can still arrive in the same JS turn — this makes one React
+  // commit per frame the actual guarantee, not an accident of batching.
+  const pendingEnvelopes = useRef<Envelope[]>([]);
+  const frameRef = useRef<number | null>(null);
+
   const onEnvelope = useCallback((env: Envelope) => {
-    switch (env.channel) {
-      case 'tick': {
-        const p = env.payload || {};
-        const ltp = Number(p.data?.ltp ?? p.ltp ?? 0);
-        if (!ltp || ltp <= 0) break;
-        const secId = String(p.securityId || p.data?.securityId || '');
-        const sym = p.symbol || (secId === '13' ? 'NIFTY' : secId === '25' ? 'BANKNIFTY' : secId === '51' ? 'SENSEX' : secId === '26' ? 'INDIAVIX' : secId === '27' ? 'FINNIFTY' : secId === '442' ? 'MIDCPNIFTY' : undefined);
-
-        setState((prev) => {
-          const nextIndices = sym ? {
-            ...prev.indices,
-            [sym]: {
-              ltp,
-              change: p.data?.change ?? 0,
-              pct: p.data?.pctChange ?? p.data?.pct ?? 0,
-              high: p.data?.high ?? 0,
-              low: p.data?.low ?? 0,
-              open: p.data?.open ?? 0,
-              prevClose: p.data?.prevClose ?? 0,
-              spot: ltp,
-            },
-          } : prev.indices;
-
-          const nextPositions = secId ? prev.positions.map((pos) => {
-            if (String(pos.securityId) === secId) {
-              const net = Number(pos.netQty ?? pos.net_qty ?? 0);
-              const buyAvg = Number(pos.buyAvg ?? pos.buy_avg ?? 0);
-              const sellAvg = Number(pos.sellAvg ?? pos.sell_avg ?? 0);
-              const unrealized = net !== 0 ? (net > 0 ? (ltp - buyAvg) * net : (sellAvg - ltp) * Math.abs(net)) : 0;
-              const realized = Number(pos.realizedProfit ?? pos.realized_pnl ?? 0);
-              const pnl = Number((realized + unrealized).toFixed(2));
-              return { ...pos, ltp, pnl, unrealizedPnl: unrealized, unrealizedProfit: unrealized };
-            }
-            return pos;
-          }) : prev.positions;
-
-          const nextQuotes = secId ? {
-            ...(prev.quotes || {}),
-            [secId]: {
-              ltp,
-              oi: p.data?.oi,
-              volume: p.data?.volume,
-              change: p.data?.change,
-              pct: p.data?.pctChange,
-            },
-          } : prev.quotes;
-
-          return { ...prev, indices: nextIndices, positions: nextPositions, quotes: nextQuotes };
-        });
-        break;
-      }
-      case 'log': {
-        const p = env.payload || {};
-        setState((prev) => {
-          const id = env.ts + prev.logIdCounter;
-          const logs = [...prev.logs, { id, time: p.time || new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', message: p.message || '', source: p.source || 'system', reqId: p.reqId || '-' }];
-          return { ...prev, logs: logs.length > 400 ? logs.slice(-400) : logs, logIdCounter: prev.logIdCounter + 1 };
-        });
-        break;
-      }
-      case 'alert': {
-        const p = env.payload || {};
-        setState((prev) => {
-          const alert = { id: env.ts + prev.alertIdCounter, time: new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', msg: p.msg || p.message || '', read: false };
-          const alerts = [...prev.alerts, alert];
-          return { ...prev, alerts: alerts.length > 200 ? alerts.slice(-200) : alerts, alertIdCounter: prev.alertIdCounter + 1 };
-        });
-        break;
-      }
-      case 'telemetry': {
-        const p = env.payload || {};
-        setState((prev) => ({
-          ...prev,
-          telemetryEvents: [...prev.telemetryEvents.slice(-399), {
-            id: p.id || `ev_${env.ts}`,
-            agent: p.agent || 'planner',
-            type: p.type || 'ACT',
-            time: p.time || new Date().toLocaleTimeString('en-GB', { hour12: false }),
-            summary: p.summary,
-            tool: p.tool,
-            response: p.response,
-            duration: p.duration,
-          }],
-          agentTokens: prev.agentTokens + Math.ceil((p.summary || '').length / 4),
-          agentDhanCalls: prev.agentDhanCalls + (p.tool ? 1 : 0),
-        }));
-        break;
-      }
-      case 'risk': {
-        const p = env.payload || {};
-        setState((prev) => ({
-          ...prev,
-          killed: !!p.killed,
-          live: !p.killed,
-          circuitBreakers: (p.breakers || []).map((b: any) => ({
-            rule: b.rule, threshold: b.threshold, current: b.current, state: b.state, action: b.action,
-          })),
-        }));
-        break;
-      }
-      case 'portfolio': {
-        const p = env.payload || {};
-        if (p.positions) {
-          setState((prev) => ({
-            ...prev,
-            positions: p.positions,
-            funds: p.funds ? { ...prev.funds, ...p.funds } : prev.funds,
-          }));
-        }
-        break;
-      }
-      case 'order': {
-        const p = env.payload || {};
-        if (p.kind === 'fill') {
-          void refreshPortfolio();
-          void refreshControlState();
-        }
-        break;
-      }
-      case 'system': {
-        const p = env.payload || {};
-        if (p.type === 'connected' || p.type === 'pong') break;
-        if (p.type === 'kill_switch') {
-          setState((prev) => ({ ...prev, killed: p.state === 'ENGAGED', live: p.state !== 'ENGAGED' }));
-          void refreshPortfolio();
-          void refreshControlState();
-        } else if (p.type === 'agent_run_complete') {
-          setState((prev) => ({ ...prev, agentRunning: false }));
-          void refreshPortfolio();
-        } else if (p.type === 'autonomy') {
-          // autonomy toggled from anywhere (this UI or headless)
-          void refreshControlState();
-        }
-        break;
-      }
-    }
+    pendingEnvelopes.current.push(env);
+    if (frameRef.current !== null) return;
+    frameRef.current = requestAnimationFrame(() => {
+      frameRef.current = null;
+      const batch = pendingEnvelopes.current;
+      pendingEnvelopes.current = [];
+      const effects: PendingEffects = { refreshPortfolio: false, refreshControlState: false };
+      setState((prev) => batch.reduce((acc, e) => applyEnvelope(acc, e, effects), prev));
+      if (effects.refreshPortfolio) void refreshPortfolio();
+      if (effects.refreshControlState) void refreshControlState();
+    });
   }, [refreshPortfolio, refreshControlState]);
+
+  useEffect(() => {
+    return () => {
+      if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+    };
+  }, []);
 
   const stream = useBackendStream(onEnvelope);
   useEffect(() => {
