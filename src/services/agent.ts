@@ -12,10 +12,9 @@ import {
   buildIronCondor, buildIronButterfly, buildCreditSpread, buildDebitSpread,
   buildStraddle, buildStrangle, buildOrbBuyingStrategy, buildOrb30mStrategy,
   buildVwapPullbackStrategy, evaluateStrategyBacktest, calculateCapitalAllocationLots, getLotSize,
-  type ConstructedStrategy
+  resolveNearestExpiry, type ConstructedStrategy
 } from './strategyConstructor';
 import { analyzeOptionsBehavior } from '../routes/market';
-import { nearestIndexExpiry } from './marketHours';
 
 export type AgentKey = 'planner' | 'analyst' | 'strategy' | 'execution' | 'risk' | 'critic';
 
@@ -232,7 +231,7 @@ export class AgentOrchestrator {
       for (const target of targets) {
         const inst = INDEX_INSTRUMENTS[target];
         if (!inst) continue;
-        const expiry = nearestIndexExpiry(target);
+        const expiry = await resolveNearestExpiry(this.client, target);
         const [ltpRes, chainRes] = await Promise.all([
           this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
           this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),

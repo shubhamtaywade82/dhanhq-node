@@ -4,8 +4,7 @@ import type { MarketDataService } from '../services/marketData';
 import { getOptionsAnalysisCache, saveOptionsAnalysisCache } from '../db';
 import { eventBus } from '../services/eventBus';
 import { analyzeOptionChain, toChainRowView } from '../services/optionsAnalytics';
-import { nearestIndexExpiry } from '../services/marketHours';
-import { warmLotSizeCache } from '../services/strategyConstructor';
+import { warmLotSizeCache, resolveNearestExpiry } from '../services/strategyConstructor';
 
 /**
  * Market data routes — every response is sourced from live DhanHQ data.
@@ -31,7 +30,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
   router.get('/option-chain/:symbol', async (req, res) => {
     try {
       const symbol = (req.params.symbol || 'NIFTY').toUpperCase();
-      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
+      const expiry = (req.query.expiry as string) || await resolveNearestExpiry(client, symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
         underlyingScrip: Number(securityIdFor(symbol)),
         underlyingSeg: 'IDX_I',
@@ -81,7 +80,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
   router.get('/greeks', async (req, res) => {
     try {
       const symbol = ((req.query.symbol as string) || 'NIFTY').toUpperCase();
-      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
+      const expiry = (req.query.expiry as string) || await resolveNearestExpiry(client, symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
         underlyingScrip: Number(securityIdFor(symbol)),
         underlyingSeg: 'IDX_I',
@@ -113,7 +112,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
     try {
       const symbol = (req.params.symbol || 'NIFTY').toUpperCase();
       const secId = securityIdFor(symbol);
-      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
+      const expiry = (req.query.expiry as string) || await resolveNearestExpiry(client, symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
         underlyingScrip: Number(secId), underlyingSeg: 'IDX_I', expiry,
       });

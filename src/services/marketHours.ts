@@ -29,7 +29,7 @@ export interface MarketClock {
  * 15:30 with minutes < 30 on the next check, e.g. 16:05 evaluated as
  * hours>=15 && minutes>=30 is false — "not yet past cutoff" hours after it
  * clearly was. */
-function isPastExpiryCutoff(hours: number, minutes: number): boolean {
+export function isPastExpiryCutoff(hours: number, minutes: number): boolean {
   return hours > 15 || (hours === 15 && minutes >= 30);
 }
 

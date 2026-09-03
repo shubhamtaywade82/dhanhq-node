@@ -1,7 +1,7 @@
 import { selectStrikeByDelta, selectStrikeByPremiumTarget, calculateGreeks } from './optionsAnalytics';
 import { listPaperStrategies, createPaperStrategy } from '../db';
 import { INDEX_INSTRUMENTS } from './marketData';
-import { nearestIndexExpiry } from './marketHours';
+import { nearestIndexExpiry, istParts, isPastExpiryCutoff } from './marketHours';
 import { eventBus } from './eventBus';
 
 export interface StrategyLeg {
@@ -89,6 +89,50 @@ export function getLotSize(symbol: string): number {
   const cached = lotSizeCache.get(sym);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
   return LOT_SIZES[sym] || 65;
+}
+
+// Expiry-list cache: the exchange publishes this once and it's valid for the
+// full trading day (a new weekly/monthly expiry only ever appears after the
+// current one lapses) — no reason to hit the API more than hourly.
+const EXPIRY_LIST_CACHE_TTL_MS = 60 * 60 * 1000;
+const expiryListCache = new Map<string, { list: string[]; expiresAt: number }>();
+
+async function fetchExpiryList(client: any, symbol: string): Promise<string[]> {
+  const sym = symbol.toUpperCase();
+  const cached = expiryListCache.get(sym);
+  if (cached && cached.expiresAt > Date.now()) return cached.list;
+  const inst = INDEX_INSTRUMENTS[sym];
+  if (!inst) return [];
+  const res = await client?.optionChain?.expiryList?.({ underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I' });
+  const list: string[] = (Array.isArray(res) ? res : res?.data) || [];
+  const valid = list.filter((d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+  if (valid.length > 0) expiryListCache.set(sym, { list: valid, expiresAt: Date.now() + EXPIRY_LIST_CACHE_TTL_MS });
+  return valid;
+}
+
+/**
+ * Resolves the true nearest expiry off the exchange's own published expiry
+ * list (client.optionChain.expiryList) rather than the weekday/month-end
+ * arithmetic in nearestIndexExpiry(). The heuristic can be wrong whenever the
+ * exchange's actual calendar deviates from the plain weekday rule for a
+ * reason this system doesn't model (a mid-cycle SEBI calendar change, an
+ * exchange-specific holiday adjustment our table doesn't carry yet, etc.).
+ *
+ * Falls back to the heuristic when the API call fails or returns nothing —
+ * a live-data outage degrades to "probably right" instead of throwing and
+ * blocking every strategy build that needs an expiry.
+ */
+export async function resolveNearestExpiry(client: any, symbol: string, now: Date = new Date()): Promise<string> {
+  try {
+    const list = await fetchExpiryList(client, symbol);
+    if (list.length === 0) return nearestIndexExpiry(symbol, now);
+    const parts = istParts(now);
+    const cutoffPassed = isPastExpiryCutoff(parts.hours, parts.minutes);
+    const upcoming = list.filter((d) => d > parts.dateStr || (d === parts.dateStr && !cutoffPassed));
+    return upcoming[0] || nearestIndexExpiry(symbol, now);
+  } catch {
+    return nearestIndexExpiry(symbol, now);
+  }
 }
 
 /**
@@ -955,7 +999,7 @@ export async function seedStandardStrategies(
     if (existing && existing.length >= 4) return 0;
 
     let count = 0;
-    const niftyExpiry = nearestIndexExpiry('NIFTY');
+    const niftyExpiry = await resolveNearestExpiry(client, 'NIFTY');
     const niftySecId = Number(INDEX_INSTRUMENTS.NIFTY.securityId);
     let niftyRows: any[] = [];
     try {
@@ -983,7 +1027,7 @@ export async function seedStandardStrategies(
       if (vwap) { await deploySeeded(vwap, paper, market); count++; }
     }
 
-    const bnfExpiry = nearestIndexExpiry('BANKNIFTY');
+    const bnfExpiry = await resolveNearestExpiry(client, 'BANKNIFTY');
     const bnfSecId = Number(INDEX_INSTRUMENTS.BANKNIFTY.securityId);
     let bnfRows: any[] = [];
     try {
@@ -1001,7 +1045,7 @@ export async function seedStandardStrategies(
     }
 
     // 3. FINNIFTY Strategies
-    const finExpiry = nearestIndexExpiry('FINNIFTY');
+    const finExpiry = await resolveNearestExpiry(client, 'FINNIFTY');
     const finSecId = Number(INDEX_INSTRUMENTS.FINNIFTY?.securityId || '27');
     let finRows: any[] = [];
     try {
@@ -1019,7 +1063,7 @@ export async function seedStandardStrategies(
     }
 
     // 4. SENSEX Strategies (BSE F&O)
-    const snxExpiry = nearestIndexExpiry('SENSEX');
+    const snxExpiry = await resolveNearestExpiry(client, 'SENSEX');
     const snxSecId = Number(INDEX_INSTRUMENTS.SENSEX?.securityId || '51');
     let snxRows: any[] = [];
     try {
@@ -1037,7 +1081,7 @@ export async function seedStandardStrategies(
     }
 
     // 5. MIDCPNIFTY Strategies
-    const midExpiry = nearestIndexExpiry('MIDCPNIFTY');
+    const midExpiry = await resolveNearestExpiry(client, 'MIDCPNIFTY');
     const midSecId = Number(INDEX_INSTRUMENTS.MIDCPNIFTY?.securityId || '442');
     let midRows: any[] = [];
     try {
