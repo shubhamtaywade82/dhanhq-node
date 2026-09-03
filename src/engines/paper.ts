@@ -5,6 +5,7 @@ import { eventBus } from '../services/eventBus';
 import { journal } from '../services/journal';
 import { applyFillSlippage } from '../services/fillModel';
 import type { MarketDataService } from '../services/marketData';
+import { toTrailConfig } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 
 /**
@@ -170,7 +171,7 @@ export class PaperExecutionEngine {
         entryPrice: result.avgPrice,
         stopLoss: risk_limits.stop_loss,
         target: risk_limits.target,
-        trail: risk_limits.trailing_stop,
+        trail: toTrailConfig(risk_limits.trailing_stop),
       });
     }
 

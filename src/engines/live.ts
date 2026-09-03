@@ -3,6 +3,7 @@ import { redisPublisher } from '../auth';
 import { eventBus } from '../services/eventBus';
 import { journal } from '../services/journal';
 import type { MarketDataService } from '../services/marketData';
+import { toTrailConfig } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 
 /**
@@ -89,7 +90,7 @@ export class LiveExecutionEngine {
         entryPrice: fill.averagePrice || price,
         stopLoss: risk_limits.stop_loss,
         target: risk_limits.target,
-        trail: risk_limits.trailing_stop,
+        trail: toTrailConfig(risk_limits.trailing_stop),
       });
     }
 

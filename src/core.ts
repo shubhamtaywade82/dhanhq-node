@@ -1,7 +1,7 @@
 import { DhanClient, OrderTracker, type PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
 import { createDhanClient, redisPublisher, redisAvailable } from './auth';
 import { initDatabase, listPaperPositions } from './db';
-import { MarketDataService } from './services/marketData';
+import { MarketDataService, toTrailConfig } from './services/marketData';
 import { RiskEngine } from './services/riskEngine';
 import { AutonomyEngine } from './services/autonomy';
 import { AgentOrchestrator } from './services/agent';
@@ -130,7 +130,7 @@ async function seedExistingPositions(market: MarketDataService, monitor: Positio
     if (active.length > 0) market.addInstruments(active);
 
     for (const p of open) {
-      if (!p.stopLoss && !p.target) continue;
+      if (!p.stopLoss && !p.target && !p.trailingStop) continue;
       monitor.track({
         securityId: String(p.securityId),
         exchangeSegment: p.exchangeSegment || 'NSE_FNO',
@@ -138,6 +138,7 @@ async function seedExistingPositions(market: MarketDataService, monitor: Positio
         entryPrice: p.netQty > 0 ? p.buyAvg : p.sellAvg,
         stopLoss: p.stopLoss ?? undefined,
         target: p.target ?? undefined,
+        trail: toTrailConfig(p.trailingStop),
       });
     }
   } catch { /* non-fatal */ }

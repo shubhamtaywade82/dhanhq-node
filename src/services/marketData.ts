@@ -48,6 +48,35 @@ export interface QuoteSnapshot {
   updatedAt: number;
 }
 
+/**
+ * Translates this app's trailing-stop config — a fixed point DISTANCE off
+ * the high-water mark (paper_positions.trailing_stop, the shape every
+ * caller in this codebase already stores and reasons about) — into the
+ * shape PositionMonitor.track() actually requires: { atr, multiplier }.
+ *
+ * Every call site used to pass a raw number or { distance } directly as
+ * `trail`. PositionMonitor.track() only checks that `trail` is truthy and
+ * then reads `trail.atr` — neither shape has that property, so `atr` was
+ * always `undefined`. Its TrailManager computes
+ * `candidate = highestPrice - atr * multiplier`, which is then NaN, and
+ * `NaN > currentStop` is always false — the trail NEVER ADVANCES. Since
+ * every leg here also sets an explicit stopLoss alongside trailingStop,
+ * the practical effect was that every "trailing" stop in the system
+ * silently degraded to a static stop that never trails; a trailing-only
+ * position with no separate stopLoss would have had NO stop-loss
+ * protection at all (its threshold would also compute as NaN).
+ *
+ * multiplier: 1 reproduces the intended semantic exactly: `stop =
+ * highestPrice - distance`, i.e. "trail by N points off the high water
+ * mark" — using the SDK's ATR-trail mechanism with the multiplier pinned
+ * to 1 rather than treating `distance` as a true Average True Range.
+ */
+export function toTrailConfig(raw: number | { distance: number } | null | undefined): { atr: number; multiplier: number } | undefined {
+  const d = Number(typeof raw === 'object' && raw !== null ? raw.distance : raw);
+  if (!(d > 0)) return undefined;
+  return { atr: d, multiplier: 1 };
+}
+
 export class MarketDataService {
   private client: DhanClient;
   private quotes = new Map<string, QuoteSnapshot>();     // securityId → snapshot
