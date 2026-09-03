@@ -130,6 +130,7 @@ export class AutonomyEngine {
           eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
         }
         await this.reconcileMonitor();
+        await this.reconcileUnmanagedLivePositions();
         await this.reconcileLedgerAgainstPostgres();
         await this.publishPortfolioSnapshot();
         await this.enforceStrategyLimits();
@@ -264,6 +265,70 @@ export class AutonomyEngine {
       });
       eventBus.log('WARN', `Reconciler: re-armed missing protection for ${key}`, 'autonomy');
       await pushAlert('WARN', 'autonomy', `Monitor/position drift corrected: re-armed protection for ${key}`);
+    }
+  }
+
+  /**
+   * Live-mode-only safety net, and the reason it's a SEPARATE pass from
+   * reconcileMonitor above rather than a branch inside it: DhanHQ's
+   * positions API never reports what stop-loss/target/trailing-stop a
+   * position is SUPPOSED to have — unlike the paper ledger, which persists
+   * those fields in Postgres, a broker position's stopLoss/target/
+   * trailingStop (NormalizedPosition) are ALWAYS null (see
+   * BrokerPortfolioSource's docstring). That means reconcileMonitor's
+   * "untracked open position with nothing configured to re-arm → nothing to
+   * do" branch is silently unreachable for every broker position — it can
+   * never re-arm protection it has no way to know about, and would treat a
+   * genuinely unmanaged live position exactly like an intentionally naked
+   * paper leg.
+   *
+   * PositionMonitor's tracked set is this app's ENTIRE memory of which live
+   * positions carry protection — track() is called exactly once, inline,
+   * right after a live fill (see LiveExecutionEngine.placeOrder). So a
+   * broker position this process isn't tracking is always one of two
+   * things: this app placed it and then lost track (a crash mid-flow, a
+   * bug), or it was opened by something entirely outside this app's control
+   * (a manual trade, another process, a broker-side action). Either way,
+   * real capital is exposed with NO stop-loss anywhere — the trading rules
+   * this system operates under make that mandatory, not optional.
+   *
+   * There is no safe way to reconstruct a guessed stop-loss for it (e.g.
+   * from the day's journal) — a reconstructed value could be stale, wrong,
+   * or simply absent if the position predates this boot, and resuming
+   * silent management on a guess is worse than stopping. So the only
+   * correct response is to flatten it immediately and halt autonomous
+   * trading for a human to review, exactly the "broker wins, square off the
+   * difference, arm a sticky kill" contract this reconciler exists for.
+   */
+  private async reconcileUnmanagedLivePositions(): Promise<void> {
+    if (this.portfolio.kind !== 'broker') return;
+
+    const positions = await this.portfolio.getPositions();
+    const trackedKeys = new Set(this.market.monitor.tracked().map((t) => `${t.exchangeSegment}:${t.securityId}`));
+
+    for (const p of positions) {
+      if (p.netQty === 0 || !p.securityId || p.securityId === '0') continue;
+      const key = `${p.exchangeSegment || 'NSE_FNO'}:${p.securityId}`;
+      if (trackedKeys.has(key)) continue;
+
+      const msg = `UNMANAGED LIVE POSITION: ${p.tradingSymbol} (${key}, netQty=${p.netQty}) is open at the broker with no stop-loss/target/trailing-stop tracked by this process. Flattening immediately and halting autonomous trading.`;
+      eventBus.log('ERROR', msg, 'autonomy');
+      await pushAlert('ERROR', 'autonomy', msg);
+      journal.append('risk_decision', {
+        rule: 'Unmanaged Live Position', from: 'OK', to: 'ERROR', current: `${key} netQty=${p.netQty}`,
+        threshold: 'every open broker position must be tracked by PositionMonitor', action: 'Squared off and armed kill switch',
+      });
+
+      const closeResult = await this.portfolio.closePosition(p.tradingSymbol).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
+      eventBus.log(
+        closeResult.status === 'TRADED' ? 'TRADE' : 'ERROR',
+        `Unmanaged position square-off ${p.tradingSymbol}: ${closeResult.status}${closeResult.reason ? ` (${closeResult.reason})` : ''}`,
+        'autonomy',
+      );
+
+      if (!this.risk.isKilled()) {
+        await this.risk.armKillSwitch(`Unmanaged live position detected: ${p.tradingSymbol} (${key})`);
+      }
     }
   }
 
