@@ -426,18 +426,25 @@ export class AgentOrchestrator {
       // Partial fill on a multi-leg structure is worse than no fill — e.g. a
       // short leg filling without its hedge is naked, undefined risk. Unwind
       // whatever filled rather than leaving it to stand.
+      //
+      // Goes through PortfolioSource.closePosition(), NOT engine.placeOrder()
+      // — placeOrder() re-checks risk.canTrade(), the SAME gate whose
+      // failure typically caused THIS partial fill (a breaker tripping
+      // between legs, or the kill switch arming). A risk-REDUCING close must
+      // never be blocked by the entry gate; closePosition() (paper and
+      // broker alike) doesn't check it.
+      const portfolio = this.risk.getPortfolio();
       for (const leg of filledLegs) {
         const unwindPrice = this.market.getFillablePrice(leg.securityId, { allowClosed: true }) ?? leg.price;
-        await engine.placeOrder({
-          correlation_id: `${strat.id}_${leg.optionType}_${leg.strike}_unwind`,
-          intent_id: runId,
-          params: {
-            security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
-            transaction_type: leg.side === 'BUY' ? 'SELL' : 'BUY', order_type: 'MARKET',
-            exchange_segment: leg.exchangeSegment || 'NSE_FNO', product_type: 'INTRADAY', price: unwindPrice,
-          },
-        }).catch(() => {});
-        this.market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
+        const result = await portfolio.closePosition(leg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
+        if (result.status === 'TRADED') {
+          this.market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
+        } else {
+          // Untracking here would strip stop-loss/target from a leg that is
+          // STILL open — the same mistake fixed in RiskEngine.armKillSwitch
+          // for the exact same reason.
+          eventBus.log('ERROR', `Unwind FAILED for leg ${leg.instrument}: ${result.status}${(result as any).reason ? ` (${(result as any).reason})` : ''} — still open, protection left tracked`, 'agent');
+        }
       }
       eventBus.log('ERROR', `Multi-leg deploy ${strat.name} partially filled (${filledLegs.length}/${strat.legs.length}) — unwound`, 'agent');
       this.step(runId, 'execution', 'ACT', `Strategy ${strat.name} partial fill unwound (${filledLegs.length}/${strat.legs.length})`);

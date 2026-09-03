@@ -429,6 +429,46 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
       jest.useRealTimers();
     }
   });
+
+  it('unwinds a partially-filled leg even when canTrade() has since gone false — the exact condition that likely caused the partial fill', async () => {
+    // Regression test: the unwind used to call engine.placeOrder() for the
+    // reversing order, which re-checks risk.canTrade() — the SAME gate a
+    // breaker tripping or the kill switch arming BETWEEN legs would have
+    // just failed on leg 2. That left leg 1 open, naked, and (since
+    // monitor.untrack() ran unconditionally regardless of the unwind's own
+    // outcome) with no stop-loss either.
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z'));
+    try {
+      const { agent, risk } = await stubEngines(100);
+      // Leg 1's entry sees canTrade() allowed; every call after — leg 2's
+      // entry, and (pre-fix) the unwind itself — sees it blocked.
+      jest.spyOn(risk, 'canTrade')
+        .mockReturnValueOnce({ allowed: true })
+        .mockReturnValue({ allowed: false, reason: 'blocked mid-deploy' });
+
+      const strat = {
+        id: `exec01b_test_${Date.now()}`,
+        name: 'Test Bull Call Spread (gate race)',
+        symbol: 'NIFTY',
+        type: 'BULL_CALL_SPREAD' as any,
+        lots: 1,
+        estimatedNetPremium: 0,
+        lotSize: 50,
+        legs: [
+          { instrument: 'NIFTY24060CE', securityId: '44000', side: 'BUY' as const, qty: 50, strike: 24060, optionType: 'CE' as const, price: 100, exchangeSegment: 'NSE_FNO' },
+          { instrument: 'NIFTY24160CE', securityId: '99998', side: 'SELL' as const, qty: 50, strike: 24160, optionType: 'CE' as const, price: 0, exchangeSegment: 'NSE_FNO' },
+        ],
+      };
+      const result: any = await (agent as any).executeStrategy('run1b', 'deploy this spread', strat, true);
+      expect(result.status).toBe('FAILED');
+      expect(result.reason).toBe('partial_fill_unwound');
+      const pos = (await listPaperPositions()).find((p: any) => p.tradingSymbol === 'NIFTY24060CE');
+      expect(Number(pos?.netQty || 0)).toBe(0); // unwound despite canTrade() being false throughout
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('Database layer — fallback mode honesty', () => {
