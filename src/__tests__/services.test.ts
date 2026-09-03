@@ -561,6 +561,24 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
     expect(status.personas.planner).toEqual({ status: 'idle', steps: 0 });
   });
 
+  it('uses OLLAMA_CLOUD_MODEL when a cloud API key is configured, and the local OLLAMA_MODEL otherwise', () => {
+    const priorKey = process.env.OLLAMA_API_KEY_1;
+    const priorCloudModel = process.env.OLLAMA_CLOUD_MODEL;
+    try {
+      delete process.env.OLLAMA_API_KEY_1;
+      const localAgent = new AgentOrchestrator(stubClient(), stubMarket(100), new RiskEngine(stubClient(), stubMarket(100)), {} as any, {} as any);
+      expect((localAgent as any).llmModel).toBe(process.env.OLLAMA_MODEL || 'qwen2.5:0.5b');
+
+      process.env.OLLAMA_API_KEY_1 = 'test-cloud-key';
+      process.env.OLLAMA_CLOUD_MODEL = 'gemma4:cloud';
+      const cloudAgent = new AgentOrchestrator(stubClient(), stubMarket(100), new RiskEngine(stubClient(), stubMarket(100)), {} as any, {} as any);
+      expect((cloudAgent as any).llmModel).toBe('gemma4:cloud');
+    } finally {
+      if (priorKey === undefined) delete process.env.OLLAMA_API_KEY_1; else process.env.OLLAMA_API_KEY_1 = priorKey;
+      if (priorCloudModel === undefined) delete process.env.OLLAMA_CLOUD_MODEL; else process.env.OLLAMA_CLOUD_MODEL = priorCloudModel;
+    }
+  });
+
   it('exposes the real SDK tool catalog (44 policy-gated tools)', () => {
     const { agent } = { agent: new AgentOrchestrator(stubClient(), stubMarket(100), new RiskEngine(stubClient(), stubMarket(100)), {} as any, {} as any) };
     const catalog = agent.toolCatalog();

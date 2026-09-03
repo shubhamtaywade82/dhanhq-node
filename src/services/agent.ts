@@ -200,15 +200,37 @@ export class AgentOrchestrator {
     this.paper = paper;
     this.live = live;
     this.sandbox = sandbox;
-    this.llmModel = process.env.OLLAMA_MODEL || 'qwen2.5:0.5b';
     this.tools = new AgentToolRegistry({ client, policy: Policy.fromEnv() });
 
+    // Ollama Cloud, when API keys are configured (same env var names as the
+    // paper-broker app — OLLAMA_API_KEY_1/2/3 — so the same keys work here
+    // unchanged): several keys bound to one cloud model via the SDK's native
+    // credential/failover routing, so a rate-limited or dead key falls
+    // through to the next one automatically. No local baseUrl fallback in
+    // this mode — a local Ollama daemon almost certainly doesn't have the
+    // cloud-only model pulled, so a "fallback" request would just fail with
+    // a model-not-found error instead of a useful retry. Total cloud
+    // failure already degrades to deterministic mode via reason()'s catch,
+    // same as local-Ollama-unreachable does today.
+    const cloudKeys = [process.env.OLLAMA_API_KEY_1, process.env.OLLAMA_API_KEY_2, process.env.OLLAMA_API_KEY_3]
+      .filter((k): k is string => Boolean(k));
+    const cloudModel = process.env.OLLAMA_CLOUD_MODEL || 'gemma4:cloud';
+    this.llmModel = cloudKeys.length > 0 ? cloudModel : (process.env.OLLAMA_MODEL || 'qwen2.5:0.5b');
+
     if (process.env.OLLAMA_ENABLED !== 'false') {
-      this.ollama = new OllamaClient({
-        baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
-        timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS) || 15000,
-        retries: 0,
-      });
+      this.ollama = cloudKeys.length > 0
+        ? new OllamaClient({
+            baseUrl: process.env.OLLAMA_CLOUD_BASE_URL || 'https://ollama.com',
+            credentials: Object.fromEntries(cloudKeys.map((apiKey, i) => [`cloud-${i + 1}`, { apiKey }])),
+            modelBindings: { [cloudModel]: cloudKeys.map((_, i) => `cloud-${i + 1}`) },
+            timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS) || 15000,
+            retries: 0,
+          })
+        : new OllamaClient({
+            baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
+            timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS) || 15000,
+            retries: 0,
+          });
       void this.probeLlm();
     }
   }
