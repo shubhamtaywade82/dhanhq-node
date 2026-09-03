@@ -100,6 +100,14 @@ describe("RiskEngine kill switch — DhanHQ Trader's Control calls", () => {
     expect(result.details.brokerKillSwitchError).toContain('rate limited');
   });
 
+  it('exposes the injected PortfolioSource via getPortfolio() — what AgentOrchestrator\'s capital-allocation check reads instead of guessing SDK method/field names itself', () => {
+    const client = stubClient();
+    const market = new MarketDataService(client);
+    const portfolio = stubPortfolio();
+    const risk = new RiskEngine(client, market, portfolio);
+    expect(risk.getPortfolio()).toBe(portfolio);
+  });
+
   it('does not call traderControls at all in paper mode', async () => {
     process.env.TRADING_MODE = 'paper';
     const client = stubClient();

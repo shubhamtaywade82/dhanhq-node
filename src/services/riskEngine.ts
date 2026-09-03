@@ -129,6 +129,13 @@ export class RiskEngine {
     return this.killed;
   }
 
+  /** Exposes the mode-appropriate PortfolioSource to other engines (the
+   * agent's capital-allocation check, notably) so they don't need their own
+   * copy of the paper/live branching this class already does. */
+  getPortfolio(): PortfolioSource {
+    return this.portfolio;
+  }
+
   snapshot() {
     return {
       killed: this.killed,

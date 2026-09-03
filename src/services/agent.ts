@@ -3,7 +3,7 @@ import { OllamaClient } from '@nemesis-oss/ollama-sdk';
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
-import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules, getPaperWallet } from '../db';
+import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules } from '../db';
 import { INDEX_INSTRUMENTS } from './marketData';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { LiveExecutionEngine } from '../engines/live';
@@ -202,17 +202,20 @@ export class AgentOrchestrator {
       const explicitTarget = watchlist.find((s) => new RegExp(`\\b${s}\\b`, 'i').test(objective) && !objective.toLowerCase().includes('and') && !objective.toLowerCase().includes('across') && !objective.toLowerCase().includes('all'));
       const targets = explicitTarget ? [explicitTarget] : watchlist;
 
-      // 2b. Capital allocation (30% of total available capital)
+      // 2b. Capital allocation (30% of total available capital). Reads
+      // through RiskEngine's PortfolioSource rather than branching on
+      // TRADING_MODE itself — a prior version called
+      // (this.client as any).funds?.get?.() directly for live mode, which
+      // doesn't exist on the SDK (the real method is funds.getLimit(), with
+      // response fields availabelBalance/utilizedAmount, not the
+      // availableCash/availMargin guessed here). Because of the optional
+      // chaining, that silently resolved to undefined every time and this
+      // fell through to the hardcoded ₹10L default regardless of the real
+      // account balance — fabricated capital sizing in live mode.
       let availableCapital = 1_000_000;
       try {
-        const isLive = process.env.TRADING_MODE === 'live';
-        if (isLive) {
-          const funds = await (this.client as any).funds?.get?.();
-          availableCapital = Number(funds?.availableCash || funds?.availMargin || 1_000_000);
-        } else {
-          const wallet = await getPaperWallet();
-          availableCapital = Number(wallet.availableMargin || wallet.totalBalance || 1_000_000);
-        }
+        const wallet = await this.risk.getPortfolio().getWallet();
+        availableCapital = Number(wallet.availableMargin || wallet.totalBalance || 1_000_000);
       } catch { /* default 10L */ }
 
       const vixRes = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } });
