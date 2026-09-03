@@ -13,6 +13,7 @@ import { LiveExecutionEngine } from './engines/live';
 import { marketClock } from './services/marketHours';
 import { hasHolidayCoverage } from './services/holidays';
 import { journal, summarizeDay, type JournalEntry } from './services/journal';
+import { PaperPortfolioSource, BrokerPortfolioSource, type PortfolioSource } from './services/portfolioSource';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -64,8 +65,15 @@ export async function startCore(): Promise<Core> {
   const client = await createDhanClient();
 
   const market = new MarketDataService(client);
-  const risk = new RiskEngine(client, market);
-  const autonomy = new AutonomyEngine(client, market, risk);
+  // The ONE place TRADING_MODE picks which account this whole stack reads/
+  // acts on — RiskEngine, AutonomyEngine and LiveExecutionEngine all take
+  // the SAME instance so there is exactly one broker poll cache and one
+  // idea of "the current positions" shared across them, not one each.
+  const portfolio: PortfolioSource = process.env.TRADING_MODE === 'live'
+    ? new BrokerPortfolioSource(client)
+    : new PaperPortfolioSource();
+  const risk = new RiskEngine(client, market, portfolio);
+  const autonomy = new AutonomyEngine(client, market, risk, portfolio);
 
   // OrderTracker: resolve live orders to fills from order-update WS
   // events (MarketDataService re-emits them on the bus).
@@ -77,7 +85,7 @@ export async function startCore(): Promise<Core> {
   });
 
   const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
-  const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk);
+  const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk, portfolio);
   const agent = new AgentOrchestrator(client, market, risk, paper, live);
   autonomy.setAgent(agent);
 

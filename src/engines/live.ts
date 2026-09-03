@@ -86,12 +86,27 @@ export class LiveExecutionEngine {
     journal.append('order_result', { status: fill.status || 'TRADED', ...fillPayload });
     this.portfolio?.recordOrderOutcome({ status: fill.status === 'REJECTED' ? 'REJECTED' : 'TRADED' });
     await redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
+    // The broker's own position/wallet state just changed — force the NEXT
+    // read to poll rather than serve a snapshot from before this fill.
+    // Without this, autonomy's reconcileMonitor can see monitor.track()
+    // below (which is synchronous, right below) applied against a position
+    // list that doesn't contain this fill yet, judge the freshly-tracked
+    // entry an orphan with "no matching open position", untrack it, and on
+    // the following cycle reconcileUnmanagedLivePositions flattens it and
+    // arms the kill switch as an "unmanaged" position.
+    this.portfolio?.invalidate();
 
     if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {
+      const filledQty = fill.filledQuantity || quantity;
       this.monitor.track({
         securityId: String(security_id),
         exchangeSegment: exchange_segment,
-        quantity: fill.filledQuantity || quantity,
+        // Signed by transaction_type — PositionMonitor.quantity is positive
+        // for a long, negative for a short, and a raw filledQuantity is
+        // always positive regardless of side. An unsigned quantity here
+        // tracked a short exactly backwards: its stop-loss fired on a price
+        // FALL (a profit for a short) and its target on a RISE (the loss).
+        quantity: transaction_type === 'SELL' ? -filledQty : filledQty,
         entryPrice: fill.averagePrice || price,
         stopLoss: risk_limits.stop_loss,
         target: risk_limits.target,

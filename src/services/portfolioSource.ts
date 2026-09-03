@@ -125,6 +125,11 @@ export interface PortfolioSource {
   markToMarket(ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }>;
   closePosition(symbol: string, priceHint?: number, kind?: FillKind): Promise<CloseResult>;
   closeAll(ltpResolver: LtpResolver): Promise<CloseResult[]>;
+  /** Forces the next read to bypass any internal cache. Paper mode's mem
+   * reads are always current, so this is a no-op there; BrokerPortfolioSource
+   * uses it to force a fresh poll right after a fill changes the account —
+   * see its own docstring for why that matters. */
+  invalidate(): void;
 }
 
 // ── paper ────────────────────────────────────────────────────────────────
@@ -163,6 +168,9 @@ export class PaperPortfolioSource implements PortfolioSource {
   async closeAll(ltpResolver: LtpResolver): Promise<CloseResult[]> {
     return closeAllPaperPositions(ltpResolver) as unknown as Promise<CloseResult[]>;
   }
+
+  /** No-op: mem is always current, there is no cache to invalidate. */
+  invalidate(): void { /* see docstring */ }
 }
 
 // ── broker ───────────────────────────────────────────────────────────────
@@ -227,7 +235,17 @@ export class BrokerPortfolioSource implements PortfolioSource {
   private pollIntervalMs: number;
   private cachedPositions: NormalizedPosition[] = [];
   private cachedWallet: WalletSnapshot = emptyWallet();
+  // lastPollAt: last SUCCESSFUL refresh (what isDegraded()/lastPolledAt()
+  // report freshness against). lastAttemptAt: last time a poll was
+  // ATTEMPTED, successful or not — this is what ensureFresh() throttles on.
+  // Splitting these matters: a broker outage or a 429 would otherwise leave
+  // lastPollAt frozen at its last success forever, permanently defeating the
+  // throttle (Date.now() - lastPollAt < pollIntervalMs never re-becomes
+  // true) and turning every subsequent tick into a fresh positions.list()/
+  // funds.getLimit() call — exactly the hammering this class exists to
+  // prevent, and self-sustaining under a rate limit.
   private lastPollAt = 0;
+  private lastAttemptAt = 0;
   private pollPromise: Promise<void> | null = null;
   private degraded = false;
 
@@ -265,14 +283,32 @@ export class BrokerPortfolioSource implements PortfolioSource {
   isDegraded(): boolean { return this.degraded; }
   lastPolledAt(): number { return this.lastPollAt; }
 
+  /** Forces the NEXT read to poll rather than serve the cache, regardless
+   * of how recently the last poll ran. Used right after a live fill: the
+   * cached snapshot from before the fill doesn't yet contain the new/
+   * changed position, and reconcileMonitor/reconcileUnmanagedLivePositions
+   * (autonomy.ts) would otherwise judge PositionMonitor's already-updated
+   * tracked set against that stale snapshot and "correct" a position that
+   * is not actually orphaned — untracking it, then on the following cycle
+   * flattening it and arming the kill switch as an "unmanaged" position. */
+  invalidate(): void {
+    this.lastAttemptAt = 0;
+  }
+
   private async ensureFresh(force = false): Promise<void> {
-    if (!force && Date.now() - this.lastPollAt < this.pollIntervalMs) return;
+    // Checked BEFORE the throttle: poll() sets lastAttemptAt synchronously
+    // as its very first statement, so a concurrent caller arriving while a
+    // poll is already in flight would otherwise see "an attempt just
+    // started" and bail out early serving the STALE pre-poll cache, instead
+    // of dedup-ing onto the in-flight request like it's supposed to.
     if (this.pollPromise) return this.pollPromise;
+    if (!force && Date.now() - this.lastAttemptAt < this.pollIntervalMs) return;
     this.pollPromise = this.poll().finally(() => { this.pollPromise = null; });
     return this.pollPromise;
   }
 
   private async poll(): Promise<void> {
+    this.lastAttemptAt = Date.now();
     try {
       const [positionsRes, fundsRes] = await Promise.all([
         this.client.positions.list(),
@@ -417,7 +453,7 @@ export class BrokerPortfolioSource implements PortfolioSource {
       // The broker won't reflect this fill in positions.list() until its
       // own books settle — force a re-poll on the NEXT read rather than
       // serving a stale "still open" snapshot for a full pollIntervalMs.
-      this.lastPollAt = 0;
+      this.invalidate();
       return { status: 'TRADED', symbol: pos.tradingSymbol, orderId: fillPayload.order_id };
     } catch (e: any) {
       eventBus.log('ERROR', `Live close FAILED for ${pos.tradingSymbol}: ${e.message}`, 'portfolio_source');
@@ -427,7 +463,13 @@ export class BrokerPortfolioSource implements PortfolioSource {
   }
 
   async closePosition(symbol: string, _priceHint?: number, _kind?: FillKind): Promise<CloseResult> {
-    await this.ensureFresh();
+    // Forced, not cache-respecting: this is a deliberate, rare exit
+    // decision, not a per-tick read. A cache-respecting read (ensureFresh())
+    // would return 'noop' for a position opened within the last
+    // pollIntervalMs — the real broker position stays open, now with no
+    // caller retrying the close and, if it was untracked in the same
+    // motion, no stop-loss either.
+    await this.ensureFresh(true);
     const pos = this.findOpenPosition(symbol);
     if (!pos) return { status: 'noop', reason: 'No open position found', symbol };
     return this.reversePosition(pos, 'manual close');

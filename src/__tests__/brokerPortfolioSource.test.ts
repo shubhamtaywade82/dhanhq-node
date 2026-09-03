@@ -113,6 +113,51 @@ describe('BrokerPortfolioSource', () => {
     expect(src.isDegraded()).toBe(true);
   });
 
+  it('still respects the poll interval after a failed poll — a failure does not defeat the throttle', async () => {
+    // Regression test: an earlier version only advanced the throttle clock
+    // on a SUCCESSFUL poll, so once a poll failed the throttle window never
+    // re-closed (Date.now() - lastPollAt stayed >= pollIntervalMs forever)
+    // and every subsequent call re-attempted the broker call — the exact
+    // hammering the class exists to prevent, worse under a real outage.
+    const client = stubClient({ positions: [rawPosition()] });
+    const src = new BrokerPortfolioSource(client, 60_000);
+    client.positions.list.mockRejectedValueOnce(new Error('network blip'));
+    await src.getPositions(); // fails, but the attempt still counts
+    await src.getPositions();
+    await src.getPositions();
+    expect(client.positions.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a concurrent caller dedupe onto an in-flight poll even when that poll started this same instant', async () => {
+    // Regression test: splitting "last attempt" from "last success" (for
+    // the throttle-after-failure fix above) initially broke the OTHER
+    // dedup case — poll() sets its attempt timestamp synchronously as its
+    // first statement, so a second caller arriving in the same tick saw
+    // "an attempt just started" and returned early serving the stale
+    // pre-poll cache, instead of awaiting the same in-flight request.
+    let resolveList!: (v: any[]) => void;
+    const listPromise = new Promise<any[]>((resolve) => { resolveList = resolve; });
+    const client = stubClient({ positionsImpl: () => listPromise });
+    const src = new BrokerPortfolioSource(client, 60_000);
+    const p1 = src.getPositions();
+    const p2 = src.getPositions();
+    resolveList([rawPosition()]);
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1).toHaveLength(1);
+    expect(r2).toEqual(r1);
+  });
+
+  it('invalidate() forces the next read to poll even inside the TTL window', async () => {
+    const client = stubClient({ positions: [rawPosition()] });
+    const src = new BrokerPortfolioSource(client, 60_000);
+    await src.getPositions();
+    expect(client.positions.list).toHaveBeenCalledTimes(1);
+
+    src.invalidate();
+    await src.getPositions();
+    expect(client.positions.list).toHaveBeenCalledTimes(2);
+  });
+
   it('tallies order outcomes for the rejection-rate breaker', async () => {
     const client = stubClient();
     const src = new BrokerPortfolioSource(client, 60_000);
@@ -150,6 +195,27 @@ describe('BrokerPortfolioSource', () => {
     expect(result.status).toBe('TRADED');
     expect(result.orderId).toBe('ord42');
     expect(place).toHaveBeenCalledWith(expect.objectContaining({ transactionType: 'SELL', quantity: 50, orderType: 'MARKET' }));
+  });
+
+  it('closePosition forces a fresh poll rather than trusting a cache that may predate the position — no false noop', async () => {
+    // Regression test: closePosition used to call ensureFresh() (cache-
+    // respecting), same as a routine read. A position opened within the
+    // last pollIntervalMs would be absent from the cache, findOpenPosition
+    // would find nothing, and the caller got back {status:'noop'} while the
+    // real broker position stayed open — a silently failed exit.
+    const client = stubClient({ positions: [] }); // cache starts empty
+    const src = new BrokerPortfolioSource(client, 60_000);
+    await src.getPositions(); // populates the (empty) cache within the TTL
+
+    // The position now exists at the broker (a fill this instance hasn't
+    // polled yet) — closePosition must not trust the stale empty cache.
+    client.positions.list.mockResolvedValueOnce([rawPosition({ netQty: 50 })]);
+    const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord99' } }));
+    (client.orders.place as jest.Mock) = place;
+
+    const result = await src.closePosition('NIFTY25JAN24000CE');
+    expect(result.status).toBe('TRADED');
+    expect(place).toHaveBeenCalled();
   });
 
   it('closePosition reverses a short position with a BUY order', async () => {

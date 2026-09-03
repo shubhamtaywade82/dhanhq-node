@@ -33,6 +33,7 @@ function stubPortfolio(positions: NormalizedPosition[], opts: { kind?: 'paper' |
     markToMarket: jest.fn(async () => ({ totalUnrealized: 0, staleCount: 0 })),
     closePosition: opts.closePosition ?? jest.fn(async () => ({ status: 'TRADED' as const, symbol: 'X', orderId: 'o1' })),
     closeAll: jest.fn(async () => []),
+    invalidate: jest.fn(),
   };
 }
 
