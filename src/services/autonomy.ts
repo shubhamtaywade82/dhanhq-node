@@ -114,7 +114,10 @@ export class AutonomyEngine {
       }
 
       if (this.enabled) {
-        await markPositionsToMarket((secId) => this.market.getLtp(secId));
+        const mark = await markPositionsToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
+        if (clock.isMarketOpen && mark.staleCount > 0) {
+          eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
+        }
         await this.publishPortfolioSnapshot();
         await this.enforceStrategyLimits();
 
@@ -163,8 +166,9 @@ export class AutonomyEngine {
       const positions = await listPaperPositions();
       const pos = positions.find((x: any) => String(x.securityId) === String(p.securityId) && x.netQty !== 0);
       if (pos) {
-        const ltp = this.market.getLtp(String(pos.securityId)) || pos.ltp;
+        const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
         const res = await closePaperPosition(pos.tradingSymbol, ltp);
+        this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         eventBus.log('TRADE', `Auto-exit ${pos.tradingSymbol}: ${res.status} @ ₹${ltp} (${p.reason})`, 'autonomy');
         await this.closeParentStrategyIfFlat(pos.tradingSymbol);
       }
@@ -199,7 +203,7 @@ export class AutonomyEngine {
     setImmediate(async () => {
       this.tickMarkScheduled = false;
       try {
-        await markPositionsToMarket((secId) => this.market.getLtp(secId));
+        await markPositionsToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
         await this.publishPortfolioSnapshot();
       } catch { /* the 2s cycle below is the fallback */ }
     });
@@ -231,8 +235,9 @@ export class AutonomyEngine {
     for (const leg of strat.legs || []) {
       const pos = positions.find((p) => p.tradingSymbol === leg.instrument);
       if (pos && pos.netQty !== 0) {
-        const ltp = this.market.getLtp(String(pos.securityId)) || pos.ltp;
+        const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
         await closePaperPosition(leg.instrument, ltp).catch(() => {});
+        this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       }
     }
   }
@@ -243,8 +248,9 @@ export class AutonomyEngine {
     let closed = 0;
     for (const pos of positions) {
       if (pos.netQty === 0) continue;
-      const ltp = this.market.getLtp(String(pos.securityId)) || pos.ltp;
+      const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
       await closePaperPosition(pos.tradingSymbol, ltp).catch(() => {});
+      this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       closed++;
     }
     for (const s of await listPaperStrategies()) {

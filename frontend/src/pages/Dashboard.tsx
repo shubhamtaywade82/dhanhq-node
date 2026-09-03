@@ -19,7 +19,10 @@ const PNL_PERIOD_SECONDS: Record<PnlChartPeriod, number | null> = { '15M': 15 * 
 export function Dashboard({ onNavigate, onDeploy }: DashboardProps) {
   const { state } = useApp();
   const [pnlPeriod, setPnlPeriod] = useState<PnlChartPeriod>('SESSION');
-  const realizedPnl = Number(state.funds.realizedPnl || 0);
+  // Day P&L is session-scoped (resets at IST day rollover), not the wallet's
+  // lifetime realizedPnl — falls back to it only if the backend predates
+  // sessionRealizedPnl (RISK-01).
+  const realizedPnl = Number(state.funds.sessionRealizedPnl ?? state.funds.realizedPnl ?? 0);
   // Only OPEN positions' unrealized PnL — a closed position's lifetime
   // realizedProfit is already inside state.funds.realizedPnl and must not
   // be summed again here, or Day P&L double-counts every closed trade.
@@ -221,7 +224,7 @@ function MetricsGrid({
   const used = Number(state.funds.usedMargin || 0);
   const total = Number(state.funds.totalBalance || (avail + used));
   const utilPct = total > 0 ? (used / total) * 100 : 0;
-  const realized = Number(state.funds.realizedPnl || 0);
+  const realized = Number(state.funds.sessionRealizedPnl ?? state.funds.realizedPnl ?? 0);
   const unrealized = totalPnl - realized;
   const totalOrders = state.orders.length;
   const filledOrders = state.orders.filter((o) => o.status === "TRADED").length;

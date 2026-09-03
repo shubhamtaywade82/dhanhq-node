@@ -60,6 +60,7 @@ export class RiskEngine {
   private killed = false;
   private killedReason: string | null = null;
   private killedAt: number | null = null;
+  private killedDate: string | null = null; // IST date armed on — see start()
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastBreakers: CircuitBreakerRow[] = [];
   private lastEvalAt = 0;
@@ -74,8 +75,20 @@ export class RiskEngine {
   async start(): Promise<void> {
     const persisted = await getRiskState();
     this.limits = { ...DEFAULT_RISK_LIMITS, ...(persisted.limits || {}) };
-    this.killed = !!persisted.killed;
-    this.killedReason = persisted.killedReason || null;
+    const today = marketClock().istDate;
+    if (persisted.killed && persisted.killedDate && persisted.killedDate !== today) {
+      // A daily circuit breaker that survives into a new trading session is
+      // stale by definition — "daily loss limit" means the budget resets
+      // each day. Auto-clear rather than starting the day pre-killed.
+      this.killed = false;
+      this.killedReason = null;
+      await saveRiskState({ killed: false, killedReason: null, killedDate: null, limits: this.limits, consecutiveLosses: persisted.consecutiveLosses });
+      eventBus.log('SYSTEM', `Kill switch from ${persisted.killedDate} auto-cleared for new trading session (${today})`, 'risk_engine');
+    } else {
+      this.killed = !!persisted.killed;
+      this.killedReason = persisted.killedReason || null;
+      this.killedDate = persisted.killedDate || null;
+    }
 
     // Re-evaluate every 5s — a fallback heartbeat, not the primary trigger.
     this.timer = setInterval(() => { void this.evaluate(); }, 5000);
@@ -104,7 +117,7 @@ export class RiskEngine {
 
   async setLimits(patch: Partial<RiskLimits>): Promise<RiskLimits> {
     this.limits = { ...this.limits, ...patch };
-    await saveRiskState({ killed: this.killed, killedReason: this.killedReason, limits: this.limits });
+    await saveRiskState({ killed: this.killed, killedReason: this.killedReason, killedDate: this.killedDate, limits: this.limits });
     eventBus.log('INFO', `Risk limits updated: ${JSON.stringify(this.limits)}`, 'risk_engine');
     return this.getLimits();
   }
@@ -150,7 +163,8 @@ export class RiskEngine {
     this.killed = true;
     this.killedReason = reason;
     this.killedAt = Date.now();
-    await saveRiskState({ killed: true, killedReason: reason, limits: this.limits });
+    this.killedDate = marketClock().istDate;
+    await saveRiskState({ killed: true, killedReason: reason, killedDate: this.killedDate, limits: this.limits });
 
     const details: any = { mode: process.env.TRADING_MODE || 'paper', positionsClosed: 0 };
 
@@ -161,12 +175,16 @@ export class RiskEngine {
         details.brokerKillSwitch = 'ENABLED';
         await (this.client as any).traderControls?.pnlExit?.({ type: 'PROFIT', value: 0 }).catch(() => {});
       }
-      const closes = (await closeAllPaperPositions((secId, _sym) => this.market.getLtp(secId))) as any[];
+      const openBefore = await listPaperPositions();
+      const closes = (await closeAllPaperPositions((secId, _sym) => this.market.getFillablePrice(secId, { allowClosed: true }) ?? this.market.getLtp(secId))) as any[];
       details.positionsClosed = closes.filter((c) => c && c.status === 'TRADED').length;
       for (const c of closes) {
         if (c && c.status === 'TRADED') {
           eventBus.emit('order', { kind: 'kill_switch_fill', orderId: c.orderId, symbol: c.symbol, side: c.side, fillPrice: c.fillPrice });
         }
+      }
+      for (const pos of openBefore) {
+        if (pos.netQty !== 0) this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       }
       // Stop every RUNNING strategy too — this also reverses any multi-leg
       // hedge-margin credit (see updatePaperStrategyStatus), which the raw
@@ -190,7 +208,8 @@ export class RiskEngine {
     this.killed = false;
     this.killedReason = null;
     this.killedAt = null;
-    await saveRiskState({ killed: false, limits: this.limits });
+    this.killedDate = null;
+    await saveRiskState({ killed: false, killedDate: null, limits: this.limits });
     try {
       if ((process.env.TRADING_MODE || 'paper') === 'live') {
         await (this.client as any).traderControls?.killSwitch?.('DISABLE');
@@ -237,7 +256,7 @@ export class RiskEngine {
     ]);
 
     const unrealized = positions.reduce((acc, p) => acc + (Number(p.unrealizedPnl) || 0), 0);
-    const dayPnl = Number(wallet.realizedPnl) + unrealized;
+    const dayPnl = Number(wallet.sessionRealizedPnl) + unrealized;
     const total = Number(wallet.totalBalance) || 1;
     const utilPct = (Number(wallet.usedMargin) / total) * 100;
     const rejectionRate = orderStats.total > 0 ? (orderStats.rejected / orderStats.total) * 100 : 0;

@@ -1,5 +1,6 @@
 import { Pool } from 'pg';
 import { moduleLogger } from './lib/logger';
+import { marketClock } from './services/marketHours';
 
 const log = moduleLogger('db');
 
@@ -31,7 +32,7 @@ export function dbMode(): 'postgres' | 'memory' {
 
 // ── in-memory wallet/position cache (always-on, see header) ───────────────
 const mem = {
-  wallet: { id: 'default', initial_balance: 100000, available_margin: 100000, used_margin: 0, realized_pnl: 0, total_charges: 0, updated_at: new Date() },
+  wallet: { id: 'default', initial_balance: 100000, available_margin: 100000, used_margin: 0, realized_pnl: 0, total_charges: 0, session_realized_base: 0, session_date: null as string | null, updated_at: new Date() },
   orders: [] as any[],
   positions: new Map<string, any>(),
   strategies: [] as any[],
@@ -116,6 +117,9 @@ const SCHEMA_SQL = `
   ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS margin_blocked NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
   ALTER TABLE paper_wallet ADD COLUMN IF NOT EXISTS total_charges NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
   ALTER TABLE paper_strategies ADD COLUMN IF NOT EXISTS margin_hedge_credit NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
+  ALTER TABLE paper_wallet ADD COLUMN IF NOT EXISTS session_realized_base NUMERIC(14, 2) NOT NULL DEFAULT 0.00;
+  ALTER TABLE paper_wallet ADD COLUMN IF NOT EXISTS session_date VARCHAR(10);
+  ALTER TABLE risk_state ADD COLUMN IF NOT EXISTS killed_date VARCHAR(10);
 `;
 
 export async function initDatabase(): Promise<void> {
@@ -289,17 +293,18 @@ export async function getRiskState() {
   if (mode === 'postgres') {
     try {
       const res = await pool.query('SELECT * FROM risk_state WHERE id = $1', ['default']);
-      if (res.rows.length) return { killed: res.rows[0].killed, killedReason: res.rows[0].killed_reason, limits: res.rows[0].limits || {}, consecutiveLosses: Number(res.rows[0].consecutive_losses || 0) };
+      if (res.rows.length) return { killed: res.rows[0].killed, killedReason: res.rows[0].killed_reason, killedDate: res.rows[0].killed_date || null, limits: res.rows[0].limits || {}, consecutiveLosses: Number(res.rows[0].consecutive_losses || 0) };
     } catch { /* fall through */ }
   }
-  return mem.riskState || { killed: false, killedReason: null, limits: {}, consecutiveLosses: 0 };
+  return mem.riskState || { killed: false, killedReason: null, killedDate: null, limits: {}, consecutiveLosses: 0 };
 }
 
-export async function saveRiskState(state: { killed: boolean; killedReason?: string | null; limits?: any; consecutiveLosses?: number }) {
-  const current = mem.riskState || { killed: false, killedReason: null, limits: {}, consecutiveLosses: 0 };
+export async function saveRiskState(state: { killed: boolean; killedReason?: string | null; killedDate?: string | null; limits?: any; consecutiveLosses?: number }) {
+  const current = mem.riskState || { killed: false, killedReason: null, killedDate: null, limits: {}, consecutiveLosses: 0 };
   const merged = {
     killed: state.killed,
     killedReason: state.killedReason ?? null,
+    killedDate: state.killedDate ?? (state.killed ? current.killedDate : null) ?? null,
     limits: state.limits ?? current.limits ?? {},
     consecutiveLosses: state.consecutiveLosses ?? current.consecutiveLosses ?? 0,
   };
@@ -309,10 +314,10 @@ export async function saveRiskState(state: { killed: boolean; killedReason?: str
   if (mode === 'postgres') {
     try {
       await pool.query(
-        `INSERT INTO risk_state (id, killed, killed_reason, limits, consecutive_losses)
-         VALUES ('default', $1, $2, $3, $4)
-         ON CONFLICT (id) DO UPDATE SET killed = $1, killed_reason = $2, limits = $3, consecutive_losses = $4, updated_at = NOW()`,
-        [merged.killed, merged.killedReason, JSON.stringify(merged.limits), merged.consecutiveLosses],
+        `INSERT INTO risk_state (id, killed, killed_reason, killed_date, limits, consecutive_losses)
+         VALUES ('default', $1, $2, $3, $4, $5)
+         ON CONFLICT (id) DO UPDATE SET killed = $1, killed_reason = $2, killed_date = $3, limits = $4, consecutive_losses = $5, updated_at = NOW()`,
+        [merged.killed, merged.killedReason, merged.killedDate, JSON.stringify(merged.limits), merged.consecutiveLosses],
       );
     } catch { /* non-fatal */ }
   }
@@ -413,17 +418,40 @@ export async function deletePaperStrategy(id: string) {
   return { id, status: 'deleted' };
 }
 
+/** `realized_pnl` on the wallet is a LIFETIME counter (feeds equity, never
+ * reset). "Daily loss limit" needs a number scoped to the current IST
+ * trading session instead — this snapshots the lifetime total at the start
+ * of each new session so callers can subtract it back out. Runs on every
+ * getPaperWallet() read (cheap: one string compare) rather than a scheduler,
+ * so it self-heals whenever the process happens to be up across the
+ * rollover, restart included. */
+async function ensureWalletSessionRolled(): Promise<void> {
+  const today = marketClock().istDate;
+  const w = mem.wallet as any;
+  if (w.session_date === today) return;
+  w.session_realized_base = Number(w.realized_pnl);
+  w.session_date = today;
+  if (mode === 'postgres') {
+    await pool.query(
+      'UPDATE paper_wallet SET session_realized_base = $1, session_date = $2, updated_at = NOW() WHERE id = $3',
+      [w.session_realized_base, today, w.id],
+    ).catch(() => {});
+  }
+}
+
 // ── wallet ──────────────────────────────────────────────────────────────
 // Reads always come from `mem` (see header) — Postgres is written to on every
 // fill but never read back on the hot path.
 export async function getPaperWallet() {
   const w = mem.wallet as any;
   if (!w) {
-    return { availableMargin: 100000, usedMargin: 0, realizedPnl: 0, unrealizedPnl: 0, totalCharges: 0, netRealizedPnl: 0, totalBalance: 100000, equity: 100000, spanMargin: 0, exposureMargin: 0 };
+    return { availableMargin: 100000, usedMargin: 0, realizedPnl: 0, sessionRealizedPnl: 0, unrealizedPnl: 0, totalCharges: 0, netRealizedPnl: 0, totalBalance: 100000, equity: 100000, spanMargin: 0, exposureMargin: 0 };
   }
+  await ensureWalletSessionRolled();
   const availableMargin = Number(w.available_margin);
   const usedMargin = Number(w.used_margin);
   const realizedPnl = Number(w.realized_pnl);
+  const sessionRealizedPnl = realizedPnl - Number(w.session_realized_base || 0);
   const totalCharges = Number(w.total_charges || 0);
   const initialBalance = Number(w.initial_balance);
   let unrealizedPnl = 0;
@@ -433,7 +461,7 @@ export async function getPaperWallet() {
     unrealizedPnl += computeUnrealized(netQty, Number(pos.buy_avg), Number(pos.sell_avg), Number(pos.ltp));
   }
   return {
-    availableMargin, usedMargin, realizedPnl, unrealizedPnl, totalCharges,
+    availableMargin, usedMargin, realizedPnl, sessionRealizedPnl, unrealizedPnl, totalCharges,
     netRealizedPnl: Number((realizedPnl - totalCharges).toFixed(2)),
     totalBalance: availableMargin + usedMargin,
     // Net worth: capital + booked P&L + open P&L, net of charges — distinct
@@ -468,7 +496,7 @@ export async function resetPaperWallet(initialBalance = 100000) {
     try {
       await client.query('BEGIN');
       await client.query(
-        `UPDATE paper_wallet SET initial_balance = $1, available_margin = $1, used_margin = 0, realized_pnl = 0, total_charges = 0, updated_at = NOW() WHERE id = 'default'`,
+        `UPDATE paper_wallet SET initial_balance = $1, available_margin = $1, used_margin = 0, realized_pnl = 0, total_charges = 0, session_realized_base = 0, session_date = NULL, updated_at = NOW() WHERE id = 'default'`,
         [initialBalance],
       );
       await client.query('DELETE FROM paper_positions');
@@ -476,7 +504,7 @@ export async function resetPaperWallet(initialBalance = 100000) {
       await client.query('DELETE FROM paper_strategies');
       await client.query('DELETE FROM alerts');
       await client.query('DELETE FROM agent_events');
-      await client.query(`UPDATE risk_state SET killed = FALSE, killed_reason = NULL, limits = '{}', consecutive_losses = 0, updated_at = NOW() WHERE id = 'default'`);
+      await client.query(`UPDATE risk_state SET killed = FALSE, killed_reason = NULL, killed_date = NULL, limits = '{}', consecutive_losses = 0, updated_at = NOW() WHERE id = 'default'`);
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK');
@@ -486,7 +514,7 @@ export async function resetPaperWallet(initialBalance = 100000) {
     }
   }
   // The in-memory cache is the read path in both modes — always reset it.
-  mem.wallet = { id: 'default', initial_balance: initialBalance, available_margin: initialBalance, used_margin: 0, realized_pnl: 0, total_charges: 0, updated_at: new Date() };
+  mem.wallet = { id: 'default', initial_balance: initialBalance, available_margin: initialBalance, used_margin: 0, realized_pnl: 0, total_charges: 0, session_realized_base: 0, session_date: null, updated_at: new Date() };
   mem.orders = [];
   mem.positions.clear();
   mem.strategies = [];
@@ -743,6 +771,11 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
     }
   }
 
+  // Snapshot the session base BEFORE folding this fill's realized PnL in —
+  // otherwise a fill landing before this process's first getPaperWallet()
+  // read of the day would get silently absorbed into the rollover baseline
+  // instead of counted as today's P&L.
+  await ensureWalletSessionRolled();
   pushOrderToMem(orderId, sym, securityId, exchangeSegment, input, qty, fillPrice, latencyMs, u.realized, charges);
   applyFillToMem(sym, u, newRealized, fillPrice, marginRequired, input, charges);
 
@@ -775,13 +808,24 @@ function computeUnrealized(netQty: number, buyAvg: number, sellAvg: number, ltp:
   return netQty > 0 ? (ltp - buyAvg) * netQty : (sellAvg - ltp) * Math.abs(netQty);
 }
 
-export async function markPositionsToMarket(ltpResolver: (securityId: string, symbol: string) => number | null): Promise<number> {
+export interface MarkToMarketResult {
+  totalUnrealized: number;
+  /** Positions where the resolver returned null this cycle — marked from a
+   * stale/last-known price, not a fresh quote. Distinct from "confidently
+   * priced" so a feed dropout during market hours is visible instead of
+   * silently smoothed over by reusing an old LTP forever. */
+  staleCount: number;
+}
+
+export async function markPositionsToMarket(ltpResolver: (securityId: string, symbol: string) => number | null): Promise<MarkToMarketResult> {
   let totalUnrealized = 0;
+  let staleCount = 0;
   for (const pos of mem.positions.values()) {
     const netQty = Number(pos.net_qty);
     if (netQty === 0) continue;
     const buyAvg = Number(pos.buy_avg), sellAvg = Number(pos.sell_avg);
     const ltp = ltpResolver(pos.security_id, pos.symbol);
+    if (ltp == null) staleCount++;
     const effectiveLtp = ltp ?? Number(pos.ltp || (netQty > 0 ? buyAvg : sellAvg));
     const unrealized = computeUnrealized(netQty, buyAvg, sellAvg, effectiveLtp);
     totalUnrealized += unrealized;
@@ -789,7 +833,7 @@ export async function markPositionsToMarket(ltpResolver: (securityId: string, sy
     pos.unrealized_pnl = unrealized;
     pos.updated_at = new Date();
   }
-  return totalUnrealized;
+  return { totalUnrealized, staleCount };
 }
 
 export async function listPaperPositions() {

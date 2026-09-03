@@ -392,11 +392,11 @@ export class AgentOrchestrator {
       return { status: 'SKIPPED' };
     }
 
-    let filledCount = 0;
     this.market.addInstruments(strat.legs.map((l) => ({ securityId: l.securityId, exchangeSegment: l.exchangeSegment || 'NSE_FNO' })));
+    const isLive = process.env.TRADING_MODE === 'live';
+    const engine = isLive ? this.live : this.paper;
+    const filledLegs: typeof strat.legs = [];
     for (const leg of strat.legs) {
-      const isLive = process.env.TRADING_MODE === 'live';
-      const engine = isLive ? this.live : this.paper;
       const res = await engine.placeOrder({
         correlation_id: `${strat.id}_${leg.optionType}_${leg.strike}`,
         intent_id: runId,
@@ -411,13 +411,41 @@ export class AgentOrchestrator {
           trailing_stop: leg.trailingStop,
         },
       });
-      if (res && (res.status === 'TRADED' || res.orderId)) filledCount++;
+      if (res && (res.status === 'TRADED' || res.orderId)) {
+        filledLegs.push(leg);
+      } else {
+        // Stop rather than keep filling — more legs into a broken structure
+        // is more exposure to unwind, not less.
+        break;
+      }
     }
 
-    if (filledCount > 0) {
+    if (filledLegs.length > 0 && filledLegs.length < strat.legs.length) {
+      // Partial fill on a multi-leg structure is worse than no fill — e.g. a
+      // short leg filling without its hedge is naked, undefined risk. Unwind
+      // whatever filled rather than leaving it to stand.
+      for (const leg of filledLegs) {
+        const unwindPrice = this.market.getFillablePrice(leg.securityId, { allowClosed: true }) ?? leg.price;
+        await engine.placeOrder({
+          correlation_id: `${strat.id}_${leg.optionType}_${leg.strike}_unwind`,
+          intent_id: runId,
+          params: {
+            security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
+            transaction_type: leg.side === 'BUY' ? 'SELL' : 'BUY', order_type: 'MARKET',
+            exchange_segment: leg.exchangeSegment || 'NSE_FNO', product_type: 'INTRADAY', price: unwindPrice,
+          },
+        }).catch(() => {});
+        this.market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
+      }
+      eventBus.log('ERROR', `Multi-leg deploy ${strat.name} partially filled (${filledLegs.length}/${strat.legs.length}) — unwound`, 'agent');
+      this.step(runId, 'execution', 'ACT', `Strategy ${strat.name} partial fill unwound (${filledLegs.length}/${strat.legs.length})`);
+      return { status: 'FAILED', reason: 'partial_fill_unwound' };
+    }
+
+    if (filledLegs.length === strat.legs.length && filledLegs.length > 0) {
       await createPaperStrategy({ id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots, legs: strat.legs });
-      this.step(runId, 'execution', 'ACT', `Strategy deployed: ${strat.name} (${filledCount}/${strat.legs.length} legs filled)`);
-      return { status: 'TRADED', strategyId: strat.id, legsFilled: filledCount };
+      this.step(runId, 'execution', 'ACT', `Strategy deployed: ${strat.name} (${filledLegs.length}/${strat.legs.length} legs filled)`);
+      return { status: 'TRADED', strategyId: strat.id, legsFilled: filledLegs.length };
     }
     return { status: 'FAILED' };
   }

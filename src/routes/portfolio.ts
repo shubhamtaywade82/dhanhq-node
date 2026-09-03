@@ -159,6 +159,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       const pos = positions.find((p) => p.tradingSymbol === symbol.toUpperCase());
       const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
       const result = await closePaperPosition(symbol, liveLtp || (ltp ? Number(ltp) : undefined));
+      if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       res.json(result);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -265,8 +266,10 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
           },
         });
         if (result.status !== 'TRADED') {
+          // Stop rather than skip to the next leg — firing more legs into a
+          // structure that's already broken only adds more exposure to unwind.
           eventBus.log('WARN', `Strategy ${name}: leg ${leg.instrument} rejected — ${result.reason}`, 'portfolio');
-          continue;
+          break;
         }
         filled++;
         legsWithPx.push({ ...leg, ltp: result.fill_price });
@@ -277,6 +280,26 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       }
       if (filled === 0) {
         return res.status(422).json({ error: 'No leg could be priced from the live market feed — strategy not deployed' });
+      }
+      if (filled < pricedLegs.length) {
+        // Partial fill on a multi-leg structure is worse than no fill — e.g.
+        // a short leg filling without its hedge is naked, undefined risk.
+        // Unwind whatever filled rather than leaving it to stand.
+        for (const filledLeg of legsWithPx) {
+          const unwindPrice = market.getFillablePrice(String(filledLeg.securityId || '0'), { allowClosed: true }) ?? filledLeg.ltp;
+          await paper.placeOrder({
+            correlation_id: `${strategyId}_${filledLeg.instrument}_unwind`,
+            intent_id: strategyId,
+            params: {
+              security_id: filledLeg.securityId || '0', symbol: filledLeg.instrument, quantity: filledLeg.qty,
+              transaction_type: filledLeg.side === 'BUY' ? 'SELL' : 'BUY', order_type: 'MARKET',
+              exchange_segment: filledLeg.exchangeSegment || 'NSE_FNO', product_type: 'INTRADAY', price: unwindPrice,
+            },
+          }).catch(() => {});
+          if (filledLeg.securityId) market.monitor.untrack(filledLeg.exchangeSegment || 'NSE_FNO', String(filledLeg.securityId));
+        }
+        eventBus.log('ERROR', `Strategy ${name}: partial fill (${filled}/${pricedLegs.length} legs) — unwound`, 'portfolio');
+        return res.status(422).json({ error: `Partial fill (${filled}/${pricedLegs.length} legs) — unwound, strategy not deployed` });
       }
 
       // Release the hedge benefit: legs above each blocked their own
@@ -371,6 +394,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
           const pos = positions.find((p) => p.tradingSymbol === leg.instrument);
           const ltp = pos ? market.getLtp(String(pos.securityId)) || pos.ltp : undefined;
           await closePaperPosition(leg.instrument, ltp);
+          if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         }
         await updatePaperStrategyStatus(id, 'STOPPED');
       }

@@ -8,7 +8,7 @@ import { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import {
   initDatabase, dbMode, executePaperOrder, getPaperWallet,
   listPaperPositions, closeAllPaperPositions, markPositionsToMarket,
-  resetPaperWallet, pool,
+  resetPaperWallet, pool, saveRiskState,
 } from '../db';
 
 /**
@@ -146,6 +146,51 @@ describe('RiskEngine — real-state circuit breakers', () => {
   });
 });
 
+describe('RiskEngine — IST session rollover (RISK-01)', () => {
+  beforeAll(async () => { await initDatabase(); });
+  beforeEach(async () => { await resetPaperWallet(100000); });
+  afterAll(async () => { await resetPaperWallet(100000); });
+
+  it('scopes sessionRealizedPnl to today, not the lifetime wallet total', async () => {
+    await executePaperOrder({ symbol: 'SESSTEST', securityId: '44000', quantity: 50, transactionType: 'BUY', price: 100 });
+    await executePaperOrder({ symbol: 'SESSTEST', securityId: '44000', quantity: 50, transactionType: 'SELL', price: 110 }); // +500 realized
+
+    const w1 = await getPaperWallet();
+    // First read of a fresh session snapshots the base at the current lifetime
+    // total, so a session that already has realized PnL when the process
+    // boots doesn't retroactively count as "today's" loss/gain.
+    expect(w1.sessionRealizedPnl).toBe(w1.realizedPnl);
+
+    await executePaperOrder({ symbol: 'SESSTEST', securityId: '44000', quantity: 50, transactionType: 'BUY', price: 100 });
+    await executePaperOrder({ symbol: 'SESSTEST', securityId: '44000', quantity: 50, transactionType: 'SELL', price: 106 }); // +300 more
+
+    const w2 = await getPaperWallet();
+    expect(w2.sessionRealizedPnl).toBeCloseTo(w1.sessionRealizedPnl + 300, 2);
+    expect(w2.realizedPnl).toBeCloseTo(w1.realizedPnl + 300, 2);
+  });
+
+  it('auto-clears a kill switch armed on a prior trading day', async () => {
+    await saveRiskState({ killed: true, killedReason: 'stale test kill', killedDate: '2000-01-01', limits: {} });
+    const risk = new RiskEngine(stubClient(), stubMarket(100));
+    await risk.start();
+    expect(risk.isKilled()).toBe(false);
+    risk.stop();
+  });
+
+  it('keeps a kill switch armed today across a restart', async () => {
+    const today = new Date().toISOString().slice(0, 10); // close enough for a same-instant restart in CI's UTC/IST window
+    await saveRiskState({ killed: true, killedReason: 'live test kill', killedDate: today, limits: {} });
+    const risk = new RiskEngine(stubClient(), stubMarket(100));
+    await risk.start();
+    // Only assert same-day persistence when the host clock and IST agree on
+    // the date (avoids UTC-evening flakiness where `today` != IST's today).
+    const { marketClock } = await import('../services/marketHours');
+    if (marketClock().istDate === today) expect(risk.isKilled()).toBe(true);
+    risk.stop();
+    await saveRiskState({ killed: false, killedReason: null, killedDate: null, limits: {} });
+  });
+});
+
 describe('Kill switch — real position square-off', () => {
   beforeAll(async () => { await initDatabase(); });
 
@@ -178,8 +223,9 @@ describe('Mark-to-market — autonomy loop feed', () => {
   it('marks open positions from live ticks', async () => {
     await executePaperOrder({ symbol: 'MARKTEST', securityId: '44000', quantity: 50, transactionType: 'BUY', price: 100 });
     const market = stubMarket(150);
-    const unrealized = await markPositionsToMarket((secId) => market.getLtp(secId));
-    expect(unrealized).toBeGreaterThan(0); // (150-100)*50 across open positions
+    const { totalUnrealized, staleCount } = await markPositionsToMarket((secId) => market.getLtp(secId));
+    expect(totalUnrealized).toBeGreaterThan(0); // (150-100)*50 across open positions
+    expect(staleCount).toBe(0);
     const pos = (await listPaperPositions()).find((p: any) => p.tradingSymbol === 'MARKTEST');
     expect(pos?.ltp).toBe(150);
     expect(pos?.unrealizedPnl).toBeGreaterThan(0);
@@ -219,6 +265,36 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
     await expect(agent.run('test objective')).rejects.toThrow(/kill switch/i);
     await risk.disarmKillSwitch();
     risk.stop();
+  });
+
+  it('unwinds a multi-leg deploy when only some legs fill (EXEC-01)', async () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST, Tuesday
+    try {
+      const { agent } = await stubEngines(100); // quote exists only for security '44000'
+      const strat = {
+        id: `exec01_test_${Date.now()}`,
+        name: 'Test Bull Call Spread',
+        symbol: 'NIFTY',
+        type: 'BULL_CALL_SPREAD' as any,
+        lots: 1,
+        estimatedNetPremium: 0,
+        lotSize: 50,
+        legs: [
+          // Fillable: quote exists for this security.
+          { instrument: 'NIFTY24050CE', securityId: '44000', side: 'BUY' as const, qty: 50, strike: 24050, optionType: 'CE' as const, price: 100, exchangeSegment: 'NSE_FNO' },
+          // Unfillable: no quote for this security and no fallback price → paper.placeOrder REJECTs.
+          { instrument: 'NIFTY24150CE', securityId: '99999', side: 'SELL' as const, qty: 50, strike: 24150, optionType: 'CE' as const, price: 0, exchangeSegment: 'NSE_FNO' },
+        ],
+      };
+      const result: any = await (agent as any).executeStrategy('run1', 'deploy this spread', strat, true);
+      expect(result.status).toBe('FAILED');
+      expect(result.reason).toBe('partial_fill_unwound');
+      const pos = (await listPaperPositions()).find((p: any) => p.tradingSymbol === 'NIFTY24050CE');
+      expect(Number(pos?.netQty || 0)).toBe(0); // the leg that filled was unwound back to flat
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 
