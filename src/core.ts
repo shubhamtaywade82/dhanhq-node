@@ -1,5 +1,5 @@
 import { DhanClient, OrderTracker, type PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
-import { createDhanClient, redisPublisher, redisAvailable } from './auth';
+import { createDhanClient, createSandboxDhanClient, redisPublisher, redisAvailable } from './auth';
 import { initDatabase, listPaperPositions, findMissingOrders, pushAlert } from './db';
 import { MarketDataService, toTrailConfig } from './services/marketData';
 import { RiskEngine } from './services/riskEngine';
@@ -11,6 +11,7 @@ import { startTelegramNotifier } from './services/telegramNotifier';
 import { eventBus } from './services/eventBus';
 import { PaperExecutionEngine } from './engines/paper';
 import { LiveExecutionEngine } from './engines/live';
+import { SandboxExecutionEngine } from './engines/sandbox';
 import { marketClock } from './services/marketHours';
 import { hasHolidayCoverage } from './services/holidays';
 import { journal, summarizeDay, type JournalEntry } from './services/journal';
@@ -29,8 +30,24 @@ export interface Core {
   agent: AgentOrchestrator;
   paper: PaperExecutionEngine;
   live: LiveExecutionEngine;
+  sandbox?: SandboxExecutionEngine;
   tracker: OrderTracker;
   selfHealing: SelfHealingService;
+}
+
+/**
+ * The ONE place that maps TRADING_MODE to an execution engine — replaces
+ * the `isLive ? core.live : core.paper` check that used to be duplicated
+ * at every call site (agent.ts, index.ts), which had no room for a third
+ * mode.
+ */
+export function resolveExecutionEngine(core: Core, mode: string | undefined): PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine {
+  if (mode === 'live') return core.live;
+  if (mode === 'sandbox') {
+    if (!core.sandbox) throw new Error('TRADING_MODE=sandbox but the sandbox engine was not initialized (missing DHAN_SANDBOX_CLIENT_ID/DHAN_SANDBOX_ACCESS_TOKEN?)');
+    return core.sandbox;
+  }
+  return core.paper;
 }
 
 import { seedStandardStrategies } from './services/strategyConstructor';
@@ -62,6 +79,12 @@ export async function startCore(): Promise<Core> {
       'after that verification (see the comment above this block).'
     );
   }
+  if (process.env.TRADING_MODE === 'sandbox' && !createSandboxDhanClient()) {
+    throw new Error(
+      'TRADING_MODE=sandbox requires DHAN_SANDBOX_CLIENT_ID and DHAN_SANDBOX_ACCESS_TOKEN — set them, or use TRADING_MODE=paper.'
+    );
+  }
+
   await initDatabase();
   const client = await createDhanClient();
 
@@ -87,7 +110,11 @@ export async function startCore(): Promise<Core> {
 
   const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
   const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk, portfolio);
-  const agent = new AgentOrchestrator(client, market, risk, paper, live);
+  // Sandbox client always uses the Real client for market data/WS (Dhan's
+  // sandbox has neither) — only order routing goes to the sandbox account.
+  const sandboxClient = createSandboxDhanClient();
+  const sandbox = sandboxClient ? new SandboxExecutionEngine(sandboxClient, market, risk) : undefined;
+  const agent = new AgentOrchestrator(client, market, risk, paper, live, sandbox);
   autonomy.setAgent(agent);
   autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, paper, risk));
 
@@ -135,7 +162,7 @@ export async function startCore(): Promise<Core> {
   eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
-  return { client, market, risk, autonomy, agent, paper, live, tracker, selfHealing };
+  return { client, market, risk, autonomy, agent, paper, live, sandbox, tracker, selfHealing };
 }
 
 /**

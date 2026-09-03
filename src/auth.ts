@@ -179,6 +179,28 @@ export async function createDhanClient(): Promise<DhanClient> {
   return client;
 }
 
+/**
+ * Builds a DhanHQ Sandbox client for TRADING_MODE=sandbox — real order
+ * routing against Dhan's paper-trading environment (flat ₹100 fills, no
+ * WebSocket). Deliberately simpler than createDhanClient(): sandbox tokens
+ * don't need the Redis/Rails-authority/TOTP rotation chain the real
+ * account's live trading token does, so this just reads two env vars once.
+ *
+ * Returns undefined when unconfigured, so sandbox mode stays opt-in.
+ */
+export function createSandboxDhanClient(): DhanClient | undefined {
+  const clientId = process.env.DHAN_SANDBOX_CLIENT_ID;
+  const token = process.env.DHAN_SANDBOX_ACCESS_TOKEN;
+  if (!clientId || !token) return undefined;
+
+  return new DhanClient({
+    clientId,
+    token,
+    baseURL: process.env.DHAN_SANDBOX_BASE_URL || "https://sandbox.dhan.co/v2",
+    timeoutMs: 20000,
+  });
+}
+
 async function setupTokenRotationSubscriber() {
   if (!(await redisAvailable())) return;
   redisSubscriber.subscribe("dhan:auth:rotated", (err) => {

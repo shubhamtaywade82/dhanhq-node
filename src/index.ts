@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-import { startCore } from "./core";
+import { startCore, resolveExecutionEngine } from "./core";
 import Redis from "ioredis";
 import type { Core } from "./core";
 import { moduleLogger, logError } from "./lib/logger";
@@ -62,8 +62,7 @@ async function listenForIntents(core: Core): Promise<void> {
     try {
       const intent = JSON.parse(message);
       log.info({ intentId: intent.intent_id, strategy: intent.strategy }, "Processing execution intent");
-      const isLive = process.env.TRADING_MODE === "live";
-      const engine = isLive ? core.live : core.paper;
+      const engine = resolveExecutionEngine(core, process.env.TRADING_MODE);
       await engine.placeOrder(intent);
     } catch (e: any) {
       logError(log, "Execution failed", e);

@@ -7,6 +7,7 @@ import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules } 
 import { INDEX_INSTRUMENTS } from './marketData';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { LiveExecutionEngine } from '../engines/live';
+import type { SandboxExecutionEngine } from '../engines/sandbox';
 import { analyzeOptionChain, recordIvSample, getIvRank, selectStrikeByDelta } from './optionsAnalytics';
 import {
   buildIronCondor, buildIronButterfly, buildCreditSpread, buildDebitSpread,
@@ -91,6 +92,7 @@ export class AgentOrchestrator {
   private risk: RiskEngine;
   private paper: PaperExecutionEngine;
   private live: LiveExecutionEngine;
+  private sandbox?: SandboxExecutionEngine;
   private tools: AgentToolRegistry;
   private ollama: OllamaClient | null = null;
   private llmModel: string;
@@ -99,12 +101,13 @@ export class AgentOrchestrator {
   private currentRun: AgentRunStatus | null = null;
   private llmProbed = false;
 
-  constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, paper: PaperExecutionEngine, live: LiveExecutionEngine) {
+  constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, paper: PaperExecutionEngine, live: LiveExecutionEngine, sandbox?: SandboxExecutionEngine) {
     this.client = client;
     this.market = market;
     this.risk = risk;
     this.paper = paper;
     this.live = live;
+    this.sandbox = sandbox;
     this.llmModel = process.env.OLLAMA_MODEL || 'qwen2.5:0.5b';
     this.tools = new AgentToolRegistry({ client, policy: Policy.fromEnv() });
 
@@ -446,8 +449,8 @@ export class AgentOrchestrator {
     }
 
     this.market.addInstruments(strat.legs.map((l) => ({ securityId: l.securityId, exchangeSegment: l.exchangeSegment || 'NSE_FNO' })));
-    const isLive = process.env.TRADING_MODE === 'live';
-    const engine = isLive ? this.live : this.paper;
+    const mode = process.env.TRADING_MODE;
+    const engine = mode === 'live' ? this.live : mode === 'sandbox' && this.sandbox ? this.sandbox : this.paper;
     const filledLegs: typeof strat.legs = [];
     for (const leg of strat.legs) {
       const res = await engine.placeOrder({
