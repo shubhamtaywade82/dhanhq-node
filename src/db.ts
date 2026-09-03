@@ -1037,3 +1037,38 @@ export async function correctLedgerFromPostgres(report: LedgerDriftReport): Prom
     mem.positions.delete(symbol);
   }
 }
+
+/**
+ * Returns the subset of the given IDs that have NO matching durable order
+ * record — used by core.ts's boot-time journal cross-check (journal.ts's
+ * summarizeDay) to verify every trade the journal recorded as TRADED
+ * actually has a row in the durable order history. Checked against BOTH
+ * `id` and `correlation_id`: an ENTRY's journaled id is the caller's own
+ * correlation id (the `correlation_id` column), while an EXIT's
+ * (closePaperPosition) is the generated order id (the `id` column) —
+ * closePaperPosition reuses the `correlation_id` field name in its fill
+ * payload for that value, so the caller doesn't need to know which is
+ * which; this checks both.
+ */
+export async function findMissingOrders(ids: string[]): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const remaining = new Set(ids);
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT id, correlation_id FROM paper_orders WHERE id = ANY($1) OR correlation_id = ANY($1)', [ids]);
+      for (const row of res.rows) {
+        remaining.delete(row.id);
+        if (row.correlation_id) remaining.delete(row.correlation_id);
+      }
+    } catch (e: any) {
+      log.warn({ err: { message: e.message } }, 'findMissingOrders query failed — skipping this boot cross-check');
+      return []; // a failed CHECK is not itself a finding
+    }
+  } else {
+    for (const o of mem.orders) {
+      remaining.delete(o.id);
+      if (o.correlation_id) remaining.delete(o.correlation_id);
+    }
+  }
+  return [...remaining];
+}

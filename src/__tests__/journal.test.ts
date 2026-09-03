@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { Journal } from '../services/journal';
+import { Journal, summarizeDay, type JournalEntry } from '../services/journal';
 
 describe('Journal', () => {
   let dir: string;
@@ -117,5 +117,44 @@ describe('Journal', () => {
 
     const lines = readFileSync(join(dir, '2026-03-10.ndjson'), 'utf8').trim().split('\n');
     expect(lines.length).toBe(50);
+  });
+});
+
+describe('summarizeDay', () => {
+  function entry(seq: number, kind: JournalEntry['kind'], payload: any): JournalEntry {
+    return { seq, ts: seq, kind, payload };
+  }
+
+  it('collects the correlation_id of every TRADED order_result, in order', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'a' }),
+      entry(2, 'order_result', { correlation_id: 'a', status: 'TRADED' }),
+      entry(3, 'order_result', { correlation_id: 'b', status: 'REJECTED', reason: 'no LTP' }),
+      entry(4, 'order_result', { correlation_id: 'c', status: 'TRADED' }),
+    ];
+    expect(summarizeDay(entries).tradedCorrelationIds).toEqual(['a', 'c']);
+  });
+
+  it('ignores a TRADED result with no correlation_id rather than pushing undefined', () => {
+    const entries: JournalEntry[] = [entry(1, 'order_result', { status: 'TRADED' })];
+    expect(summarizeDay(entries).tradedCorrelationIds).toEqual([]);
+  });
+
+  it('reports the LAST kill-switch action seen, not the first', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'kill', { action: 'arm', reason: 'daily loss' }),
+      entry(2, 'kill', { action: 'disarm' }),
+      entry(3, 'kill', { action: 'arm', reason: 'manual' }),
+    ];
+    expect(summarizeDay(entries).lastKillAction).toBe('arm');
+  });
+
+  it('reports null kill action when the day has none', () => {
+    const entries: JournalEntry[] = [entry(1, 'control_command', { route: 'POST /autonomy' })];
+    expect(summarizeDay(entries).lastKillAction).toBeNull();
+  });
+
+  it('handles an empty day', () => {
+    expect(summarizeDay([])).toEqual({ tradedCorrelationIds: [], lastKillAction: null });
   });
 });

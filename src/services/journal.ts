@@ -11,13 +11,20 @@ const log = moduleLogger('journal');
  * Postgres (current position/wallet state) and from stdout logs (verbose,
  * not queryable by kind, rotated away by the host).
  *
- * Scope for this pass: a durable, queryable AUDIT TRAIL — order intents and
- * their results, risk decisions (breaker trips, kill/disarm), EOD/square-off
+ * Scope: a durable, queryable AUDIT TRAIL — order intents and their
+ * results, risk decisions (breaker trips, kill/disarm), EOD/square-off
  * events, and every control-plane command an operator issues. NOT tick
- * data (a separate, much higher-volume concern with its own tradeoffs) and
- * NOT yet used to reconstruct in-memory state on boot — this establishes
- * the durable record and the call sites that write to it; replaying it to
- * rebuild state after a crash is a follow-up, not done here.
+ * data (a separate, much higher-volume concern with its own tradeoffs).
+ *
+ * summarizeDay() (below) reads today's entries back on boot for a
+ * CROSS-CHECK against Postgres/mem (core.ts) — verifying every journaled
+ * trade has a matching durable order record, and that the journal's last
+ * kill-switch action agrees with the risk engine's current state — not a
+ * full event-sourced reconstruction. The journal never writes state back;
+ * a mismatch is surfaced loudly (log + alert), never silently "fixed" from
+ * the journal, because the journal only covers what happened THIS trading
+ * day and can't tell a legitimate multi-day carry-over position from
+ * actual drift.
  *
  * One file per IST trading day (JOURNAL_DIR/YYYY-MM-DD.ndjson), so a day's
  * journal is a bounded, easy-to-ship artifact and old days can be archived
@@ -148,3 +155,40 @@ export class Journal {
  * that needs to journal a decision imports this directly rather than
  * threading a Journal instance through every constructor. */
 export const journal = new Journal();
+
+export interface DayReplaySummary {
+  /** correlation_id of every TRADED order_result seen today. For an ENTRY
+   * this is the caller's own correlation id (paper_orders.correlation_id);
+   * for an EXIT (db.ts's closePaperPosition) it's the generated order id
+   * (paper_orders.id) — closePaperPosition reuses the `correlation_id`
+   * field name for that value. findMissingOrders() (db.ts) checks a
+   * candidate against both columns, so this list doesn't need to
+   * distinguish which kind it is. */
+  tradedCorrelationIds: string[];
+  /** The last kill-switch action recorded today, or null if none. */
+  lastKillAction: 'arm' | 'disarm' | null;
+}
+
+/**
+ * Pure summary of one day's entries — no I/O, easy to test in isolation
+ * from real files. Deliberately narrow: this does NOT attempt to derive
+ * net position quantities, because a position carried over from a PRIOR
+ * trading day has no fills in TODAY's journal at all (each day is its own
+ * file — see Journal.open()), so "journal-implied qty" and "actual qty"
+ * would disagree for a structural reason that has nothing to do with
+ * drift. Order-existence and kill-state are the two things a single day's
+ * journal can check without that ambiguity.
+ */
+export function summarizeDay(entries: JournalEntry[]): DayReplaySummary {
+  const tradedCorrelationIds: string[] = [];
+  let lastKillAction: 'arm' | 'disarm' | null = null;
+  for (const e of entries) {
+    if (e.kind === 'order_result' && e.payload?.status === 'TRADED' && e.payload?.correlation_id) {
+      tradedCorrelationIds.push(String(e.payload.correlation_id));
+    }
+    if (e.kind === 'kill' && (e.payload?.action === 'arm' || e.payload?.action === 'disarm')) {
+      lastKillAction = e.payload.action;
+    }
+  }
+  return { tradedCorrelationIds, lastKillAction };
+}

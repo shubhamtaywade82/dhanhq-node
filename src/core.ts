@@ -1,6 +1,6 @@
 import { DhanClient, OrderTracker, type PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
 import { createDhanClient, redisPublisher, redisAvailable } from './auth';
-import { initDatabase, listPaperPositions } from './db';
+import { initDatabase, listPaperPositions, findMissingOrders, pushAlert } from './db';
 import { MarketDataService, toTrailConfig } from './services/marketData';
 import { RiskEngine } from './services/riskEngine';
 import { AutonomyEngine } from './services/autonomy';
@@ -12,7 +12,7 @@ import { PaperExecutionEngine } from './engines/paper';
 import { LiveExecutionEngine } from './engines/live';
 import { marketClock } from './services/marketHours';
 import { hasHolidayCoverage } from './services/holidays';
-import { journal } from './services/journal';
+import { journal, summarizeDay, type JournalEntry } from './services/journal';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -108,6 +108,7 @@ export async function startCore(): Promise<Core> {
   // after it (as before) left a real window where a fired exit signal had
   // no listener yet and was silently lost.
   await risk.start();
+  await crossCheckJournalOnBoot(priorEntries, risk);
   await autonomy.start();
   await seedExistingPositions(market, market.monitor);
   await seedStandardStrategies(client, market, paper);
@@ -116,6 +117,42 @@ export async function startCore(): Promise<Core> {
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
   return { client, market, risk, autonomy, agent, paper, live, tracker, selfHealing };
+}
+
+/**
+ * Cross-checks today's journal against actual state — a restart-time
+ * sanity check, not a reconstruction. Only meaningful when priorEntries is
+ * non-empty (a restart later the same trading day); on a fresh day's first
+ * boot there's nothing yet to check against. Read-only: a mismatch is
+ * logged and alerted, never "corrected" from the journal — the journal
+ * only covers today and can't tell a legitimate multi-day carry-over
+ * position from actual drift, so it must never be treated as more
+ * authoritative than the ledger it's checking.
+ */
+export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk: RiskEngine): Promise<void> {
+  if (priorEntries.length === 0) return;
+  const summary = summarizeDay(priorEntries);
+
+  const missing = await findMissingOrders(summary.tradedCorrelationIds);
+  if (missing.length > 0) {
+    const msg = `Boot cross-check: journal recorded ${missing.length} trade(s) today with no matching durable order record (${missing.join(', ')}) — something may have altered the ledger outside the normal fill path`;
+    eventBus.log('ERROR', msg, 'core');
+    await pushAlert('ERROR', 'core', msg);
+  }
+
+  if (summary.lastKillAction === 'arm' && !risk.isKilled()) {
+    const msg = "Boot cross-check: journal's last kill-switch action today was ARM, but the risk engine reports NOT killed";
+    eventBus.log('WARN', msg, 'core');
+    await pushAlert('WARN', 'core', msg);
+  } else if (summary.lastKillAction === 'disarm' && risk.isKilled()) {
+    const msg = "Boot cross-check: journal's last kill-switch action today was DISARM, but the risk engine reports KILLED";
+    eventBus.log('WARN', msg, 'core');
+    await pushAlert('WARN', 'core', msg);
+  }
+
+  if (missing.length === 0 && (summary.lastKillAction === null || summary.lastKillAction === (risk.isKilled() ? 'arm' : 'disarm'))) {
+    eventBus.log('SYSTEM', `Boot cross-check: today's journal (${priorEntries.length} entries) agrees with current state`, 'core');
+  }
 }
 
 /** Re-subscribes quotes AND re-arms stop-loss/target for positions that

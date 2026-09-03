@@ -16,11 +16,21 @@
  */
 import {
   initDatabase, dbMode, pool, executePaperOrder, getPaperWallet, listPaperPositions,
-  reconcileLedger, correctLedgerFromPostgres, resetPaperWallet,
+  reconcileLedger, correctLedgerFromPostgres, resetPaperWallet, findMissingOrders, closePaperPosition,
 } from '../db';
 
 const RUN = !!process.env.TEST_DATABASE_URL;
 const d = RUN ? describe : describe.skip;
+
+// `pool` is a single module-level singleton shared by every describe block
+// in this file (and, if imported elsewhere in the same jest run, the whole
+// process) — ending it belongs in ONE top-level afterAll, not one per
+// describe block. Calling pool.end() inside the first block's afterAll
+// closed the pool before the second block's beforeAll could reconnect,
+// silently falling back to memory mode and failing every assertion in it.
+afterAll(async () => {
+  if (RUN) await pool.end();
+});
 
 d('reconcileLedger / correctLedgerFromPostgres (real Postgres)', () => {
   beforeAll(async () => {
@@ -29,7 +39,6 @@ d('reconcileLedger / correctLedgerFromPostgres (real Postgres)', () => {
   });
 
   beforeEach(async () => { await resetPaperWallet(100000); });
-  afterAll(async () => { await pool.end(); });
 
   it('reports no drift right after a normal fill — mem and Postgres were written from the same transaction', async () => {
     await executePaperOrder({ symbol: 'LEDGER_OK', securityId: '77001', quantity: 50, transactionType: 'BUY', price: 100 });
@@ -114,5 +123,30 @@ d('reconcileLedger / correctLedgerFromPostgres (real Postgres)', () => {
     await correctLedgerFromPostgres(report);
     expect((await listPaperPositions()).find((p) => p.tradingSymbol === 'LEDGER_PHANTOM')).toBeUndefined();
   });
+});
 
+d('findMissingOrders (real Postgres)', () => {
+  beforeAll(async () => {
+    await initDatabase();
+    expect(dbMode()).toBe('postgres');
+  });
+  beforeEach(async () => { await resetPaperWallet(100000); });
+
+  it('matches an entry order by its correlation_id column', async () => {
+    await executePaperOrder({
+      symbol: 'FMO_PG_ENTRY', securityId: '77007', quantity: 50,
+      transactionType: 'BUY', price: 100, correlationId: 'fmo_pg_corr_1',
+    });
+    expect(await findMissingOrders(['fmo_pg_corr_1'])).toEqual([]);
+  });
+
+  it('matches an exit order by its id column', async () => {
+    await executePaperOrder({ symbol: 'FMO_PG_EXIT', securityId: '77008', quantity: 50, transactionType: 'BUY', price: 100 });
+    const close: any = await closePaperPosition('FMO_PG_EXIT', 110);
+    expect(await findMissingOrders([close.orderId])).toEqual([]);
+  });
+
+  it('reports an id absent from paper_orders entirely', async () => {
+    expect(await findMissingOrders(['pg_never_placed'])).toEqual(['pg_never_placed']);
+  });
 });

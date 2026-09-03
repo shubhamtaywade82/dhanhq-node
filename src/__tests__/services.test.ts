@@ -9,7 +9,8 @@ import { EventEmitter } from 'events';
 import {
   initDatabase, dbMode, executePaperOrder, getPaperWallet,
   listPaperPositions, closeAllPaperPositions, markPositionsToMarket,
-  resetPaperWallet, pool, saveRiskState, reconcileLedger,
+  resetPaperWallet, pool, saveRiskState, reconcileLedger, findMissingOrders,
+  closePaperPosition,
 } from '../db';
 
 /**
@@ -447,5 +448,36 @@ describe('Database layer — fallback mode honesty', () => {
     expect(dbMode()).toBe('memory');
     const report = await reconcileLedger();
     expect(report).toEqual({ ok: true, checkedPositions: 0, mismatches: [], missingInPostgres: [], missingInMem: [] });
+  });
+});
+
+describe('findMissingOrders — journal boot cross-check', () => {
+  beforeAll(async () => { await initDatabase(); });
+
+  it('finds nothing missing for an entry order matched by correlation_id', async () => {
+    const order = await executePaperOrder({
+      symbol: 'FMO_ENTRY', securityId: '88001', quantity: 50,
+      transactionType: 'BUY', price: 100, correlationId: 'fmo_corr_1',
+    });
+    expect(order.status).toBe('TRADED');
+    expect(await findMissingOrders(['fmo_corr_1'])).toEqual([]);
+  });
+
+  it('finds nothing missing for an exit order matched by the generated order id', async () => {
+    await executePaperOrder({ symbol: 'FMO_EXIT', securityId: '88002', quantity: 50, transactionType: 'BUY', price: 100 });
+    const close = await closePaperPosition('FMO_EXIT', 110);
+    expect(close.status).toBe('TRADED');
+    // closePaperPosition's journaled "correlation_id" is the generated
+    // orderId (see db.ts's closePaperPosition) — this is exactly what
+    // core.ts's cross-check passes in from the journal.
+    expect(await findMissingOrders([(close as any).orderId])).toEqual([]);
+  });
+
+  it('reports an id with no matching order at all', async () => {
+    expect(await findMissingOrders(['never_placed_this_one'])).toEqual(['never_placed_this_one']);
+  });
+
+  it('returns an empty array for an empty input without querying anything', async () => {
+    expect(await findMissingOrders([])).toEqual([]);
   });
 });
