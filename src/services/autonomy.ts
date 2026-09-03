@@ -9,7 +9,8 @@ import type { AgentOrchestrator } from './agent';
 import type { AdaptiveSupertrendScanner } from './adaptiveSupertrendScanner';
 import { LongOptionPositionManager } from './longOptionPositionManager';
 import {
-  listPaperStrategies, updatePaperStrategyStatus, pushAlert,
+  listPaperStrategies, listPaperPositions, markPositionsToMarket,
+  updatePaperStrategyStatus, pushAlert,
   reconcileLedger, correctLedgerFromPostgres,
 } from '../db';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
@@ -177,8 +178,8 @@ export class AutonomyEngine {
 
     const positions = await this.portfolio.getPositions();
     if (positions.filter((p) => p.netQty !== 0).length >= 4) return;
-    positions = await listPaperPositions();
-    if (positions.filter((p: any) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
+    const paperPositions = await listPaperPositions();
+    if (paperPositions.filter((p) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
 
     this.lastScanAt = Date.now();
     try {
@@ -402,7 +403,7 @@ export class AutonomyEngine {
       this.tickMarkScheduled = false;
       try {
         await this.portfolio.markToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
-        await markPositionsToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
+        await markPositionsToMarket((secId: string) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
         await this.longOptionManager.evaluate(marketClock().squareOffWindow);
         await this.publishPortfolioSnapshot();
       } catch { /* the 2s cycle below is the fallback */ }
