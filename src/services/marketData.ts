@@ -315,7 +315,12 @@ export class MarketDataService {
       const clock = marketClock();
       const wsFresh = this.wsTickCount > 0 && Date.now() - this.lastWsTickAt < 10_000;
       const backoffRemaining = this.rateLimitedUntil - Date.now();
-      const interval = backoffRemaining > 0 ? backoffRemaining : wsFresh ? 15_000 : clock.isMarketOpen ? 3_000 : 30_000;
+      // wsFresh's own window is 10s — RiskEngine's stale-tick alarm trips at
+      // the same 10s (staleTickSec). Polling at 15s here let a real gap
+      // between WS ticks (WS pushes on price change, not a heartbeat) run
+      // past the alarm before REST ever refreshed lastTickAt. Must stay
+      // under 10s so REST always closes the gap before the alarm can fire.
+      const interval = backoffRemaining > 0 ? backoffRemaining : wsFresh ? 8_000 : clock.isMarketOpen ? 3_000 : 30_000;
       if (this.pollTimer) clearTimeout(this.pollTimer);
       this.pollTimer = setTimeout(tick, interval);
       if (backoffRemaining <= 0) {
