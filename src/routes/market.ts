@@ -119,7 +119,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
       const rows = Array.isArray(chain) ? chain : chain?.strikes || chain?.data || [];
       const spotSnap = market.getQuote(secId);
       const spot = spotSnap?.ltp || Number(req.query.spot) || 0;
-      const vixSnap = market.getQuote('26');
+      const vixSnap = market.getQuote('21'); // India VIX (NSE IDX_I) — verified against DhanHQ's instrument master
       const vix = vixSnap?.ltp || 14;
 
       const analytics = analyzeOptionChain(symbol, rows, spot, expiry, vix);
@@ -146,7 +146,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
 }
 
 function securityIdFor(symbol: string): string {
-  const map: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', SENSEX: '51', INDIAVIX: '26' };
+  const map: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', SENSEX: '51', INDIAVIX: '21' };
   return map[symbol.toUpperCase()] || '13';
 }
 

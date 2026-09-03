@@ -66,7 +66,7 @@ function applyEnvelope(prev: AppState, env: Envelope): AppState {
       const ltp = Number(p.data?.ltp ?? p.ltp ?? 0);
       if (!ltp || ltp <= 0) return prev;
       const secId = String(p.securityId || p.data?.securityId || '');
-      const sym = p.symbol || (secId === '13' ? 'NIFTY' : secId === '25' ? 'BANKNIFTY' : secId === '51' ? 'SENSEX' : secId === '26' ? 'INDIAVIX' : secId === '27' ? 'FINNIFTY' : secId === '442' ? 'MIDCPNIFTY' : undefined);
+      const sym = p.symbol || (secId === '13' ? 'NIFTY' : secId === '25' ? 'BANKNIFTY' : secId === '51' ? 'SENSEX' : secId === '21' ? 'INDIAVIX' : secId === '27' ? 'FINNIFTY' : secId === '442' ? 'MIDCPNIFTY' : undefined);
 
       const nextIndices = sym ? {
         ...prev.indices,

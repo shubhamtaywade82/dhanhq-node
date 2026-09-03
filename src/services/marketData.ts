@@ -19,13 +19,21 @@ import { marketClock, istNow } from './marketHours';
  * exits), which was previously dead code in this repo.
  */
 
+// Verified against DhanHQ's own live instrument master
+// (https://images.dhan.co/api-data/api-scrip-master.csv, NSE/BSE IDX_I
+// rows) on 2026-09-03 — NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/SENSEX all
+// checked correct; INDIAVIX was wrong (26, a stale/guessed value — the
+// real SEM_SMST_SECURITY_ID is 21) until this fix. A wrong VIX id here
+// doesn't fail loudly: it just silently subscribes to and quotes whatever
+// OTHER index security 26 happens to be, so this is exactly the kind of
+// error that needs checking against the source, not memory.
 export const INDEX_INSTRUMENTS: Record<string, { securityId: string; label: string }> = {
   NIFTY: { securityId: '13', label: 'NIFTY 50' },
   BANKNIFTY: { securityId: '25', label: 'NIFTY BANK' },
   FINNIFTY: { securityId: '27', label: 'NIFTY FIN SERVICE' },
   MIDCPNIFTY: { securityId: '442', label: 'NIFTY MID SELECT' },
   SENSEX: { securityId: '51', label: 'BSE SENSEX' },
-  INDIAVIX: { securityId: '26', label: 'INDIA VIX' },
+  INDIAVIX: { securityId: '21', label: 'INDIA VIX' },
 };
 
 const INDEX_SEC_IDS = Object.values(INDEX_INSTRUMENTS).map((i) => i.securityId);
