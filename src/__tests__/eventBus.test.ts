@@ -35,6 +35,35 @@ describe('EventBus', () => {
     expect(() => bus.emit('system', { type: 'boot' })).not.toThrow();
     expect(ok).toEqual(['system']);
   });
+
+  it('keeps a per-channel history — a burst of ticks does not evict log/alert history', () => {
+    // Previously one 500-envelope buffer was shared across every channel;
+    // a tick storm (every instrument, every price move) would push
+    // logs/alerts/telemetry out of the buffer within seconds of market
+    // open, so a newly-attaching client's hydration snapshot was ticks and
+    // nothing else. Each channel must keep its own history now.
+    const bus = new EventBus();
+    bus.emit('log', { message: 'before the storm' });
+    for (let i = 0; i < 600; i++) bus.emit('tick', { securityId: '13', ltp: 24000 + i });
+
+    const logs = bus.recent(undefined, ['log']);
+    expect(logs.length).toBe(1);
+    expect(logs[0].payload.message).toBe('before the storm');
+
+    // The tick channel's own buffer is still bounded (ring, not unbounded).
+    const ticks = bus.recent(undefined, ['tick']);
+    expect(ticks.length).toBeLessThan(600);
+    expect(ticks[ticks.length - 1].payload.ltp).toBe(24000 + 599); // newest survives
+  });
+
+  it('recent() merges multiple channels sorted oldest-first', () => {
+    const bus = new EventBus();
+    bus.emit('log', { n: 1 });
+    bus.emit('alert', { n: 2 });
+    bus.emit('log', { n: 3 });
+    const merged = bus.recent(undefined, ['log', 'alert']);
+    expect(merged.map((e) => e.payload.n)).toEqual([1, 2, 3]);
+  });
 });
 
 describe('MarketHours (IST-bound)', () => {
