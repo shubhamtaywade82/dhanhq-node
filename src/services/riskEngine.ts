@@ -207,14 +207,26 @@ export class RiskEngine {
     try {
       const openBefore = await this.portfolio.getPositions();
       const closes = (await this.portfolio.closeAll((secId, _sym) => this.market.getFillablePrice(secId, { allowClosed: true }) ?? this.market.getLtp(secId))) as any[];
-      details.positionsClosed = closes.filter((c) => c && c.status === 'TRADED').length;
+      const closedSymbols = new Set(closes.filter((c) => c && c.status === 'TRADED').map((c) => c.symbol));
+      details.positionsClosed = closedSymbols.size;
       for (const c of closes) {
         if (c && c.status === 'TRADED') {
           eventBus.emit('order', { kind: 'kill_switch_fill', orderId: c.orderId, symbol: c.symbol, side: c.side, fillPrice: c.fillPrice });
         }
       }
+      // Only untrack a position that was ACTUALLY flattened. closeAll can
+      // return a mix of TRADED and REJECTED (a broker order rejection, or —
+      // in paper mode — an insufficient-margin throw partway through the
+      // loop): untracking on the mere ATTEMPT, regardless of outcome,
+      // stripped stop-loss/target monitoring from a position that is still
+      // open with real exposure, and (in broker mode) there is no way to
+      // re-arm it later — a broker position's stopLoss/target/trailingStop
+      // are always null, so reconcileMonitor can never reconstruct what
+      // protection it's missing.
       for (const pos of openBefore) {
-        if (pos.netQty !== 0) this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
+        if (pos.netQty !== 0 && closedSymbols.has(pos.tradingSymbol)) {
+          this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
+        }
       }
       // Stop every RUNNING strategy too — this also reverses any multi-leg
       // hedge-margin credit (see updatePaperStrategyStatus), which the raw
