@@ -9,8 +9,7 @@ import type { AgentOrchestrator } from './agent';
 import type { AdaptiveSupertrendScanner } from './adaptiveSupertrendScanner';
 import { LongOptionPositionManager } from './longOptionPositionManager';
 import {
-  listPaperStrategies, listPaperPositions, markPositionsToMarket,
-  updatePaperStrategyStatus, pushAlert,
+  listPaperStrategies, updatePaperStrategyStatus, pushAlert,
   reconcileLedger, correctLedgerFromPostgres,
 } from '../db';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
@@ -176,10 +175,12 @@ export class AutonomyEngine {
     const gate = this.risk.canTrade();
     if (!gate.allowed) return;
 
+    // Portfolio-abstraction-aware — a direct listPaperPositions() call here
+    // would check the paper ledger even in broker mode (always near-empty,
+    // since real positions live at the broker), silently disabling this
+    // cap for live trading instead of enforcing it.
     const positions = await this.portfolio.getPositions();
-    if (positions.filter((p) => p.netQty !== 0).length >= 4) return;
-    const paperPositions = await listPaperPositions();
-    if (paperPositions.filter((p) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
+    if (positions.filter((p) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
 
     this.lastScanAt = Date.now();
     try {
@@ -402,8 +403,12 @@ export class AutonomyEngine {
     setImmediate(async () => {
       this.tickMarkScheduled = false;
       try {
+        // this.portfolio.markToMarket() already calls markPositionsToMarket()
+        // internally in paper mode (PaperPortfolioSource delegates there) —
+        // a second direct call here duplicated that work in paper mode and,
+        // in broker mode, marked an irrelevant/empty paper position set
+        // instead of anything the portfolio abstraction already covers.
         await this.portfolio.markToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
-        await markPositionsToMarket((secId: string) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
         await this.longOptionManager.evaluate(marketClock().squareOffWindow);
         await this.publishPortfolioSnapshot();
       } catch { /* the 2s cycle below is the fallback */ }
