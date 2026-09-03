@@ -97,6 +97,7 @@ export class MarketDataService {
   private extraSubscriptions = new Set<string>();        // 'SEG:SECID' keys
   private unsubEventBus: (() => void) | null = null;
   private wsConnecting = false;
+  private wsConnectingAt = 0;
   private pollInFlight = false;
   readonly monitor = new PositionMonitor();
 
@@ -144,7 +145,18 @@ export class MarketDataService {
     }
 
     // Back off if recently rate-limited (429) on WebSocket
-    if (this.wsConnecting) return;
+    if (this.wsConnecting) {
+      // A connect() attempt that never fires open/error/close — a raw
+      // socket stuck at the TCP level with no timeout enforced by the WS
+      // library, e.g. a firewall silently dropping packets — would
+      // otherwise leave wsConnecting true forever: every later retry hits
+      // this guard and returns immediately, and nothing past this point
+      // schedules another one, permanently killing the reconnect loop.
+      // Treat an attempt this stale as dead and let it retry instead of
+      // trusting it'll eventually settle.
+      if (Date.now() - this.wsConnectingAt < 30_000) return;
+      this.wsConnecting = false;
+    }
     if (Date.now() - this.lastWs429At < 60_000) {
       this.scheduleWsRetry(60_000 - (Date.now() - this.lastWs429At));
       return;
@@ -229,6 +241,7 @@ export class MarketDataService {
 
       if (!ws.market?.isConnected) {
         this.wsConnecting = true;
+        this.wsConnectingAt = Date.now();
         ws.market?.connect?.().catch((e: any) => {
           this.wsConnecting = false;
           const msg = e?.message || String(e);
@@ -238,6 +251,17 @@ export class MarketDataService {
             this.scheduleWsRetry(60_000);
           }
         });
+      } else if (!this.wsStarted) {
+        // isConnected can lag reality: the SDK only flips it to false
+        // inside the underlying transport's own async 'close' event, not
+        // synchronously when we call disconnect() (armSilenceWatch, the
+        // 429 handler) — so a retry landing in that window sees a
+        // stale-true isConnected and skips connect() above entirely.
+        // Nothing else in this function schedules a retry for that case,
+        // so without this the reconnect loop would die permanently here:
+        // wsStarted stays false, isConnected stays stale-true, and nothing
+        // ever calls connect() again.
+        this.scheduleWsRetry();
       }
       if (!ws.orders?.isConnected) {
         ws.orders?.connect?.().catch(() => {});

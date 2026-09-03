@@ -311,6 +311,88 @@ describe('MarketDataService — WebSocket failover', () => {
       else process.env.DHAN_ACCESS_TOKEN = originalToken;
     }
   });
+
+  it('retries a connect() attempt that never settles instead of getting stuck forever', async () => {
+    // Regression test: wsConnecting was only ever cleared by the open/
+    // error/close handlers. A connect() that never fires any of them — a
+    // raw socket stuck at the TCP level with no timeout enforced by the WS
+    // library — left wsConnecting true permanently: every later retry hit
+    // the early guard and returned without scheduling another one, so the
+    // reconnect loop died forever.
+    const pending = new Promise<void>(() => {}); // never resolves or rejects
+    const market = Object.assign(new EventEmitter(), {
+      isConnected: false,
+      subscribe: jest.fn(),
+      connect: jest.fn(() => pending),
+      disconnect: jest.fn(),
+    });
+    const client = { ws: { market }, marketFeed: { quote: jest.fn() } } as any;
+    const service = new MarketDataService(client);
+    const originalToken = process.env.DHAN_ACCESS_TOKEN;
+    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+
+    try {
+      (service as any).tryStartWs();
+      expect(market.connect).toHaveBeenCalledTimes(1);
+
+      // A retry landing while the attempt is still "fresh" must not
+      // double-connect.
+      (service as any).tryStartWs();
+      expect(market.connect).toHaveBeenCalledTimes(1);
+
+      // Once the stuck attempt is stale, the next retry must try again
+      // rather than staying stuck behind the early guard forever.
+      (service as any).wsConnectingAt = Date.now() - 31_000;
+      (service as any).tryStartWs();
+      expect(market.connect).toHaveBeenCalledTimes(2);
+    } finally {
+      service.stop();
+      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
+      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+    }
+  });
+
+  it('schedules a retry instead of dying silently when isConnected reads stale-true after a forced disconnect', async () => {
+    // Regression test: the SDK only flips isConnected to false inside the
+    // underlying transport's own ASYNC 'close' event — not synchronously
+    // inside disconnect() (confirmed against the SDK's BaseWS source). A
+    // retry landing before that event fires sees isConnected still true,
+    // skips connect() entirely, and — since nothing else in tryStartWs()
+    // scheduled a retry for that branch — the reconnect loop died
+    // permanently: wsStarted stayed false, isConnected stayed stale-true,
+    // and connect() was never called again.
+    const market = Object.assign(new EventEmitter(), {
+      isConnected: false,
+      subscribe: jest.fn(),
+      connect: jest.fn(() => Promise.resolve()),
+      disconnect: jest.fn(), // deliberately does NOT flip isConnected — the close event hasn't "fired" yet
+    });
+    const client = { ws: { market }, marketFeed: { quote: jest.fn() } } as any;
+    const service = new MarketDataService(client);
+    const originalToken = process.env.DHAN_ACCESS_TOKEN;
+    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+
+    try {
+      (service as any).tryStartWs();
+      market.isConnected = true;
+      market.emit('open');
+      expect((service as any).wsStarted).toBe(true);
+
+      // Simulate a forced disconnect (armSilenceWatch/the 429 handler):
+      // wsStarted flips false, but isConnected stays stale-true.
+      (service as any).wsStarted = false;
+      market.disconnect();
+      expect(market.isConnected).toBe(true);
+
+      expect((service as any).wsRetryTimer).toBeNull();
+      (service as any).tryStartWs();
+      expect((service as any).wsRetryTimer).not.toBeNull();
+    } finally {
+      service.stop();
+      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
+      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+    }
+  });
 });
 
 describe('RiskEngine — IST session rollover (RISK-01)', () => {
