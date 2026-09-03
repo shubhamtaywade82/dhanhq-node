@@ -28,7 +28,7 @@ export interface Strategy {
   name: string;
   symbol: string;
   type: string;
-  status: 'RUNNING' | 'PAUSED' | 'STOPPED';
+  status: 'RUNNING' | 'PAUSED' | 'STOPPED' | 'MONITORING';
   pnl: number;
   lots: number;
   entryTime: string;

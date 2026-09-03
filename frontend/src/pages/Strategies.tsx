@@ -160,7 +160,7 @@ function StrategyCard({ strategy: s, onExecute, onPause, onResume, onStop }: { s
                 <span className="text-muted">x{l.qty}</span>
               </div>
               <div className="flex items-center gap-3">
-                <span className="text-muted">@{fmt(l.price)} → {fmt(l.ltp)}</span>
+                <span className="text-muted">@{fmt(l.side === 'BUY' ? l.bAvg : l.sAvg)} → {fmt(l.ltp)}</span>
                 <span className={`${pnlClass(legPnl)} font-semibold`}>{fmtINR(legPnl)}</span>
               </div>
             </div>

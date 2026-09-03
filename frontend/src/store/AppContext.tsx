@@ -21,16 +21,45 @@ interface PendingEffects {
 }
 
 /**
- * Pure state transition for one backend envelope — no setState call of its
- * own. Every WS message used to call setState directly in the hook's
- * onmessage handler, one React commit per envelope; under DhanHQ's 'full'
- * feed mode with option legs subscribed this could re-render the tree
- * hundreds of times a second. AppProvider now buffers incoming envelopes
- * and reduces a whole batch through this function in a single setState per
- * animation frame (see onEnvelope below) — this function is what makes
- * that reduction possible without duplicating the per-channel logic.
+ * Which side effects one envelope wants fired, independent of and computed
+ * BEFORE any setState call — deliberately not mutated from inside a
+ * setState updater (see onEnvelope below for why: a functional updater can
+ * run later than the call that scheduled it, and reading a flag it was
+ * supposed to have mutated by "now" is a race, not a guarantee).
  */
-function applyEnvelope(prev: AppState, env: Envelope, effects: PendingEffects): AppState {
+function getEnvelopeEffects(env: Envelope): PendingEffects {
+  const effects: PendingEffects = { refreshPortfolio: false, refreshControlState: false };
+  if (env.channel === 'order') {
+    if ((env.payload || {}).kind === 'fill') {
+      effects.refreshPortfolio = true;
+      effects.refreshControlState = true;
+    }
+  } else if (env.channel === 'system') {
+    const type = (env.payload || {}).type;
+    if (type === 'kill_switch') {
+      effects.refreshPortfolio = true;
+      effects.refreshControlState = true;
+    } else if (type === 'agent_run_complete') {
+      effects.refreshPortfolio = true;
+    } else if (type === 'autonomy') {
+      effects.refreshControlState = true;
+    }
+  }
+  return effects;
+}
+
+/**
+ * Pure state transition for one backend envelope — no setState call of its
+ * own, and no side channel out. Every WS message used to call setState
+ * directly in the hook's onmessage handler, one React commit per envelope;
+ * under DhanHQ's 'full' feed mode with option legs subscribed this could
+ * re-render the tree hundreds of times a second. AppProvider now buffers
+ * incoming envelopes and reduces a whole batch through this function in a
+ * single setState per animation frame (see onEnvelope below) — this
+ * function is what makes that reduction possible without duplicating the
+ * per-channel logic.
+ */
+function applyEnvelope(prev: AppState, env: Envelope): AppState {
   switch (env.channel) {
     case 'tick': {
       const p = env.payload || {};
@@ -130,27 +159,16 @@ function applyEnvelope(prev: AppState, env: Envelope, effects: PendingEffects): 
       };
     }
     case 'order': {
-      const p = env.payload || {};
-      if (p.kind === 'fill') {
-        effects.refreshPortfolio = true;
-        effects.refreshControlState = true;
-      }
       return prev;
     }
     case 'system': {
       const p = env.payload || {};
       if (p.type === 'connected' || p.type === 'pong') return prev;
       if (p.type === 'kill_switch') {
-        effects.refreshPortfolio = true;
-        effects.refreshControlState = true;
         return { ...prev, killed: p.state === 'ENGAGED', live: p.state !== 'ENGAGED' };
       }
       if (p.type === 'agent_run_complete') {
-        effects.refreshPortfolio = true;
         return { ...prev, agentRunning: false };
-      }
-      if (p.type === 'autonomy') {
-        effects.refreshControlState = true;
       }
       return prev;
     }
@@ -346,10 +364,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
       frameRef.current = null;
       const batch = pendingEnvelopes.current;
       pendingEnvelopes.current = [];
-      const effects: PendingEffects = { refreshPortfolio: false, refreshControlState: false };
-      setState((prev) => batch.reduce((acc, e) => applyEnvelope(acc, e, effects), prev));
-      if (effects.refreshPortfolio) void refreshPortfolio();
-      if (effects.refreshControlState) void refreshControlState();
+      // Scanned BEFORE calling setState, not mutated from inside its
+      // updater: React does not guarantee a functional updater runs
+      // eagerly — it can defer to the render phase whenever the fiber
+      // already has other pending lanes, which a ~10Hz tick stream makes
+      // routine. Reading a flag the updater was "supposed to" have set by
+      // the very next line raced that deferral and silently dropped every
+      // post-fill refreshPortfolio()/refreshControlState() call whenever
+      // React lost that race — undetectable without heavy load, since
+      // idle sessions rarely hit a pending lane.
+      let refreshPortfolioNeeded = false;
+      let refreshControlStateNeeded = false;
+      for (const env of batch) {
+        const e = getEnvelopeEffects(env);
+        refreshPortfolioNeeded = refreshPortfolioNeeded || e.refreshPortfolio;
+        refreshControlStateNeeded = refreshControlStateNeeded || e.refreshControlState;
+      }
+      setState((prev) => batch.reduce((acc, e) => applyEnvelope(acc, e), prev));
+      if (refreshPortfolioNeeded) void refreshPortfolio();
+      if (refreshControlStateNeeded) void refreshControlState();
     });
   }, [refreshPortfolio, refreshControlState]);
 
