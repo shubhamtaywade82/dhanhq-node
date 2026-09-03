@@ -133,7 +133,7 @@ async function deployMultiLeg(
   }
 
   if (filledLegs.length > 0 && filledLegs.length < strat.legs.length) {
-    await unwindLegs(engine, filledLegs, market, risk);
+    await unwindLegs(engine, strat.id, filledLegs, market, risk);
     return { status: 'FAILED', reason: 'partial_fill_unwound' };
   }
   if (filledLegs.length === strat.legs.length && filledLegs.length > 0) {
@@ -155,12 +155,16 @@ async function deployMultiLeg(
  * real sandbox leg stays live — so sandbox unwinds through the engine's own
  * closeLeg() (a real reversing order), not PortfolioSource.
  */
-async function unwindLegs(engine: ExecutionEngine, filledLegs: StrategyLeg[], market: MarketDataService, risk: RiskEngine): Promise<void> {
+async function unwindLegs(engine: ExecutionEngine, stratId: string, filledLegs: StrategyLeg[], market: MarketDataService, risk: RiskEngine): Promise<void> {
   const portfolio = risk.getPortfolio();
   for (const leg of filledLegs) {
     const unwindPrice = market.getFillablePrice(leg.securityId, { allowClosed: true }) ?? leg.price;
     const result = engine instanceof SandboxExecutionEngine
-      ? await engine.closeLeg({ securityId: leg.securityId, exchangeSegment: leg.exchangeSegment, qty: leg.qty, side: leg.side, instrument: leg.instrument }, unwindPrice).catch((e: any) => ({ status: 'REJECTED', reason: e.message }))
+      // Deterministic (strat.id + securityId), not Date.now()-suffixed —
+      // an unwind that dies before its result is journaled needs a stable
+      // id to be resolvable via getByCorrelationId() on the next boot,
+      // same as an entry leg's correlation_id.
+      ? await engine.closeLeg({ securityId: leg.securityId, exchangeSegment: leg.exchangeSegment, qty: leg.qty, side: leg.side, instrument: leg.instrument }, unwindPrice, `unwind_${stratId}_${leg.securityId}`).catch((e: any) => ({ status: 'REJECTED', reason: e.message }))
       : await portfolio.closePosition(leg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
 
     if (result.status === 'TRADED') {

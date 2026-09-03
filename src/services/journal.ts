@@ -169,6 +169,12 @@ export interface DayReplaySummary {
    * candidate against both columns, so this list doesn't need to
    * distinguish which kind it is. */
   tradedCorrelationIds: string[];
+  /** correlation_id of every order_intent seen today with NO matching
+   * order_result (any status) later in the journal — an order this process
+   * placed but died before learning the outcome of. Needs resolving on
+   * boot: against paper_orders for paper mode, or the broker's own order
+   * book (GET /orders/external/{id}) for live/sandbox. */
+  unresolvedIntents: string[];
   /** The last kill-switch action recorded today, or null if none. */
   lastKillAction: 'arm' | 'disarm' | null;
 }
@@ -185,14 +191,21 @@ export interface DayReplaySummary {
  */
 export function summarizeDay(entries: JournalEntry[]): DayReplaySummary {
   const tradedCorrelationIds: string[] = [];
+  const intentIds = new Set<string>();
+  const resolvedIds = new Set<string>();
   let lastKillAction: 'arm' | 'disarm' | null = null;
   for (const e of entries) {
-    if (e.kind === 'order_result' && e.payload?.status === 'TRADED' && e.payload?.correlation_id) {
-      tradedCorrelationIds.push(String(e.payload.correlation_id));
+    if (e.kind === 'order_intent' && e.payload?.correlation_id) {
+      intentIds.add(String(e.payload.correlation_id));
+    }
+    if (e.kind === 'order_result' && e.payload?.correlation_id) {
+      resolvedIds.add(String(e.payload.correlation_id));
+      if (e.payload?.status === 'TRADED') tradedCorrelationIds.push(String(e.payload.correlation_id));
     }
     if (e.kind === 'kill' && (e.payload?.action === 'arm' || e.payload?.action === 'disarm')) {
       lastKillAction = e.payload.action;
     }
   }
-  return { tradedCorrelationIds, lastKillAction };
+  const unresolvedIntents = [...intentIds].filter((id) => !resolvedIds.has(id));
+  return { tradedCorrelationIds, unresolvedIntents, lastKillAction };
 }

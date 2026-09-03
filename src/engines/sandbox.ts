@@ -85,9 +85,9 @@ export class SandboxExecutionEngine {
    * Dhan Sandbox account — never in PortfolioSource — so unwinding here
    * cannot go through portfolio.closePosition() like the other two modes.
    */
-  async closeLeg(leg: { securityId: string; exchangeSegment?: string; qty: number; side: 'BUY' | 'SELL'; instrument?: string }, price: number): Promise<{ status: string; orderId?: string }> {
+  async closeLeg(leg: { securityId: string; exchangeSegment?: string; qty: number; side: 'BUY' | 'SELL'; instrument?: string }, price: number, correlationId: string = `unwind_${leg.securityId}_${Date.now()}`): Promise<{ status: string; orderId?: string }> {
     const placed = await this.client.orders.place({
-      correlationId: `unwind_${leg.securityId}_${Date.now()}`,
+      correlationId,
       securityId: String(leg.securityId),
       exchangeSegment: (leg.exchangeSegment || 'NSE_FNO') as any,
       transactionType: leg.side === 'BUY' ? 'SELL' : 'BUY',

@@ -158,7 +158,7 @@ export async function startCore(): Promise<Core> {
   // no listener yet and was silently lost.
   setSystemState('RECONCILING', 'Reconciling ledger and arming positions');
   await risk.start();
-  await crossCheckJournalOnBoot(priorEntries, risk);
+  await crossCheckJournalOnBoot(priorEntries, risk, client, sandboxClient);
   await autonomy.start();
   await seedExistingPositions(market, market.monitor);
   await seedStandardStrategies(client, market, paper);
@@ -183,24 +183,53 @@ export async function startCore(): Promise<Core> {
  * position from actual drift, so it must never be treated as more
  * authoritative than the ledger it's checking.
  */
-export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk: RiskEngine): Promise<void> {
+export async function crossCheckJournalOnBoot(
+  priorEntries: JournalEntry[], risk: RiskEngine, client: DhanClient, sandboxClient?: DhanClient,
+): Promise<void> {
   if (priorEntries.length === 0) return;
   const summary = summarizeDay(priorEntries);
+  const mode = process.env.TRADING_MODE || 'paper';
+  const problems: string[] = [];
 
-  // findMissingOrders() only checks paper_orders — the durable table
-  // executePaperOrder() (paper.ts) writes to. Live/sandbox fills are
-  // journaled with status:'TRADED' too, but neither engine inserts into
-  // paper_orders, so outside paper mode EVERY trade would show "missing"
-  // on restart and (via the READY gate below) permanently lock trading.
-  // Skip this specific check outside paper mode until live/sandbox fills
-  // have their own durable order record to reconcile against.
-  const isPaperMode = (process.env.TRADING_MODE || 'paper') === 'paper';
-  const missing = isPaperMode ? await findMissingOrders(summary.tradedCorrelationIds) : [];
-  if (missing.length > 0) {
-    const msg = `Boot cross-check: journal recorded ${missing.length} trade(s) today with no matching durable order record (${missing.join(', ')}) — something may have altered the ledger outside the normal fill path`;
+  if (mode === 'paper') {
+    // paper_orders is paper mode's durable record — a TRADED result should
+    // have a row there, and so should any intent whose outcome the journal
+    // never recorded (executePaperOrder is in-process and synchronous, so
+    // this only catches a crash mid-call, not a network round-trip).
+    const toCheck = [...summary.tradedCorrelationIds, ...summary.unresolvedIntents];
+    const missing = await findMissingOrders(toCheck);
+    problems.push(...missing.map((id) => `no matching paper_orders record for ${id}`));
+  } else {
+    // Live/sandbox: a journaled TRADED result is itself durable (the
+    // journal is an fsync'd file) and isn't re-verified against the broker
+    // here — that's full reconciliation, deliberately out of scope for this
+    // boot check. What DOES need resolving is an order this process placed
+    // but died before learning the outcome of — the broker's own order book
+    // is the only durable record for those, via GET /orders/external/{id}.
+    const lookupClient = mode === 'sandbox' ? sandboxClient : client;
+    for (const id of summary.unresolvedIntents) {
+      if (!lookupClient) {
+        problems.push(`unresolved order ${id} — no ${mode} client available to reconcile`);
+        continue;
+      }
+      try {
+        const order: any = await lookupClient.orders.getByCorrelationId(id);
+        if (!order?.orderStatus) {
+          problems.push(`unresolved order ${id} — broker has no record of it`);
+        } else {
+          eventBus.log('SYSTEM', `Boot reconciliation: order ${id} resolved from broker as ${order.orderStatus}`, 'core');
+        }
+      } catch (e: any) {
+        problems.push(`unresolved order ${id} — broker lookup failed (${e.message})`);
+      }
+    }
+  }
+
+  if (problems.length > 0) {
+    const msg = `Boot cross-check: ${problems.length} unresolved order(s) today — ${problems.join('; ')}`;
     eventBus.log('ERROR', msg, 'core');
     await pushAlert('ERROR', 'core', msg);
-    setSystemState('DEGRADED', `Missing durable orders: ${missing.length}`);
+    setSystemState('DEGRADED', `Unresolved orders: ${problems.length}`);
   }
 
   if (summary.lastKillAction === 'arm' && !risk.isKilled()) {
@@ -213,7 +242,7 @@ export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk
     await pushAlert('WARN', 'core', msg);
   }
 
-  if (missing.length === 0 && (summary.lastKillAction === null || summary.lastKillAction === (risk.isKilled() ? 'arm' : 'disarm'))) {
+  if (problems.length === 0 && (summary.lastKillAction === null || summary.lastKillAction === (risk.isKilled() ? 'arm' : 'disarm'))) {
     eventBus.log('SYSTEM', `Boot cross-check: today's journal (${priorEntries.length} entries) agrees with current state`, 'core');
   }
 }

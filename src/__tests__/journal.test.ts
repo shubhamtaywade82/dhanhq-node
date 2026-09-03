@@ -187,6 +187,23 @@ describe('summarizeDay', () => {
   });
 
   it('handles an empty day', () => {
-    expect(summarizeDay([])).toEqual({ tradedCorrelationIds: [], lastKillAction: null });
+    expect(summarizeDay([])).toEqual({ tradedCorrelationIds: [], unresolvedIntents: [], lastKillAction: null });
+  });
+
+  it('collects an intent with no later result as unresolved, regardless of the result status of others', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'resolved' }),
+      entry(2, 'order_result', { correlation_id: 'resolved', status: 'TRADED' }),
+      entry(3, 'order_intent', { correlation_id: 'died_before_result' }),
+    ];
+    expect(summarizeDay(entries).unresolvedIntents).toEqual(['died_before_result']);
+  });
+
+  it('treats a REJECTED result as resolved, not unresolved', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'a' }),
+      entry(2, 'order_result', { correlation_id: 'a', status: 'REJECTED', reason: 'no LTP' }),
+    ];
+    expect(summarizeDay(entries).unresolvedIntents).toEqual([]);
   });
 });
