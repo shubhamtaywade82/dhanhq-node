@@ -4,6 +4,7 @@ import { marketClock, istNow } from './marketHours';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
 import type { AgentOrchestrator } from './agent';
+import type { AdaptiveSupertrendScanner } from './adaptiveSupertrendScanner';
 import { LongOptionPositionManager } from './longOptionPositionManager';
 import {
   listPaperStrategies, listPaperPositions, markPositionsToMarket,
@@ -21,11 +22,14 @@ import {
  *   4. Periodically scans for autonomous option opportunities (09:20-15:15 IST).
  *   5. Closes every position at 15:20 IST EOD square-off.
  */
+export const MAX_CONCURRENT_POSITIONS = 4;
+
 export class AutonomyEngine {
   private client: DhanClient;
   private market: MarketDataService;
   private risk: RiskEngine;
   private agent: AgentOrchestrator | null = null;
+  private scanner: AdaptiveSupertrendScanner | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private enabled = true;
   private scanEnabled = process.env.AUTONOMOUS_SCAN_ENABLED !== 'false';
@@ -49,6 +53,11 @@ export class AutonomyEngine {
 
   setAgent(agent: AgentOrchestrator): void {
     this.agent = agent;
+  }
+
+  setScanner(scanner: AdaptiveSupertrendScanner): void {
+    this.scanner = scanner;
+    eventBus.log('SYSTEM', 'Adaptive Supertrend scanner armed (1m/5m, naked ATM CE/PE)', 'adaptive_supertrend');
   }
 
   setScanEnabled(on: boolean): void {
@@ -132,6 +141,7 @@ export class AutonomyEngine {
         }
 
         await this.evaluateAutonomousScan(clock);
+        if (this.scanner) await this.scanner.evaluate(clock);
       }
 
       const nextDelay = clock.isMarketOpen ? 2000 : 30000;
@@ -152,7 +162,7 @@ export class AutonomyEngine {
     if (!gate.allowed) return;
 
     const positions = await listPaperPositions();
-    if (positions.filter((p: any) => p.netQty !== 0).length >= 4) return;
+    if (positions.filter((p: any) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
 
     this.lastScanAt = Date.now();
     try {
