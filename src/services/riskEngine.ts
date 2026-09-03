@@ -5,7 +5,7 @@ import { marketClock } from './marketHours';
 import type { MarketDataService } from './marketData';
 import { INDEX_INSTRUMENTS } from './marketData';
 import { nearestIndexExpiry } from './marketHours';
-import { calculateGreeks } from './optionsAnalytics';
+import { calculateGreeks, getLastIv } from './optionsAnalytics';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 import { getSystemState } from './systemState';
 import {
@@ -289,7 +289,10 @@ export class RiskEngine {
    * Symbol format is "<UNDERLYING><STRIKE><CE|PE>" (e.g. NIFTY24050PE),
    * which is how every position is already keyed in this system. Expiry and
    * IV aren't persisted per-position, so this approximates with the current
-   * nearest weekly expiry and a flat 15% IV — a coarse but honest estimate,
+   * nearest weekly expiry and the underlying's last observed ATM IV
+   * (getLastIv — populated by the agent's own option-chain scans), falling
+   * back to a flat 15% only when this underlying hasn't been scanned yet
+   * this process lifetime — a coarse but honest estimate either way,
    * refreshed every evaluate() cycle rather than pretending precision it
    * doesn't have. */
   /** A real DhanHQ trading symbol's exact string format is not the
@@ -333,7 +336,8 @@ export class RiskEngine {
       }
 
       const expiry = nearestIndexExpiry(underlying);
-      const g = calculateGreeks(spot, strike, expiry, optType, 0.15);
+      const iv = getLastIv(underlying) ?? 0.15;
+      const g = calculateGreeks(spot, strike, expiry, optType, iv);
       deltaNotional += netQty * g.delta * spot;
     }
     return deltaNotional;

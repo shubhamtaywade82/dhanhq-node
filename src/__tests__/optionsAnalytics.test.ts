@@ -1,5 +1,6 @@
 import {
   calculateGreeks, analyzeOptionChain, selectStrikeByDelta, aggregatePortfolioGreeks,
+  recordIvSample, getLastIv,
 } from '../services/optionsAnalytics';
 import {
   buildIronCondor, buildCreditSpread, buildStraddle, buildStrangle, evaluateStrategyBacktest,
@@ -67,6 +68,14 @@ describe('Options & Volatility Analytics Core', () => {
 
     expect(agg.totalPositions).toBe(2);
     expect(agg.netDelta).toBeGreaterThan(0); // Long call + short put both have positive delta
+  });
+
+  it('getLastIv returns null before any sample, then the most recent recorded IV — used by the risk engine instead of a flat 15% fallback', () => {
+    const symbol = `IV_TEST_${Date.now()}`;
+    expect(getLastIv(symbol)).toBeNull();
+    recordIvSample(symbol, 18.5);
+    recordIvSample(symbol, 21.2);
+    expect(getLastIv(symbol)).toBe(21.2);
   });
 });
 

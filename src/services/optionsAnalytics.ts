@@ -103,6 +103,17 @@ export function getIvRank(symbol: string): number | null {
   return Number(((below / arr.length) * 100).toFixed(1));
 }
 
+/** Most recent ATM IV sample recorded for this underlying (unlike
+ * getIvRank, needs only one prior sample, not IV_RANK_MIN_SAMPLES — used to
+ * feed calculateGreeks a real IV instead of a flat fallback). Returns null
+ * when the underlying hasn't been scanned yet this process lifetime (e.g.
+ * right after boot), in which case callers should fall back to a
+ * conservative constant, not treat null as zero volatility. */
+export function getLastIv(symbol: string): number | null {
+  const arr = ivHistory.get(symbol);
+  return arr && arr.length > 0 ? arr[arr.length - 1] : null;
+}
+
 export function analyzeOptionChain(
   symbol: string,
   chainRows: any[],
