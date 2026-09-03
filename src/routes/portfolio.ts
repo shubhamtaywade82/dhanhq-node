@@ -288,18 +288,22 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
         // Partial fill on a multi-leg structure is worse than no fill — e.g.
         // a short leg filling without its hedge is naked, undefined risk.
         // Unwind whatever filled rather than leaving it to stand.
+        //
+        // Goes through closePaperPosition(), NOT paper.placeOrder() — that
+        // re-checks risk.canTrade(), the SAME gate whose failure typically
+        // caused THIS partial fill (a breaker tripping between legs, or the
+        // kill switch arming). A risk-REDUCING close must never be blocked
+        // by the entry gate; closePaperPosition() doesn't check it.
         for (const filledLeg of legsWithPx) {
           const unwindPrice = market.getFillablePrice(String(filledLeg.securityId || '0'), { allowClosed: true }) ?? filledLeg.ltp;
-          await paper.placeOrder({
-            correlation_id: `${strategyId}_${filledLeg.instrument}_unwind`,
-            intent_id: strategyId,
-            params: {
-              security_id: filledLeg.securityId || '0', symbol: filledLeg.instrument, quantity: filledLeg.qty,
-              transaction_type: filledLeg.side === 'BUY' ? 'SELL' : 'BUY', order_type: 'MARKET',
-              exchange_segment: filledLeg.exchangeSegment || 'NSE_FNO', product_type: 'INTRADAY', price: unwindPrice,
-            },
-          }).catch(() => {});
-          if (filledLeg.securityId) market.monitor.untrack(filledLeg.exchangeSegment || 'NSE_FNO', String(filledLeg.securityId));
+          const result: any = await closePaperPosition(filledLeg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED', message: e.message }));
+          if (result.status === 'TRADED' && filledLeg.securityId) {
+            market.monitor.untrack(filledLeg.exchangeSegment || 'NSE_FNO', String(filledLeg.securityId));
+          } else if (result.status !== 'TRADED') {
+            // Untracking here would strip stop-loss/target from a leg that
+            // is STILL open.
+            eventBus.log('ERROR', `Unwind FAILED for leg ${filledLeg.instrument}: ${result.status}${result.message ? ` (${result.message})` : ''} — still open, protection left tracked`, 'portfolio');
+          }
         }
         eventBus.log('ERROR', `Strategy ${name}: partial fill (${filled}/${pricedLegs.length} legs) — unwound`, 'portfolio');
         return res.status(422).json({ error: `Partial fill (${filled}/${pricedLegs.length} legs) — unwound, strategy not deployed` });

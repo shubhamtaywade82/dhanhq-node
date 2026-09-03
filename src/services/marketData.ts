@@ -19,13 +19,21 @@ import { marketClock, istNow } from './marketHours';
  * exits), which was previously dead code in this repo.
  */
 
+// Verified against DhanHQ's own live instrument master
+// (https://images.dhan.co/api-data/api-scrip-master.csv, NSE/BSE IDX_I
+// rows) on 2026-09-03 — NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/SENSEX all
+// checked correct; INDIAVIX was wrong (26, a stale/guessed value — the
+// real SEM_SMST_SECURITY_ID is 21) until this fix. A wrong VIX id here
+// doesn't fail loudly: it just silently subscribes to and quotes whatever
+// OTHER index security 26 happens to be, so this is exactly the kind of
+// error that needs checking against the source, not memory.
 export const INDEX_INSTRUMENTS: Record<string, { securityId: string; label: string }> = {
   NIFTY: { securityId: '13', label: 'NIFTY 50' },
   BANKNIFTY: { securityId: '25', label: 'NIFTY BANK' },
   FINNIFTY: { securityId: '27', label: 'NIFTY FIN SERVICE' },
   MIDCPNIFTY: { securityId: '442', label: 'NIFTY MID SELECT' },
   SENSEX: { securityId: '51', label: 'BSE SENSEX' },
-  INDIAVIX: { securityId: '26', label: 'INDIA VIX' },
+  INDIAVIX: { securityId: '21', label: 'INDIA VIX' },
 };
 
 const INDEX_SEC_IDS = Object.values(INDEX_INSTRUMENTS).map((i) => i.securityId);
@@ -48,6 +56,35 @@ export interface QuoteSnapshot {
   updatedAt: number;
 }
 
+/**
+ * Translates this app's trailing-stop config — a fixed point DISTANCE off
+ * the high-water mark (paper_positions.trailing_stop, the shape every
+ * caller in this codebase already stores and reasons about) — into the
+ * shape PositionMonitor.track() actually requires: { atr, multiplier }.
+ *
+ * Every call site used to pass a raw number or { distance } directly as
+ * `trail`. PositionMonitor.track() only checks that `trail` is truthy and
+ * then reads `trail.atr` — neither shape has that property, so `atr` was
+ * always `undefined`. Its TrailManager computes
+ * `candidate = highestPrice - atr * multiplier`, which is then NaN, and
+ * `NaN > currentStop` is always false — the trail NEVER ADVANCES. Since
+ * every leg here also sets an explicit stopLoss alongside trailingStop,
+ * the practical effect was that every "trailing" stop in the system
+ * silently degraded to a static stop that never trails; a trailing-only
+ * position with no separate stopLoss would have had NO stop-loss
+ * protection at all (its threshold would also compute as NaN).
+ *
+ * multiplier: 1 reproduces the intended semantic exactly: `stop =
+ * highestPrice - distance`, i.e. "trail by N points off the high water
+ * mark" — using the SDK's ATR-trail mechanism with the multiplier pinned
+ * to 1 rather than treating `distance` as a true Average True Range.
+ */
+export function toTrailConfig(raw: number | { distance: number } | null | undefined): { atr: number; multiplier: number } | undefined {
+  const d = Number(typeof raw === 'object' && raw !== null ? raw.distance : raw);
+  if (!(d > 0)) return undefined;
+  return { atr: d, multiplier: 1 };
+}
+
 export class MarketDataService {
   private client: DhanClient;
   private quotes = new Map<string, QuoteSnapshot>();     // securityId → snapshot
@@ -68,6 +105,7 @@ export class MarketDataService {
   private extraSubscriptions = new Set<string>();        // 'SEG:SECID' keys
   private unsubEventBus: (() => void) | null = null;
   private wsConnecting = false;
+  private wsConnectingAt = 0;
   private pollInFlight = false;
   readonly monitor = new PositionMonitor();
 
@@ -115,7 +153,18 @@ export class MarketDataService {
     }
 
     // Back off if recently rate-limited (429) on WebSocket
-    if (this.wsConnecting) return;
+    if (this.wsConnecting) {
+      // A connect() attempt that never fires open/error/close — a raw
+      // socket stuck at the TCP level with no timeout enforced by the WS
+      // library, e.g. a firewall silently dropping packets — would
+      // otherwise leave wsConnecting true forever: every later retry hits
+      // this guard and returns immediately, and nothing past this point
+      // schedules another one, permanently killing the reconnect loop.
+      // Treat an attempt this stale as dead and let it retry instead of
+      // trusting it'll eventually settle.
+      if (Date.now() - this.wsConnectingAt < 30_000) return;
+      this.wsConnecting = false;
+    }
     if (Date.now() - this.lastWs429At < 60_000) {
       this.scheduleWsRetry(60_000 - (Date.now() - this.lastWs429At));
       return;
@@ -200,6 +249,7 @@ export class MarketDataService {
 
       if (!ws.market?.isConnected) {
         this.wsConnecting = true;
+        this.wsConnectingAt = Date.now();
         ws.market?.connect?.().catch((e: any) => {
           this.wsConnecting = false;
           const msg = e?.message || String(e);
@@ -209,6 +259,17 @@ export class MarketDataService {
             this.scheduleWsRetry(60_000);
           }
         });
+      } else if (!this.wsStarted) {
+        // isConnected can lag reality: the SDK only flips it to false
+        // inside the underlying transport's own async 'close' event, not
+        // synchronously when we call disconnect() (armSilenceWatch, the
+        // 429 handler) — so a retry landing in that window sees a
+        // stale-true isConnected and skips connect() above entirely.
+        // Nothing else in this function schedules a retry for that case,
+        // so without this the reconnect loop would die permanently here:
+        // wsStarted stays false, isConnected stays stale-true, and nothing
+        // ever calls connect() again.
+        this.scheduleWsRetry();
       }
       if (!ws.orders?.isConnected) {
         ws.orders?.connect?.().catch(() => {});
@@ -479,7 +540,17 @@ export class MarketDataService {
     if (!clock.isMarketOpen && !opts.allowClosed) return null;
     const snap = this.quotes.get(String(securityId));
     if (!snap || !snap.ltp || snap.ltp <= 0) return null;
-    const maxAgeMs = opts.maxAgeMs ?? 15_000;
+    // schedulePolling() backs the REST poll interval off to 30s off-hours
+    // (vs 3s during market hours) — a 15s bound tuned for live market-hours
+    // fills rejected the SAME still-freshest-available quote for roughly
+    // half of every 30s off-hours cycle, purely by timing luck: whether
+    // seedStandardStrategies' spot lookups, EOD square-off, or the kill
+    // switch's close-all price happened to run just after a poll (fresh)
+    // or just before the next one (same value, now "stale"). allowClosed
+    // callers are explicitly the off-hours-tolerant ones, so give them a
+    // bound comfortably above that poll interval instead of silently
+    // inheriting the market-hours-tuned default.
+    const maxAgeMs = opts.maxAgeMs ?? (opts.allowClosed ? 40_000 : 15_000);
     if (Date.now() - snap.updatedAt > maxAgeMs) return null;
     return snap.ltp;
   }
@@ -532,10 +603,26 @@ export class MarketDataService {
   }
 }
 
-function patchOrderWsSafety(): void {
+// Exported for direct unit testing — the surrounding class methods that
+// call this require a live WS connection attempt to reach it, but the
+// patch itself has no dependency on `this` or any connection state.
+export function patchOrderWsSafety(): void {
+  // Two independent one-time patches, each guarded by its OWN flag name,
+  // checked with hasOwnProperty rather than a plain truthy read. They used
+  // to share one `__safetyPatched` name on two prototypes in the SAME
+  // chain — BaseWS.prototype is OrderUpdateWS.prototype's direct parent —
+  // so setting it on the base prototype below made a plain
+  // `OrderUpdateWS.prototype.__safetyPatched` read `true` too, via
+  // inheritance, even though it had never been set on OrderUpdateWS.
+  // prototype itself. That made the SECOND patch's own guard see "already
+  // patched" on its very first run and return immediately — the
+  // concatenated-JSON/malformed-frame onMessage patch below never
+  // installed, so a Dhan frame containing two concatenated `{...}{...}`
+  // objects hit the SDK's raw onMessage and could throw inside the socket
+  // handler instead of being safely split and parsed.
   const baseProto = Object.getPrototypeOf(OrderUpdateWS.prototype);
-  if (baseProto && !baseProto.__safetyPatched) {
-    baseProto.__safetyPatched = true;
+  if (baseProto && !Object.prototype.hasOwnProperty.call(baseProto, '__connectSafetyPatched')) {
+    baseProto.__connectSafetyPatched = true;
     const origConnect = baseProto.connect;
     baseProto.connect = async function (this: any) {
       if (typeof this.listenerCount === 'function' && this.listenerCount('error') === 0) {
@@ -546,8 +633,8 @@ function patchOrderWsSafety(): void {
   }
 
   const proto = (OrderUpdateWS as any)?.prototype;
-  if (!proto || proto.__safetyPatched) return;
-  proto.__safetyPatched = true;
+  if (!proto || Object.prototype.hasOwnProperty.call(proto, '__onMessageSafetyPatched')) return;
+  proto.__onMessageSafetyPatched = true;
   const origOnMessage = proto.onMessage;
   proto.onMessage = function (data: any) {
     try {

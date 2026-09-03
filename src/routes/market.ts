@@ -4,8 +4,7 @@ import type { MarketDataService } from '../services/marketData';
 import { getOptionsAnalysisCache, saveOptionsAnalysisCache } from '../db';
 import { eventBus } from '../services/eventBus';
 import { analyzeOptionChain, toChainRowView } from '../services/optionsAnalytics';
-import { nearestIndexExpiry } from '../services/marketHours';
-import { warmLotSizeCache } from '../services/strategyConstructor';
+import { warmLotSizeCache, resolveNearestExpiry } from '../services/strategyConstructor';
 
 /**
  * Market data routes — every response is sourced from live DhanHQ data.
@@ -31,7 +30,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
   router.get('/option-chain/:symbol', async (req, res) => {
     try {
       const symbol = (req.params.symbol || 'NIFTY').toUpperCase();
-      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
+      const expiry = (req.query.expiry as string) || await resolveNearestExpiry(client, symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
         underlyingScrip: Number(securityIdFor(symbol)),
         underlyingSeg: 'IDX_I',
@@ -81,7 +80,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
   router.get('/greeks', async (req, res) => {
     try {
       const symbol = ((req.query.symbol as string) || 'NIFTY').toUpperCase();
-      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
+      const expiry = (req.query.expiry as string) || await resolveNearestExpiry(client, symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
         underlyingScrip: Number(securityIdFor(symbol)),
         underlyingSeg: 'IDX_I',
@@ -113,14 +112,14 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
     try {
       const symbol = (req.params.symbol || 'NIFTY').toUpperCase();
       const secId = securityIdFor(symbol);
-      const expiry = (req.query.expiry as string) || nearestIndexExpiry(symbol);
+      const expiry = (req.query.expiry as string) || await resolveNearestExpiry(client, symbol);
       const chain = await (client as any).optionChain.fetchNormalized({
         underlyingScrip: Number(secId), underlyingSeg: 'IDX_I', expiry,
       });
       const rows = Array.isArray(chain) ? chain : chain?.strikes || chain?.data || [];
       const spotSnap = market.getQuote(secId);
       const spot = spotSnap?.ltp || Number(req.query.spot) || 0;
-      const vixSnap = market.getQuote('26');
+      const vixSnap = market.getQuote('21'); // India VIX (NSE IDX_I) — verified against DhanHQ's instrument master
       const vix = vixSnap?.ltp || 14;
 
       const analytics = analyzeOptionChain(symbol, rows, spot, expiry, vix);
@@ -147,7 +146,7 @@ export function marketRoutes(client: DhanClient, market: MarketDataService): Rou
 }
 
 function securityIdFor(symbol: string): string {
-  const map: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', SENSEX: '51', INDIAVIX: '26' };
+  const map: Record<string, string> = { NIFTY: '13', BANKNIFTY: '25', FINNIFTY: '27', MIDCPNIFTY: '442', SENSEX: '51', INDIAVIX: '21' };
   return map[symbol.toUpperCase()] || '13';
 }
 

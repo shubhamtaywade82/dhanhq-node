@@ -3,4 +3,5 @@ dist
 .env
 logs/
 .cache/
+.journal/
 data/

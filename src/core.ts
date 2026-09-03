@@ -1,7 +1,7 @@
 import { DhanClient, OrderTracker, type PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
-import { createDhanClient, redisPublisher, redisAvailable } from './auth';
-import { initDatabase, listPaperPositions } from './db';
-import { MarketDataService } from './services/marketData';
+import { createDhanClient, createSandboxDhanClient, redisPublisher, redisAvailable } from './auth';
+import { initDatabase, listPaperPositions, findMissingOrders, pushAlert } from './db';
+import { MarketDataService, toTrailConfig } from './services/marketData';
 import { RiskEngine } from './services/riskEngine';
 import { AutonomyEngine } from './services/autonomy';
 import { AgentOrchestrator } from './services/agent';
@@ -11,6 +11,11 @@ import { startTelegramNotifier } from './services/telegramNotifier';
 import { eventBus } from './services/eventBus';
 import { PaperExecutionEngine } from './engines/paper';
 import { LiveExecutionEngine } from './engines/live';
+import { SandboxExecutionEngine } from './engines/sandbox';
+import { marketClock } from './services/marketHours';
+import { hasHolidayCoverage } from './services/holidays';
+import { journal, summarizeDay, type JournalEntry } from './services/journal';
+import { PaperPortfolioSource, BrokerPortfolioSource, type PortfolioSource } from './services/portfolioSource';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -25,36 +30,74 @@ export interface Core {
   agent: AgentOrchestrator;
   paper: PaperExecutionEngine;
   live: LiveExecutionEngine;
+  sandbox?: SandboxExecutionEngine;
   tracker: OrderTracker;
   selfHealing: SelfHealingService;
+}
+
+/**
+ * The ONE place that maps TRADING_MODE to an execution engine — replaces
+ * the `isLive ? core.live : core.paper` check that used to be duplicated
+ * at every call site (agent.ts, index.ts), which had no room for a third
+ * mode.
+ */
+export function resolveExecutionEngine(core: Core, mode: string | undefined): PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine {
+  if (mode === 'live') return core.live;
+  if (mode === 'sandbox') {
+    if (!core.sandbox) throw new Error('TRADING_MODE=sandbox but the sandbox engine was not initialized (missing DHAN_SANDBOX_CLIENT_ID/DHAN_SANDBOX_ACCESS_TOKEN?)');
+    return core.sandbox;
+  }
+  return core.paper;
 }
 
 import { seedStandardStrategies } from './services/strategyConstructor';
 
 export async function startCore(): Promise<Core> {
-  // LiveExecutionEngine places real broker orders but writes no position/
-  // wallet state of its own — RiskEngine, AutonomyEngine, the kill switch
-  // and EOD square-off all read/act on the PAPER tables regardless of
-  // TRADING_MODE. In live mode that means real capital trades with the
-  // entire risk layer blind to it: the daily-loss breaker sees ₹0, EOD
-  // square-off closes paper positions while real ones stay open, and the
-  // kill switch's "positions closed" count is fabricated from an empty
-  // paper book. Refusing to boot is safer than an unmonitored live book —
-  // this must be resolved (a real PortfolioSource behind risk/autonomy)
-  // before TRADING_MODE=live is usable again.
+  // The gap this guard originally existed for is closed: RiskEngine,
+  // AutonomyEngine and LiveExecutionEngine all read/act through
+  // PortfolioSource now, BrokerPortfolioSource polls the real DhanHQ
+  // account, and reconcileUnmanagedLivePositions (autonomy.ts) flattens and
+  // halts on any broker position PositionMonitor isn't tracking. Two
+  // silent-no-op bugs on the live kill-switch and capital-check paths
+  // (wrong SDK method names swallowed by optional chaining) were also found
+  // and fixed in the same pass.
+  //
+  // The guard stays in place anyway, by deliberate choice, not oversight:
+  // none of the above has ever run against a real DhanHQ account (this
+  // environment has no live credentials) — the reversing-order square-off
+  // path, the broker kill switch call, and the assumption that a flattened
+  // position still reports realizedProfit in positions.list() are all
+  // verified only against the SDK's type declarations and mocks. Lift this
+  // only after a supervised first live session (minimum lot size, one
+  // index) confirms the kill switch and reconciler actually fire correctly
+  // against the real account — not as a standalone code change.
   if (process.env.TRADING_MODE === 'live') {
     throw new Error(
-      'TRADING_MODE=live is currently unsafe: risk engine, autonomy loop, EOD square-off, and the kill switch ' +
-      'all operate on paper position/wallet state, not the live broker book. Live orders would execute ' +
-      'completely unmonitored. Set TRADING_MODE=paper until a live PortfolioSource is wired through.'
+      'TRADING_MODE=live is deliberately disabled pending a supervised first live session: PortfolioSource, ' +
+      'the broker kill switch, and the unmanaged-position reconciler are implemented and tested against mocks, ' +
+      'but have never run against a real DhanHQ account. Set TRADING_MODE=paper, or remove this guard only ' +
+      'after that verification (see the comment above this block).'
     );
   }
+  if (process.env.TRADING_MODE === 'sandbox' && !createSandboxDhanClient()) {
+    throw new Error(
+      'TRADING_MODE=sandbox requires DHAN_SANDBOX_CLIENT_ID and DHAN_SANDBOX_ACCESS_TOKEN — set them, or use TRADING_MODE=paper.'
+    );
+  }
+
   await initDatabase();
   const client = await createDhanClient();
 
   const market = new MarketDataService(client);
-  const risk = new RiskEngine(client, market);
-  const autonomy = new AutonomyEngine(client, market, risk);
+  // The ONE place TRADING_MODE picks which account this whole stack reads/
+  // acts on — RiskEngine, AutonomyEngine and LiveExecutionEngine all take
+  // the SAME instance so there is exactly one broker poll cache and one
+  // idea of "the current positions" shared across them, not one each.
+  const portfolio: PortfolioSource = process.env.TRADING_MODE === 'live'
+    ? new BrokerPortfolioSource(client)
+    : new PaperPortfolioSource();
+  const risk = new RiskEngine(client, market, portfolio);
+  const autonomy = new AutonomyEngine(client, market, risk, portfolio);
 
   // OrderTracker: resolve live orders to fills from order-update WS
   // events (MarketDataService re-emits them on the bus).
@@ -66,8 +109,12 @@ export async function startCore(): Promise<Core> {
   });
 
   const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
-  const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk);
-  const agent = new AgentOrchestrator(client, market, risk, paper, live);
+  const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk, portfolio);
+  // Sandbox client always uses the Real client for market data/WS (Dhan's
+  // sandbox has neither) — only order routing goes to the sandbox account.
+  const sandboxClient = createSandboxDhanClient();
+  const sandbox = sandboxClient ? new SandboxExecutionEngine(sandboxClient, market, risk) : undefined;
+  const agent = new AgentOrchestrator(client, market, risk, paper, live, sandbox);
   autonomy.setAgent(agent);
   autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, paper, risk));
 
@@ -82,6 +129,22 @@ export async function startCore(): Promise<Core> {
   selfHealing.start();
   startTelegramNotifier();
 
+  // The holiday table is hand-maintained per calendar year (see holidays.ts)
+  // — running into an uncovered year would silently treat every day as
+  // tradeable again, which is exactly the bug this table exists to close.
+  // Loud at boot, not a per-cycle log spam source.
+  const todayIst = marketClock().istDate;
+  if (!hasHolidayCoverage(todayIst)) {
+    eventBus.log('ERROR', `No trading-holiday data for ${todayIst.slice(0, 4)} — market-closed days will NOT be detected. Update src/services/holidays.ts.`, 'core');
+  }
+
+  // Durable audit trail — order intents/results, risk/kill decisions, EOD
+  // square-offs, control commands (journal.ts). Opened before anything can
+  // journal to it; a prior boot's entries from the same trading day (a
+  // restart) are read back for a diagnostic count, not replayed into state.
+  const priorEntries = journal.open(todayIst);
+  eventBus.log('SYSTEM', `Journal opened for ${todayIst} (${priorEntries.length} entr${priorEntries.length === 1 ? 'y' : 'ies'} from earlier this session)`, 'core');
+
   await market.start();
   // risk/autonomy register their exit-signal and evaluation listeners here —
   // must happen BEFORE re-arming any existing position's stop-loss/target
@@ -91,6 +154,7 @@ export async function startCore(): Promise<Core> {
   // after it (as before) left a real window where a fired exit signal had
   // no listener yet and was silently lost.
   await risk.start();
+  await crossCheckJournalOnBoot(priorEntries, risk);
   await autonomy.start();
   await seedExistingPositions(market, market.monitor);
   await seedStandardStrategies(client, market, paper);
@@ -98,7 +162,43 @@ export async function startCore(): Promise<Core> {
   eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
-  return { client, market, risk, autonomy, agent, paper, live, tracker, selfHealing };
+  return { client, market, risk, autonomy, agent, paper, live, sandbox, tracker, selfHealing };
+}
+
+/**
+ * Cross-checks today's journal against actual state — a restart-time
+ * sanity check, not a reconstruction. Only meaningful when priorEntries is
+ * non-empty (a restart later the same trading day); on a fresh day's first
+ * boot there's nothing yet to check against. Read-only: a mismatch is
+ * logged and alerted, never "corrected" from the journal — the journal
+ * only covers today and can't tell a legitimate multi-day carry-over
+ * position from actual drift, so it must never be treated as more
+ * authoritative than the ledger it's checking.
+ */
+export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk: RiskEngine): Promise<void> {
+  if (priorEntries.length === 0) return;
+  const summary = summarizeDay(priorEntries);
+
+  const missing = await findMissingOrders(summary.tradedCorrelationIds);
+  if (missing.length > 0) {
+    const msg = `Boot cross-check: journal recorded ${missing.length} trade(s) today with no matching durable order record (${missing.join(', ')}) — something may have altered the ledger outside the normal fill path`;
+    eventBus.log('ERROR', msg, 'core');
+    await pushAlert('ERROR', 'core', msg);
+  }
+
+  if (summary.lastKillAction === 'arm' && !risk.isKilled()) {
+    const msg = "Boot cross-check: journal's last kill-switch action today was ARM, but the risk engine reports NOT killed";
+    eventBus.log('WARN', msg, 'core');
+    await pushAlert('WARN', 'core', msg);
+  } else if (summary.lastKillAction === 'disarm' && risk.isKilled()) {
+    const msg = "Boot cross-check: journal's last kill-switch action today was DISARM, but the risk engine reports KILLED";
+    eventBus.log('WARN', msg, 'core');
+    await pushAlert('WARN', 'core', msg);
+  }
+
+  if (missing.length === 0 && (summary.lastKillAction === null || summary.lastKillAction === (risk.isKilled() ? 'arm' : 'disarm'))) {
+    eventBus.log('SYSTEM', `Boot cross-check: today's journal (${priorEntries.length} entries) agrees with current state`, 'core');
+  }
 }
 
 /** Re-subscribes quotes AND re-arms stop-loss/target for positions that
@@ -113,7 +213,7 @@ async function seedExistingPositions(market: MarketDataService, monitor: Positio
     if (active.length > 0) market.addInstruments(active);
 
     for (const p of open) {
-      if (!p.stopLoss && !p.target) continue;
+      if (!p.stopLoss && !p.target && !p.trailingStop) continue;
       monitor.track({
         securityId: String(p.securityId),
         exchangeSegment: p.exchangeSegment || 'NSE_FNO',
@@ -121,6 +221,7 @@ async function seedExistingPositions(market: MarketDataService, monitor: Positio
         entryPrice: p.netQty > 0 ? p.buyAvg : p.sellAvg,
         stopLoss: p.stopLoss ?? undefined,
         target: p.target ?? undefined,
+        trail: toTrailConfig(p.trailingStop),
       });
     }
   } catch { /* non-fatal */ }

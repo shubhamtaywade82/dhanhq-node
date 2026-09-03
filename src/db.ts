@@ -1,6 +1,10 @@
 import { Pool } from 'pg';
 import { moduleLogger } from './lib/logger';
 import { marketClock } from './services/marketHours';
+import { eventBus } from './services/eventBus';
+import { journal } from './services/journal';
+import { applyFillSlippage, type FillKind } from './services/fillModel';
+import { redisPublisher } from './auth';
 
 const log = moduleLogger('db');
 
@@ -791,22 +795,55 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
   };
 }
 
-export async function closePaperPosition(symbol: string, currentLtp?: number, marginResolver?: MarginResolver) {
+/**
+ * Closes an open paper position at a slipped fill price and emits the same
+ * 'order' fill telemetry as PaperExecutionEngine.placeOrder.
+ *
+ * Every exit path in the system — autonomy's auto-exit on a PositionMonitor
+ * signal, strategy loss-limit stops, EOD square-off, the kill switch, and
+ * the manual/strategy close routes — calls this function directly rather
+ * than going through PaperExecutionEngine. It used to fill at the exact
+ * reference price with zero slippage and emit nothing onto the event bus,
+ * so every exit was invisible to the risk engine's on-fill re-evaluation,
+ * the frontend's live Orders/Positions feed, and the Redis fill bridge —
+ * only entries participated in any of that. `kind` lets a caller that knows
+ * this is a triggered stop (vs. a target/manual close) price the extra
+ * adverse-crossing cost a real stop pays; callers that don't care default
+ * to the plain exit cost.
+ */
+export async function closePaperPosition(symbol: string, currentLtp?: number, marginResolver?: MarginResolver, kind: FillKind = 'EXIT') {
   const sym = symbol.toUpperCase();
   const pos = mem.positions.get(sym);
   if (!pos || Number(pos.net_qty) === 0) return { status: 'noop', message: 'No open position found' };
   const netQty = Number(pos.net_qty);
-  return executePaperOrder({
+  const transactionType: 'BUY' | 'SELL' = netQty > 0 ? 'SELL' : 'BUY';
+  const referencePrice = currentLtp || Number(pos.ltp || (netQty > 0 ? pos.buy_avg : pos.sell_avg));
+  const fillPrice = applyFillSlippage(referencePrice, transactionType, kind);
+
+  const result: any = await executePaperOrder({
     symbol: sym,
     securityId: pos.security_id,
     exchangeSegment: pos.exchange_segment,
-    transactionType: netQty > 0 ? 'SELL' : 'BUY',
+    transactionType,
     orderType: 'MARKET',
     productType: pos.product_type,
     quantity: Math.abs(netQty),
-    price: currentLtp || Number(pos.ltp || (netQty > 0 ? pos.buy_avg : pos.sell_avg)),
+    price: fillPrice,
     correlationId: `close_${sym}_${Date.now()}`,
   }, marginResolver);
+
+  if (result.status === 'TRADED') {
+    const fillPayload = {
+      correlation_id: result.orderId, is_paper: true, fill_price: result.fillPrice,
+      quantity: result.quantity, security_id: pos.security_id, symbol: sym,
+      latency_ms: result.latencyMs, charges: result.charges, filled_at: new Date().toISOString(),
+    };
+    eventBus.log('TRADE', `Paper close ${transactionType} ${result.quantity} ${sym} @ ₹${result.fillPrice.toFixed(2)}`, 'paper_engine');
+    eventBus.emit('order', { kind: 'fill', ...fillPayload });
+    journal.append('order_result', { status: 'TRADED', exitKind: kind, ...fillPayload });
+    redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
+  }
+  return result;
 }
 
 /** Mark open positions to market — pure in-memory, called every autonomy
@@ -873,4 +910,163 @@ export async function closeAllPaperPositions(ltpResolver: (securityId: string, s
     results.push(await closePaperPosition(p.tradingSymbol, ltp));
   }
   return results;
+}
+
+// ── ledger reconciliation: mem cache vs durable Postgres ───────────────────
+export interface LedgerMismatch { subject: string; field: string; mem: number | string; postgres: number | string }
+export interface LedgerDriftReport {
+  ok: boolean;
+  checkedPositions: number;
+  mismatches: LedgerMismatch[];
+  missingInPostgres: string[]; // open in mem, no row in postgres
+  missingInMem: string[];      // open in postgres, not open in mem
+}
+
+// Wallet fields a FILL writes to both stores — excludes nothing computed
+// (mem.wallet has no derived fields; getPaperWallet() computes those from
+// these raw columns on read).
+const WALLET_FIELDS = ['initial_balance', 'available_margin', 'used_margin', 'realized_pnl', 'total_charges', 'session_realized_base'] as const;
+
+// Position fields a FILL writes to both stores. Deliberately excludes
+// `ltp` and `unrealized_pnl`: markPositionsToMarket() updates those in mem
+// on every tick and NEVER writes them to Postgres (mark-to-market is a
+// pure in-memory hot path, by design) — comparing them would report
+// permanent "drift" that isn't drift at all, just two different concerns
+// living in the same row.
+const POSITION_FIELDS = ['buy_qty', 'buy_avg', 'sell_qty', 'sell_avg', 'net_qty', 'realized_pnl', 'margin_blocked', 'stop_loss', 'target', 'trailing_stop'] as const;
+
+const NUMERIC_TOLERANCE = 0.01; // one paisa — floating-point noise, not drift
+
+function numsDiffer(a: any, b: any): boolean {
+  const na = Number(a ?? 0), nb = Number(b ?? 0);
+  if (Number.isNaN(na) || Number.isNaN(nb)) return na !== nb;
+  return Math.abs(na - nb) > NUMERIC_TOLERANCE;
+}
+
+/**
+ * Compares the in-memory cache — the read path every position/wallet query
+ * in this system goes through — against what's actually durable in
+ * Postgres. They're expected to always agree (mem is updated from the same
+ * computed result as every Postgres write inside one transaction), so any
+ * mismatch means a write silently diverged: a Postgres commit that
+ * appeared to fail but partially applied, a direct SQL change outside
+ * this process, or a bug in a future code path that updates one store and
+ * not the other.
+ *
+ * Read-only and cheap enough to run periodically (a handful of indexed
+ * queries) — no-ops in memory mode, where there is nothing to compare
+ * against.
+ */
+export async function reconcileLedger(): Promise<LedgerDriftReport> {
+  const report: LedgerDriftReport = { ok: true, checkedPositions: 0, mismatches: [], missingInPostgres: [], missingInMem: [] };
+  if (mode !== 'postgres') return report;
+
+  try {
+    const walletRes = await pool.query('SELECT * FROM paper_wallet WHERE id = $1', ['default']);
+    const pgWallet = walletRes.rows[0];
+    if (pgWallet) {
+      for (const field of WALLET_FIELDS) {
+        const memVal = (mem.wallet as any)[field];
+        const pgVal = pgWallet[field];
+        if (numsDiffer(memVal, pgVal)) {
+          report.mismatches.push({ subject: 'wallet', field, mem: Number(memVal ?? 0), postgres: Number(pgVal ?? 0) });
+        }
+      }
+    }
+
+    const posRes = await pool.query('SELECT * FROM paper_positions WHERE net_qty <> 0');
+    const pgOpen = new Map<string, any>(posRes.rows.map((r: any) => [r.id, r]));
+    const memOpen = new Map<string, any>([...mem.positions.entries()].filter(([, p]) => Number(p.net_qty) !== 0));
+    report.checkedPositions = Math.max(pgOpen.size, memOpen.size);
+
+    for (const [symbol, memPos] of memOpen) {
+      const pgPos = pgOpen.get(symbol);
+      if (!pgPos) { report.missingInPostgres.push(symbol); continue; }
+      for (const field of POSITION_FIELDS) {
+        if (numsDiffer(memPos[field], pgPos[field])) {
+          report.mismatches.push({ subject: symbol, field, mem: Number(memPos[field] ?? 0), postgres: Number(pgPos[field] ?? 0) });
+        }
+      }
+    }
+    for (const symbol of pgOpen.keys()) {
+      if (!memOpen.has(symbol)) report.missingInMem.push(symbol);
+    }
+  } catch (e: any) {
+    log.warn({ err: { message: e.message } }, 'Ledger reconciliation query failed — treating as non-fatal, will retry next cycle');
+    return report; // a failed CHECK is not itself drift — don't report false corrections
+  }
+
+  report.ok = report.mismatches.length === 0 && report.missingInPostgres.length === 0 && report.missingInMem.length === 0;
+  return report;
+}
+
+/**
+ * Applies the correction implied by a drift report: Postgres is the
+ * durable source of truth, so every mismatch is resolved by overwriting
+ * the mem side with the Postgres row. A position missing from mem is
+ * pulled in from Postgres; a position mem has that Postgres doesn't is
+ * dropped from mem (Postgres's absence IS the truth — mem must not keep
+ * trading a position the durable ledger has no record of).
+ */
+export async function correctLedgerFromPostgres(report: LedgerDriftReport): Promise<void> {
+  if (mode !== 'postgres' || report.ok) return;
+
+  if (report.mismatches.some((m) => m.subject === 'wallet') || report.missingInPostgres.length + report.missingInMem.length > 0) {
+    const walletRes = await pool.query('SELECT * FROM paper_wallet WHERE id = $1', ['default']);
+    if (walletRes.rows[0]) mem.wallet = walletRes.rows[0];
+  }
+
+  const affected = new Set<string>([
+    ...report.mismatches.filter((m) => m.subject !== 'wallet').map((m) => m.subject),
+    ...report.missingInMem,
+  ]);
+  for (const symbol of affected) {
+    const res = await pool.query('SELECT * FROM paper_positions WHERE id = $1', [symbol]);
+    if (res.rows[0] && Number(res.rows[0].net_qty) !== 0) {
+      mem.positions.set(symbol, res.rows[0]);
+    } else {
+      mem.positions.delete(symbol);
+    }
+  }
+
+  for (const symbol of report.missingInPostgres) {
+    // Postgres has no record of this position at all — mem must not keep
+    // trading something the durable ledger never saw.
+    mem.positions.delete(symbol);
+  }
+}
+
+/**
+ * Returns the subset of the given IDs that have NO matching durable order
+ * record — used by core.ts's boot-time journal cross-check (journal.ts's
+ * summarizeDay) to verify every trade the journal recorded as TRADED
+ * actually has a row in the durable order history. Checked against BOTH
+ * `id` and `correlation_id`: an ENTRY's journaled id is the caller's own
+ * correlation id (the `correlation_id` column), while an EXIT's
+ * (closePaperPosition) is the generated order id (the `id` column) —
+ * closePaperPosition reuses the `correlation_id` field name in its fill
+ * payload for that value, so the caller doesn't need to know which is
+ * which; this checks both.
+ */
+export async function findMissingOrders(ids: string[]): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const remaining = new Set(ids);
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT id, correlation_id FROM paper_orders WHERE id = ANY($1) OR correlation_id = ANY($1)', [ids]);
+      for (const row of res.rows) {
+        remaining.delete(row.id);
+        if (row.correlation_id) remaining.delete(row.correlation_id);
+      }
+    } catch (e: any) {
+      log.warn({ err: { message: e.message } }, 'findMissingOrders query failed — skipping this boot cross-check');
+      return []; // a failed CHECK is not itself a finding
+    }
+  } else {
+    for (const o of mem.orders) {
+      remaining.delete(o.id);
+      if (o.correlation_id) remaining.delete(o.correlation_id);
+    }
+  }
+  return [...remaining];
 }

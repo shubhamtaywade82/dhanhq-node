@@ -2,17 +2,22 @@ import type { DhanClient, PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
 import { redisPublisher } from '../auth';
 import { executePaperOrder, defaultMarginResolver, type MarginResolver } from '../db';
 import { eventBus } from '../services/eventBus';
+import { journal } from '../services/journal';
+import { applyFillSlippage } from '../services/fillModel';
 import type { MarketDataService } from '../services/marketData';
+import { toTrailConfig } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 
 /**
  * Paper execution engine.
  *
  * Fills are priced from the LIVE market LTP served by MarketDataService
- * (DhanHQ binary WS or REST quotes) — never from a constant. A slippage
- * model (ticks adverse to the aggressor) is applied on top of the real
- * price. If no live price is known for the instrument the order is
- * REJECTED, exactly like a broker would reject an unpriceable order.
+ * (DhanHQ binary WS or REST quotes) — never from a constant. A premium-
+ * scaled spread model (fillModel.ts) is applied on top of the real price,
+ * shared with every exit path (db.ts closePaperPosition) so entries and
+ * exits pay a consistent, realistic cost rather than drifting apart. If no
+ * live price is known for the instrument the order is REJECTED, exactly
+ * like a broker would reject an unpriceable order.
  *
  * LIMIT orders never rest — there is no order book (deliberately: paper
  * trading here only ever deals in liquid ATM CE/PE, so immediate-fill is
@@ -26,16 +31,13 @@ export class PaperExecutionEngine {
   private market: MarketDataService;
   private risk: RiskEngine;
   private latencyMs: number;
-  private slippageTicks: number;
-  private tickSize = 0.05;
 
-  constructor(client: DhanClient, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine, latencyMs = 50, slippageTicks = 1) {
+  constructor(client: DhanClient, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine, latencyMs = 50) {
     this.client = client;
     this.monitor = monitor;
     this.market = market;
     this.risk = risk;
     this.latencyMs = latencyMs;
-    this.slippageTicks = slippageTicks;
   }
 
   /** Real DhanHQ margin calculator — the same one the live margin endpoint
@@ -62,12 +64,14 @@ export class PaperExecutionEngine {
     const { correlation_id, intent_id, params, risk_limits } = intent;
     const { security_id, quantity, transaction_type, order_type = 'MARKET', price = 0 } = params;
     const symbol = params.symbol || params.trading_symbol || `SEC_${security_id}`;
+    journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'paper' });
 
     // Risk gate — the kill switch and EOD window block paper fills too.
     const gate = this.risk.canTrade();
     if (!gate.allowed) {
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${gate.reason}`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason });
       return { status: 'REJECTED', reason: gate.reason };
     }
 
@@ -87,6 +91,7 @@ export class PaperExecutionEngine {
         const reason = `LIMIT price ${price} not marketable vs LTP ${liveLtp}`;
         eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${reason}`, 'paper_engine');
         eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason });
+        journal.append('order_result', { correlation_id, status: 'REJECTED', reason });
         return { status: 'REJECTED', reason };
       }
       referencePrice = transaction_type === 'BUY' ? Math.min(liveLtp, price) : Math.max(liveLtp, price);
@@ -94,6 +99,7 @@ export class PaperExecutionEngine {
     if (referencePrice == null || referencePrice <= 0) {
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: no live LTP for ${symbol} (security ${security_id})`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: 'No live LTP available for instrument' });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: 'No live LTP available for instrument' });
       return { status: 'REJECTED', reason: 'No live LTP available for instrument' };
     }
 
@@ -102,9 +108,7 @@ export class PaperExecutionEngine {
       await new Promise((resolve) => setTimeout(resolve, this.latencyMs));
     }
 
-    const fillPrice = transaction_type === 'BUY'
-      ? referencePrice + this.slippageTicks * this.tickSize
-      : referencePrice - this.slippageTicks * this.tickSize;
+    const fillPrice = applyFillSlippage(referencePrice, transaction_type, 'ENTRY');
 
     const trailDist = typeof risk_limits?.trailing_stop === 'object'
       ? Number(risk_limits.trailing_stop.distance)
@@ -131,6 +135,7 @@ export class PaperExecutionEngine {
       // a broker would, not a 500.
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${e.message}`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: e.message });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: e.message });
       return { status: 'REJECTED', reason: e.message };
     }
 
@@ -149,6 +154,7 @@ export class PaperExecutionEngine {
 
     eventBus.log('TRADE', `Paper fill ${transaction_type} ${quantity} ${symbol} @ ₹${result.fillPrice.toFixed(2)} (${correlation_id})`, 'paper_engine');
     eventBus.emit('order', { kind: 'fill', ...fillPayload });
+    journal.append('order_result', { status: 'TRADED', ...fillPayload });
     await redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
     // Stop-loss / target / trailing monitoring via SDK PositionMonitor, fed
@@ -165,7 +171,7 @@ export class PaperExecutionEngine {
         entryPrice: result.avgPrice,
         stopLoss: risk_limits.stop_loss,
         target: risk_limits.target,
-        trail: risk_limits.trailing_stop,
+        trail: toTrailConfig(risk_limits.trailing_stop),
       });
     }
 

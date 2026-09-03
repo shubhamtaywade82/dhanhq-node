@@ -1,13 +1,14 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { eventBus } from './eventBus';
+import { journal } from './journal';
 import { marketClock } from './marketHours';
 import type { MarketDataService } from './marketData';
 import { INDEX_INSTRUMENTS } from './marketData';
 import { nearestIndexExpiry } from './marketHours';
 import { calculateGreeks } from './optionsAnalytics';
+import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 import {
-  getPaperWallet, listPaperPositions, getTodayOrderStats,
-  pushAlert, getRiskState, saveRiskState, closeAllPaperPositions,
+  pushAlert, getRiskState, saveRiskState,
   listPaperStrategies, updatePaperStrategyStatus,
 } from '../db';
 
@@ -31,7 +32,22 @@ export interface RiskLimits {
   maxRejectionRatePct: number;   // % rejected / total today
   staleTickSec: number;          // seconds without a tick during market hours
   maxConcurrentStrategies: number; // simultaneous RUNNING strategies, any index
-  maxPortfolioDeltaPct: number;    // |net delta-equivalent notional| as % of equity
+  /** |net delta-equivalent notional| as % of equity. Deliberately a
+   * triple/quadruple-digit-sized threshold, not a typo: an option's delta-
+   * notional is the UNDERLYING's equivalent exposure, not the premium paid
+   * for it — that's what leverage means. A single NIFTY ATM lot (65 ×
+   * ~0.5Δ × ~24000 spot) already runs to roughly 8x the ₹100,000 default
+   * paper wallet. A threshold sized like a plain margin-utilization
+   * percentage (the old default was 150) makes canTrade() permanently
+   * ERROR — and thus block every order — after the very first fill,
+   * defeating the entire point of an autonomous multi-strategy system.
+   * This default is tuned to read WARN (visible, non-blocking) around one
+   * lot's worth of exposure and ERROR (blocks further same-direction
+   * entries) once concentration roughly doubles that — a rough starting
+   * point given the account size and lot sizes this varies with, meant to
+   * be tuned to the REAL trading account's capital via
+   * RISK_MAX_PORTFOLIO_DELTA_PCT, not treated as a universal constant. */
+  maxPortfolioDeltaPct: number;
 }
 
 export const DEFAULT_RISK_LIMITS: RiskLimits = {
@@ -42,7 +58,7 @@ export const DEFAULT_RISK_LIMITS: RiskLimits = {
   maxRejectionRatePct: 10,
   staleTickSec: 10,
   maxConcurrentStrategies: Number(process.env.RISK_MAX_CONCURRENT_STRATEGIES) || 5,
-  maxPortfolioDeltaPct: Number(process.env.RISK_MAX_PORTFOLIO_DELTA_PCT) || 150,
+  maxPortfolioDeltaPct: Number(process.env.RISK_MAX_PORTFOLIO_DELTA_PCT) || 1000,
 };
 
 export interface CircuitBreakerRow {
@@ -56,6 +72,7 @@ export interface CircuitBreakerRow {
 export class RiskEngine {
   private client: DhanClient;
   private market: MarketDataService;
+  private portfolio: PortfolioSource;
   private limits: RiskLimits = { ...DEFAULT_RISK_LIMITS };
   private killed = false;
   private killedReason: string | null = null;
@@ -67,9 +84,10 @@ export class RiskEngine {
   private tickEvalScheduled = false;
   private lastRiskEmitAt = 0;
 
-  constructor(client: DhanClient, market: MarketDataService) {
+  constructor(client: DhanClient, market: MarketDataService, portfolio: PortfolioSource = new PaperPortfolioSource()) {
     this.client = client;
     this.market = market;
+    this.portfolio = portfolio;
   }
 
   async start(): Promise<void> {
@@ -126,6 +144,13 @@ export class RiskEngine {
     return this.killed;
   }
 
+  /** Exposes the mode-appropriate PortfolioSource to other engines (the
+   * agent's capital-allocation check, notably) so they don't need their own
+   * copy of the paper/live branching this class already does. */
+  getPortfolio(): PortfolioSource {
+    return this.portfolio;
+  }
+
   snapshot() {
     return {
       killed: this.killed,
@@ -155,8 +180,24 @@ export class RiskEngine {
 
   /**
    * Arm the kill switch for real. Paper mode squares off every open
-   * position at the freshest LTP; live mode calls DhanHQ Trader's Control
-   * (kill switch + P&L exit) and then squares off intraday positions.
+   * position at the freshest LTP; live mode ALSO halts order flow at the
+   * broker itself via DhanHQ Trader's Control before squaring off.
+   *
+   * The broker call is intentionally isolated in its own try/catch: it must
+   * never be able to block the actual square-off below, which is the real
+   * safety mechanism. (An earlier version of this method called
+   * traderControls.killSwitch()/.pnlExit() — neither exists on the SDK;
+   * TraderControls only exposes setKillSwitch(status) and setPnlExit(req).
+   * Because both calls used optional chaining, a wrong method name resolved
+   * to undefined and silently no-opped rather than throwing — the broker's
+   * own kill switch never actually engaged in live mode, while this method
+   * proceeded to record brokerKillSwitch as engaged anyway. setPnlExit is
+   * not used here at all: it configures the broker's own auto-exit
+   * thresholds (profitValue/lossValue), which would need real, deliberately
+   * chosen values this system has no basis to invent — closeAll() below
+   * already handles actually exiting every position, so ACTIVATE (which
+   * only blocks new order placement, exits nothing on its own) is
+   * sufficient and doesn't duplicate it.)
    */
   async armKillSwitch(reason: string): Promise<{ status: string; details: any }> {
     if (this.killed) return { status: 'already_killed', details: { reason: this.killedReason } };
@@ -168,23 +209,39 @@ export class RiskEngine {
 
     const details: any = { mode: process.env.TRADING_MODE || 'paper', positionsClosed: 0 };
 
-    try {
-      if ((process.env.TRADING_MODE || 'paper') === 'live') {
-        // DhanHQ Trader's Control: halt order flow at the broker itself.
-        await (this.client as any).traderControls?.killSwitch?.('ENABLE');
-        details.brokerKillSwitch = 'ENABLED';
-        await (this.client as any).traderControls?.pnlExit?.({ type: 'PROFIT', value: 0 }).catch(() => {});
+    if ((process.env.TRADING_MODE || 'paper') === 'live') {
+      try {
+        await (this.client as any).traderControls?.setKillSwitch?.('ACTIVATE');
+        details.brokerKillSwitch = 'ACTIVATE';
+      } catch (e: any) {
+        details.brokerKillSwitchError = e.message;
+        eventBus.log('ERROR', `Broker kill switch ACTIVATE failed: ${e.message} — proceeding to square off locally anyway`, 'risk_engine');
       }
-      const openBefore = await listPaperPositions();
-      const closes = (await closeAllPaperPositions((secId, _sym) => this.market.getFillablePrice(secId, { allowClosed: true }) ?? this.market.getLtp(secId))) as any[];
-      details.positionsClosed = closes.filter((c) => c && c.status === 'TRADED').length;
+    }
+
+    try {
+      const openBefore = await this.portfolio.getPositions();
+      const closes = (await this.portfolio.closeAll((secId, _sym) => this.market.getFillablePrice(secId, { allowClosed: true }) ?? this.market.getLtp(secId))) as any[];
+      const closedSymbols = new Set(closes.filter((c) => c && c.status === 'TRADED').map((c) => c.symbol));
+      details.positionsClosed = closedSymbols.size;
       for (const c of closes) {
         if (c && c.status === 'TRADED') {
           eventBus.emit('order', { kind: 'kill_switch_fill', orderId: c.orderId, symbol: c.symbol, side: c.side, fillPrice: c.fillPrice });
         }
       }
+      // Only untrack a position that was ACTUALLY flattened. closeAll can
+      // return a mix of TRADED and REJECTED (a broker order rejection, or —
+      // in paper mode — an insufficient-margin throw partway through the
+      // loop): untracking on the mere ATTEMPT, regardless of outcome,
+      // stripped stop-loss/target monitoring from a position that is still
+      // open with real exposure, and (in broker mode) there is no way to
+      // re-arm it later — a broker position's stopLoss/target/trailingStop
+      // are always null, so reconcileMonitor can never reconstruct what
+      // protection it's missing.
       for (const pos of openBefore) {
-        if (pos.netQty !== 0) this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
+        if (pos.netQty !== 0 && closedSymbols.has(pos.tradingSymbol)) {
+          this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
+        }
       }
       // Stop every RUNNING strategy too — this also reverses any multi-leg
       // hedge-margin credit (see updatePaperStrategyStatus), which the raw
@@ -201,6 +258,7 @@ export class RiskEngine {
     eventBus.log('ERROR', `*** KILL SWITCH ENGAGED *** reason=${reason} positionsClosed=${details.positionsClosed}`, 'risk_engine');
     eventBus.emit('system', { type: 'kill_switch', state: 'ENGAGED', reason });
     eventBus.emit('risk', this.snapshot());
+    journal.append('kill', { action: 'arm', reason, details });
     return { status: 'killed', details };
   }
 
@@ -212,12 +270,13 @@ export class RiskEngine {
     await saveRiskState({ killed: false, killedDate: null, limits: this.limits });
     try {
       if ((process.env.TRADING_MODE || 'paper') === 'live') {
-        await (this.client as any).traderControls?.killSwitch?.('DISABLE');
+        await (this.client as any).traderControls?.setKillSwitch?.('DEACTIVATE');
       }
     } catch { /* broker may reject if not armed */ }
     eventBus.log('INFO', 'Kill switch disarmed — trading re-enabled', 'risk_engine');
     eventBus.emit('system', { type: 'kill_switch', state: 'DISENGAGED' });
     eventBus.emit('risk', this.snapshot());
+    journal.append('kill', { action: 'disarm' });
     return { status: 'ok' };
   }
 
@@ -230,20 +289,48 @@ export class RiskEngine {
    * nearest weekly expiry and a flat 15% IV — a coarse but honest estimate,
    * refreshed every evaluate() cycle rather than pretending precision it
    * doesn't have. */
+  /** A real DhanHQ trading symbol's exact string format is not the
+   * synthesized "<UNDERLYING><STRIKE><CE|PE>" shape the paper engine
+   * invents (see NormalizedPosition.strike's docstring) — but every
+   * broker's option symbol still names its underlying at the front, so a
+   * starts-with match against the known watchlist works for both. None of
+   * NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/SENSEX is a prefix of another, so
+   * this can't cross-match. */
+  private identifyUnderlying(tradingSymbol: string): string | null {
+    const sym = String(tradingSymbol || '').toUpperCase();
+    for (const key of Object.keys(INDEX_INSTRUMENTS)) {
+      if (key === 'INDIAVIX') continue; // not an options underlying
+      if (sym.startsWith(key)) return key;
+    }
+    return null;
+  }
+
   private estimatePortfolioDeltaNotional(positions: any[]): number {
     let deltaNotional = 0;
     for (const p of positions) {
       const netQty = Number(p.netQty ?? p.net_qty ?? 0);
       if (netQty === 0) continue;
-      const m = String(p.tradingSymbol || '').match(/^([A-Z]+?)(\d+)(CE|PE)$/);
-      if (!m) continue;
-      const [, underlying, strikeStr, optType] = m;
+
+      const underlying = this.identifyUnderlying(p.tradingSymbol);
+      if (!underlying) continue;
       const inst = (INDEX_INSTRUMENTS as any)[underlying];
-      if (!inst) continue;
       const spot = this.market.getLtp(inst.securityId);
       if (!spot) continue;
+
+      // Prefer the broker's own strike/optionType (real DhanHQ positions —
+      // see NormalizedPosition.strike) over parsing tradingSymbol, which
+      // only matches the paper engine's synthesized format.
+      let strike: number | null = p.strike ?? null;
+      let optType: 'CALL' | 'PUT' | null = p.optionType ?? null;
+      if (strike == null || optType == null) {
+        const m = String(p.tradingSymbol || '').match(/^([A-Z]+?)(\d+)(CE|PE)$/);
+        if (!m) continue;
+        strike = Number(m[2]);
+        optType = m[3] === 'CE' ? 'CALL' : 'PUT';
+      }
+
       const expiry = nearestIndexExpiry(underlying);
-      const g = calculateGreeks(spot, Number(strikeStr), expiry, optType === 'CE' ? 'CALL' : 'PUT', 0.15);
+      const g = calculateGreeks(spot, strike, expiry, optType, 0.15);
       deltaNotional += netQty * g.delta * spot;
     }
     return deltaNotional;
@@ -252,10 +339,14 @@ export class RiskEngine {
   async evaluate(): Promise<CircuitBreakerRow[]> {
     this.lastEvalAt = Date.now();
     const [wallet, positions, orderStats, strategies] = await Promise.all([
-      getPaperWallet(), listPaperPositions(), getTodayOrderStats(), listPaperStrategies(),
+      this.portfolio.getWallet(), this.portfolio.getPositions(), this.portfolio.getTodayOrderStats(), listPaperStrategies(),
     ]);
 
-    const unrealized = positions.reduce((acc, p) => acc + (Number(p.unrealizedPnl) || 0), 0);
+    // unrealizedProfit, not unrealizedPnl — the latter is a paper-only
+    // legacy alias db.ts's listPaperPositions() also sets; NormalizedPosition
+    // (broker mode included) only carries unrealizedProfit, matching the
+    // DhanHQ PositionResponse field name.
+    const unrealized = positions.reduce((acc, p) => acc + (Number(p.unrealizedProfit) || 0), 0);
     const dayPnl = Number(wallet.sessionRealizedPnl) + unrealized;
     const total = Number(wallet.totalBalance) || 1;
     const utilPct = (Number(wallet.usedMargin) / total) * 100;
@@ -333,6 +424,7 @@ export class RiskEngine {
         const level = row.state === 'ERROR' ? 'ERROR' : 'WARN';
         await pushAlert(level, 'risk_engine', `${row.rule}: ${prev.state} → ${row.state} (current ${row.current}, threshold ${row.threshold}). Action: ${row.action}`);
         eventBus.emit('alert', { level, source: 'risk_engine', msg: `${row.rule} tripped — ${row.current} vs ${row.threshold}` });
+        journal.append('risk_decision', { rule: row.rule, from: prev.state, to: row.state, current: row.current, threshold: row.threshold, action: row.action });
       }
     }
 

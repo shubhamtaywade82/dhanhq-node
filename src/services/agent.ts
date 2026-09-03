@@ -3,19 +3,19 @@ import { OllamaClient } from '@nemesis-oss/ollama-sdk';
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
-import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules, getPaperWallet } from '../db';
+import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules } from '../db';
 import { INDEX_INSTRUMENTS } from './marketData';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { LiveExecutionEngine } from '../engines/live';
+import type { SandboxExecutionEngine } from '../engines/sandbox';
 import { analyzeOptionChain, recordIvSample, getIvRank, selectStrikeByDelta } from './optionsAnalytics';
 import {
   buildIronCondor, buildIronButterfly, buildCreditSpread, buildDebitSpread,
   buildStraddle, buildStrangle, buildOrbBuyingStrategy, buildOrb30mStrategy,
   buildVwapPullbackStrategy, evaluateStrategyBacktest, calculateCapitalAllocationLots, getLotSize,
-  type ConstructedStrategy
+  resolveNearestExpiry, type ConstructedStrategy
 } from './strategyConstructor';
 import { analyzeOptionsBehavior } from '../routes/market';
-import { nearestIndexExpiry } from './marketHours';
 
 export type AgentKey = 'planner' | 'analyst' | 'strategy' | 'execution' | 'risk' | 'critic';
 
@@ -50,12 +50,49 @@ const idlePersonas = (): Record<AgentKey, { status: 'idle' | 'active'; steps: nu
   risk: { status: 'idle', steps: 0 }, critic: { status: 'idle', steps: 0 },
 });
 
+export type RegimeBucket = 'RANGE_BOUND_THETA' | 'BREAKOUT_MOMENTUM' | 'EXPIRY_GAMMA' | 'TRENDING_DRIFT';
+
+/**
+ * Which "professional institutional regime" bucket governs strategy
+ * selection in synthesizeStrategy() below — checked in this exact priority
+ * order (a range-bound/theta-selling setup and a breakout/momentum setup
+ * are both checked BEFORE the expiry-day override, so on expiry day with
+ * an ALSO-low vix, RANGE_BOUND_THETA fires first; that ordering predates
+ * this function and isn't something this extraction set out to change).
+ *
+ * Previously this checked analytics.regime against 'THETA_DECAY',
+ * 'RANGE_BOUND' and 'GAMMA_BLAST' — none of which analyzeOptionChain's
+ * classifyRegime() (optionsAnalytics.ts) ever produces; its real values are
+ * 'HIGH_IV_RANGE' | 'LOW_IV_TREND' | 'EXPIRY_GAMMA' | 'NEUTRAL'. Those three
+ * comparisons could never be true, so only the vix thresholds ever actually
+ * drove dispatch. Mapped to the real values here by matching STRATEGY
+ * INTENT, not by requiring the same vix range as the existing threshold —
+ * the two conditions in each OR are independent, complementary triggers for
+ * the same decision, not required to agree on IV direction:
+ *   - HIGH_IV_RANGE ("high IV, but contained") means rich premium with no
+ *     breakout brewing — the textbook setup to SELL defined-risk premium,
+ *     same decision the branch's own vix<13.5 heuristic (broad-market calm)
+ *     already made for a different reason.
+ *   - LOW_IV_TREND ("low IV, but trending" — vix<12.5 with a strong PCR
+ *     skew) means cheap premium with a directional catalyst already
+ *     emerging — the textbook setup to BUY premium ahead of a move, same
+ *     decision the branch's own vix>=15.5 heuristic (a breakout already
+ *     under way) already made for a different reason.
+ */
+export function classifyDispatchRegime(analyticsRegime: string | undefined, vix: number): RegimeBucket {
+  if (analyticsRegime === 'HIGH_IV_RANGE' || vix < 13.5) return 'RANGE_BOUND_THETA';
+  if (analyticsRegime === 'LOW_IV_TREND' || vix >= 15.5) return 'BREAKOUT_MOMENTUM';
+  if (analyticsRegime === 'EXPIRY_GAMMA') return 'EXPIRY_GAMMA';
+  return 'TRENDING_DRIFT';
+}
+
 export class AgentOrchestrator {
   private client: DhanClient;
   private market: MarketDataService;
   private risk: RiskEngine;
   private paper: PaperExecutionEngine;
   private live: LiveExecutionEngine;
+  private sandbox?: SandboxExecutionEngine;
   private tools: AgentToolRegistry;
   private ollama: OllamaClient | null = null;
   private llmModel: string;
@@ -64,12 +101,13 @@ export class AgentOrchestrator {
   private currentRun: AgentRunStatus | null = null;
   private llmProbed = false;
 
-  constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, paper: PaperExecutionEngine, live: LiveExecutionEngine) {
+  constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, paper: PaperExecutionEngine, live: LiveExecutionEngine, sandbox?: SandboxExecutionEngine) {
     this.client = client;
     this.market = market;
     this.risk = risk;
     this.paper = paper;
     this.live = live;
+    this.sandbox = sandbox;
     this.llmModel = process.env.OLLAMA_MODEL || 'qwen2.5:0.5b';
     this.tools = new AgentToolRegistry({ client, policy: Policy.fromEnv() });
 
@@ -203,17 +241,20 @@ export class AgentOrchestrator {
       const explicitTarget = watchlist.find((s) => new RegExp(`\\b${s}\\b`, 'i').test(objective) && !objective.toLowerCase().includes('and') && !objective.toLowerCase().includes('across') && !objective.toLowerCase().includes('all'));
       const targets = explicitTarget ? [explicitTarget] : watchlist;
 
-      // 2b. Capital allocation (30% of total available capital)
+      // 2b. Capital allocation (30% of total available capital). Reads
+      // through RiskEngine's PortfolioSource rather than branching on
+      // TRADING_MODE itself — a prior version called
+      // (this.client as any).funds?.get?.() directly for live mode, which
+      // doesn't exist on the SDK (the real method is funds.getLimit(), with
+      // response fields availabelBalance/utilizedAmount, not the
+      // availableCash/availMargin guessed here). Because of the optional
+      // chaining, that silently resolved to undefined every time and this
+      // fell through to the hardcoded ₹10L default regardless of the real
+      // account balance — fabricated capital sizing in live mode.
       let availableCapital = 1_000_000;
       try {
-        const isLive = process.env.TRADING_MODE === 'live';
-        if (isLive) {
-          const funds = await (this.client as any).funds?.get?.();
-          availableCapital = Number(funds?.availableCash || funds?.availMargin || 1_000_000);
-        } else {
-          const wallet = await getPaperWallet();
-          availableCapital = Number(wallet.availableMargin || wallet.totalBalance || 1_000_000);
-        }
+        const wallet = await this.risk.getPortfolio().getWallet();
+        availableCapital = Number(wallet.availableMargin || wallet.totalBalance || 1_000_000);
       } catch { /* default 10L */ }
 
       const vixRes = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } });
@@ -232,7 +273,7 @@ export class AgentOrchestrator {
       for (const target of targets) {
         const inst = INDEX_INSTRUMENTS[target];
         if (!inst) continue;
-        const expiry = nearestIndexExpiry(target);
+        const expiry = await resolveNearestExpiry(this.client, target);
         const [ltpRes, chainRes] = await Promise.all([
           this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
           this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),
@@ -308,7 +349,12 @@ export class AgentOrchestrator {
     
     // Confluence-driven directional bias (PCR OI + PCR Vol + Max Pain pull)
     const pcrBias = analytics.pcrOi > 1.15 ? 'BULLISH' : analytics.pcrOi < 0.85 ? 'BEARISH' : 'NEUTRAL';
-    const painBias = analytics.maxPain ? (spot < analytics.maxPain - 50 ? 'BULLISH' : spot > analytics.maxPain + 50 ? 'BEARISH' : 'NEUTRAL') : 'NEUTRAL';
+    // analyzeOptionChain() returns this field as maxPainStrike (see
+    // OptionChainAnalytics), not maxPain — reading the wrong name here made
+    // painBias always NEUTRAL, silently dropping the max-pain half of this
+    // confluence check and leaving `direction` to fall through to pcrBias
+    // or, when that's also neutral, the hardcoded BULLISH default.
+    const painBias = analytics.maxPainStrike ? (spot < analytics.maxPainStrike - 50 ? 'BULLISH' : spot > analytics.maxPainStrike + 50 ? 'BEARISH' : 'NEUTRAL') : 'NEUTRAL';
     const direction: 'BULLISH' | 'BEARISH' = pcrBias !== 'NEUTRAL' ? pcrBias : (painBias !== 'NEUTRAL' ? painBias : 'BULLISH');
 
     // Conservative capital allocation (30% pool, ~1-1.5% max risk).
@@ -351,8 +397,15 @@ export class AgentOrchestrator {
     if (obj.includes('vwap') || obj.includes('pullback')) return buildVwapPullbackStrategy(target, spot, rows, expiry, buyLots, direction);
 
     // ── Professional Institutional Regime Dispatcher ──
-    // 1. Low IV / Rangebound / Theta Trap Regime: Maximize Theta Decay with defined risk wings
-    if (analytics.regime === 'THETA_DECAY' || analytics.regime === 'RANGE_BOUND' || vix < 13.5) {
+    const regimeBucket = classifyDispatchRegime(analytics.regime, vix);
+
+    // 1. Range-Bound / Theta Trap Regime: Maximize Theta Decay with defined risk wings.
+    // Fires on EITHER analyzeOptionChain's own regime classifier reporting
+    // HIGH_IV_RANGE (rich premium, contained — the textbook sell setup) OR
+    // the simpler vix<13.5 heuristic (broad-market calm) — independent,
+    // complementary triggers for the same "sell defined-risk premium"
+    // decision, not required to agree on IV direction.
+    if (regimeBucket === 'RANGE_BOUND_THETA') {
       // vix<13.5 is broad-market IV; this index's own IV rank can already be
       // crushed even when overall VIX looks moderate — double-low means no
       // edge left to sell. Skip rather than force a bad trade.
@@ -362,14 +415,17 @@ export class AgentOrchestrator {
         || buildIronCondor(target, spot, rows, expiry, condorLots);
     }
 
-    // 2. High IV / Breakout / Gamma Blast Regime: Exploit Directional Momentum with defined risk
-    if (analytics.regime === 'GAMMA_BLAST' || vix >= 15.5) {
+    // 2. Breakout / Momentum Regime: Exploit Directional Momentum with defined risk.
+    // Fires on EITHER LOW_IV_TREND (cheap premium + an emerging directional
+    // skew — the textbook buy-ahead-of-a-move setup) OR the vix>=15.5
+    // heuristic (a breakout already underway) — same reasoning as above.
+    if (regimeBucket === 'BREAKOUT_MOMENTUM') {
       return buildOrbBuyingStrategy(target, spot, rows, expiry, buyLots, direction)
         || buildDebitSpread(target, direction, spot, rows, expiry, spreadLots);
     }
 
     // 3. Expiry Day Regime (0DTE Gamma Pin / Decay):
-    if (analytics.regime === 'EXPIRY_GAMMA') {
+    if (regimeBucket === 'EXPIRY_GAMMA') {
       if (ivTooLowToSell) return null;
       return buildIronButterfly(target, spot, rows, expiry, condorLots)
         || buildCreditSpread(target, direction, spot, rows, expiry, spreadLots);
@@ -393,8 +449,8 @@ export class AgentOrchestrator {
     }
 
     this.market.addInstruments(strat.legs.map((l) => ({ securityId: l.securityId, exchangeSegment: l.exchangeSegment || 'NSE_FNO' })));
-    const isLive = process.env.TRADING_MODE === 'live';
-    const engine = isLive ? this.live : this.paper;
+    const mode = process.env.TRADING_MODE;
+    const engine = mode === 'live' ? this.live : mode === 'sandbox' && this.sandbox ? this.sandbox : this.paper;
     const filledLegs: typeof strat.legs = [];
     for (const leg of strat.legs) {
       const res = await engine.placeOrder({
@@ -424,18 +480,25 @@ export class AgentOrchestrator {
       // Partial fill on a multi-leg structure is worse than no fill — e.g. a
       // short leg filling without its hedge is naked, undefined risk. Unwind
       // whatever filled rather than leaving it to stand.
+      //
+      // Goes through PortfolioSource.closePosition(), NOT engine.placeOrder()
+      // — placeOrder() re-checks risk.canTrade(), the SAME gate whose
+      // failure typically caused THIS partial fill (a breaker tripping
+      // between legs, or the kill switch arming). A risk-REDUCING close must
+      // never be blocked by the entry gate; closePosition() (paper and
+      // broker alike) doesn't check it.
+      const portfolio = this.risk.getPortfolio();
       for (const leg of filledLegs) {
         const unwindPrice = this.market.getFillablePrice(leg.securityId, { allowClosed: true }) ?? leg.price;
-        await engine.placeOrder({
-          correlation_id: `${strat.id}_${leg.optionType}_${leg.strike}_unwind`,
-          intent_id: runId,
-          params: {
-            security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
-            transaction_type: leg.side === 'BUY' ? 'SELL' : 'BUY', order_type: 'MARKET',
-            exchange_segment: leg.exchangeSegment || 'NSE_FNO', product_type: 'INTRADAY', price: unwindPrice,
-          },
-        }).catch(() => {});
-        this.market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
+        const result = await portfolio.closePosition(leg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
+        if (result.status === 'TRADED') {
+          this.market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
+        } else {
+          // Untracking here would strip stop-loss/target from a leg that is
+          // STILL open — the same mistake fixed in RiskEngine.armKillSwitch
+          // for the exact same reason.
+          eventBus.log('ERROR', `Unwind FAILED for leg ${leg.instrument}: ${result.status}${(result as any).reason ? ` (${(result as any).reason})` : ''} — still open, protection left tracked`, 'agent');
+        }
       }
       eventBus.log('ERROR', `Multi-leg deploy ${strat.name} partially filled (${filledLegs.length}/${strat.legs.length}) — unwound`, 'agent');
       this.step(runId, 'execution', 'ACT', `Strategy ${strat.name} partial fill unwound (${filledLegs.length}/${strat.legs.length})`);

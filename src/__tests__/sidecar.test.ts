@@ -1,4 +1,5 @@
 import { initDatabase, executePaperOrder, listPaperPositions, listPaperOrders, getPaperWallet, closePaperPosition, resetPaperWallet, pool } from "../db";
+import { eventBus } from "../services/eventBus";
 
 describe("DhanHQ-TS Node.js Sidecar & Paper Trading", () => {
   beforeAll(async () => {
@@ -48,16 +49,49 @@ describe("DhanHQ-TS Node.js Sidecar & Paper Trading", () => {
   });
 
   it("closes paper position and realizes PnL in wallet", async () => {
+    // 220 is a reference price, not the fill price — closing a long SELLs,
+    // and a SELL exit pays the bid side of the modelled spread (half-spread
+    // 0.50 at this premium bracket): fill = 220 - 0.50 = 219.50.
     const closeRes = await closePaperPosition("NIFTY24JAN24250CE", 220);
     expect(closeRes.status).toBe("TRADED");
 
     const positions = await listPaperPositions();
     const pos = positions.find((p) => p.tradingSymbol === "NIFTY24JAN24250CE");
     expect(pos?.netQty).toBe(0);
-    expect(pos?.realizedProfit).toBe(1000); // (220 - 200) * 50 = +1000
+    expect(pos?.realizedProfit).toBe(975); // (219.50 - 200) * 50 = +975
 
     const wallet = await getPaperWallet();
-    expect(wallet.realizedPnl).toBe(1000);
+    expect(wallet.realizedPnl).toBe(975);
+  });
+
+  it("emits an 'order' fill envelope on close — every prior exit path bypassed the engine and emitted nothing", async () => {
+    await executePaperOrder({ symbol: "NIFTY24JAN24300CE", transactionType: "BUY", quantity: 50, price: 150 });
+
+    const seen: any[] = [];
+    const off = eventBus.on('order', (env) => seen.push(env.payload));
+    try {
+      const res = await closePaperPosition("NIFTY24JAN24300CE", 160);
+      expect(res.status).toBe("TRADED");
+      const fill = seen.find((p) => p.kind === 'fill' && p.symbol === 'NIFTY24JAN24300CE');
+      expect(fill).toBeDefined();
+      expect(fill.fill_price).toBeCloseTo((res as any).fillPrice, 2);
+    } finally {
+      off();
+    }
+  });
+
+  it("prices a triggered-stop close with more adverse slippage than a plain exit", async () => {
+    await executePaperOrder({ symbol: "NIFTY24JAN24350CE", transactionType: "BUY", quantity: 50, price: 150 });
+    const plain = await closePaperPosition("NIFTY24JAN24350CE", 160, undefined, 'EXIT');
+    expect(plain.status).toBe("TRADED");
+
+    await executePaperOrder({ symbol: "NIFTY24JAN24350CE", transactionType: "BUY", quantity: 50, price: 150 });
+    const stop = await closePaperPosition("NIFTY24JAN24350CE", 160, undefined, 'STOP');
+    expect(stop.status).toBe("TRADED");
+
+    // Both close a long (SELL) at the same 160 reference — the STOP fill
+    // must be strictly lower (more adverse) than the plain exit fill.
+    expect((stop as any).fillPrice).toBeLessThan((plain as any).fillPrice);
   });
 
   it("generates a valid 6-digit TOTP from base32 secret", () => {

@@ -18,6 +18,20 @@ import { moduleLogger } from "./lib/logger";
  * NOTE: uses native fetch — axios was never a declared dependency.
  */
 
+// The SDK calls tokenProvider() (resolveToken below) on EVERY REST request
+// (confirmed against the SDK's AuthResolver — it's not cached internally by
+// the SDK itself), so resolving with zero local cache would mean a Redis
+// round-trip on every single quote/order/position call — real overhead in
+// a system ticking at ~10Hz. But the ONLY other thing that invalidates that
+// cache is a best-effort Redis pub/sub broadcast (dhan:auth:rotated,
+// setupTokenRotationSubscriber below) — fire-and-forget, no delivery
+// guarantee across a dropped connection or a Redis restart. A short window
+// keeps the common case (dozens of calls per second) cheap while still
+// re-checking Redis often enough that a MISSED rotation broadcast
+// self-heals in seconds rather than silently presenting a dead token for
+// up to half a day.
+const IN_MEMORY_TOKEN_TTL_MS = 30_000;
+
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379/0";
 
 const log = moduleLogger("auth");
@@ -97,8 +111,10 @@ export async function createDhanClient(): Promise<DhanClient> {
   let lastAuthorityFailAt = 0;
 
   const resolveToken = async (): Promise<string> => {
-    // 1. In-memory token if fresh (< 12 hours) — zero network overhead
-    if (activeToken && Date.now() - activeTokenAt < 12 * 3600 * 1000) {
+    // 1. In-memory token if fresh (< IN_MEMORY_TOKEN_TTL_MS) — zero network
+    // overhead for the common case, short enough to still re-validate
+    // against Redis regularly (see the module-level comment on the const).
+    if (activeToken && Date.now() - activeTokenAt < IN_MEMORY_TOKEN_TTL_MS) {
       return activeToken;
     }
 
@@ -161,6 +177,28 @@ export async function createDhanClient(): Promise<DhanClient> {
 
   await setupTokenRotationSubscriber();
   return client;
+}
+
+/**
+ * Builds a DhanHQ Sandbox client for TRADING_MODE=sandbox — real order
+ * routing against Dhan's paper-trading environment (flat ₹100 fills, no
+ * WebSocket). Deliberately simpler than createDhanClient(): sandbox tokens
+ * don't need the Redis/Rails-authority/TOTP rotation chain the real
+ * account's live trading token does, so this just reads two env vars once.
+ *
+ * Returns undefined when unconfigured, so sandbox mode stays opt-in.
+ */
+export function createSandboxDhanClient(): DhanClient | undefined {
+  const clientId = process.env.DHAN_SANDBOX_CLIENT_ID;
+  const token = process.env.DHAN_SANDBOX_ACCESS_TOKEN;
+  if (!clientId || !token) return undefined;
+
+  return new DhanClient({
+    clientId,
+    token,
+    baseURL: process.env.DHAN_SANDBOX_BASE_URL || "https://sandbox.dhan.co/v2",
+    timeoutMs: 20000,
+  });
 }
 
 async function setupTokenRotationSubscriber() {

@@ -1,8 +1,11 @@
 import type { DhanClient, OrderTracker, PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
 import { redisPublisher } from '../auth';
 import { eventBus } from '../services/eventBus';
+import { journal } from '../services/journal';
 import type { MarketDataService } from '../services/marketData';
+import { toTrailConfig } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
+import type { PortfolioSource } from '../services/portfolioSource';
 
 /**
  * Live execution engine — places REAL orders through DhanHQ v2.
@@ -18,24 +21,29 @@ export class LiveExecutionEngine {
   private monitor: PositionMonitor;
   private market: MarketDataService;
   private risk: RiskEngine;
+  private portfolio?: PortfolioSource;
 
-  constructor(client: DhanClient, tracker: OrderTracker, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine) {
+  constructor(client: DhanClient, tracker: OrderTracker, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine, portfolio?: PortfolioSource) {
     this.client = client;
     this.tracker = tracker;
     this.monitor = monitor;
     this.market = market;
     this.risk = risk;
+    this.portfolio = portfolio;
   }
 
   async placeOrder(intent: any): Promise<any> {
     const { correlation_id, intent_id, params, risk_limits } = intent;
     const { security_id, quantity, transaction_type, order_type = 'MARKET', exchange_segment = 'NSE_FNO', price = 0 } = params;
+    journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'live' });
 
     // Risk gate — kill switch blocks live orders too.
     const gate = this.risk.canTrade();
     if (!gate.allowed) {
       eventBus.log('WARN', `Live order BLOCKED for ${correlation_id}: ${gate.reason}`, 'live_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason });
+      this.portfolio?.recordOrderOutcome({ status: 'REJECTED' });
       return { status: 'REJECTED', reason: gate.reason };
     }
 
@@ -75,17 +83,34 @@ export class LiveExecutionEngine {
     };
 
     eventBus.emit('order', { kind: 'fill', ...fillPayload });
+    journal.append('order_result', { status: fill.status || 'TRADED', ...fillPayload });
+    this.portfolio?.recordOrderOutcome({ status: fill.status === 'REJECTED' ? 'REJECTED' : 'TRADED' });
     await redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
+    // The broker's own position/wallet state just changed — force the NEXT
+    // read to poll rather than serve a snapshot from before this fill.
+    // Without this, autonomy's reconcileMonitor can see monitor.track()
+    // below (which is synchronous, right below) applied against a position
+    // list that doesn't contain this fill yet, judge the freshly-tracked
+    // entry an orphan with "no matching open position", untrack it, and on
+    // the following cycle reconcileUnmanagedLivePositions flattens it and
+    // arms the kill switch as an "unmanaged" position.
+    this.portfolio?.invalidate();
 
     if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {
+      const filledQty = fill.filledQuantity || quantity;
       this.monitor.track({
         securityId: String(security_id),
         exchangeSegment: exchange_segment,
-        quantity: fill.filledQuantity || quantity,
+        // Signed by transaction_type — PositionMonitor.quantity is positive
+        // for a long, negative for a short, and a raw filledQuantity is
+        // always positive regardless of side. An unsigned quantity here
+        // tracked a short exactly backwards: its stop-loss fired on a price
+        // FALL (a profit for a short) and its target on a RISE (the loss).
+        quantity: transaction_type === 'SELL' ? -filledQty : filledQty,
         entryPrice: fill.averagePrice || price,
         stopLoss: risk_limits.stop_loss,
         target: risk_limits.target,
-        trail: risk_limits.trailing_stop,
+        trail: toTrailConfig(risk_limits.trailing_stop),
       });
     }
 

@@ -9,7 +9,8 @@ import { EventEmitter } from 'events';
 import {
   initDatabase, dbMode, executePaperOrder, getPaperWallet,
   listPaperPositions, closeAllPaperPositions, markPositionsToMarket,
-  resetPaperWallet, pool, saveRiskState,
+  resetPaperWallet, pool, saveRiskState, reconcileLedger, findMissingOrders,
+  closePaperPosition,
 } from '../db';
 
 /**
@@ -80,8 +81,9 @@ describe('Paper execution engine — real-LTP pricing policy', () => {
         params: { security_id: '44000', quantity: 50, transaction_type: 'BUY', order_type: 'MARKET', price: 555 },
       });
       expect(result.status).toBe('TRADED');
-      // BUY slippage = +1 tick (0.05) over the live LTP of 100, NOT price 555.
-      expect(result.fill_price).toBeCloseTo(100.05, 2);
+      // BUY slippage = premium-scaled half-spread over the live LTP of 100
+      // (100 falls in the <300 bracket: half-spread 0.50), NOT price 555.
+      expect(result.fill_price).toBeCloseTo(100.5, 2);
     } finally {
       jest.useRealTimers();
     }
@@ -190,7 +192,7 @@ describe('Money-path math — fees, margin, sign flips', () => {
         params: { security_id: '44000', quantity: 50, transaction_type: 'BUY', order_type: 'LIMIT', price: 105 }, // BUY limit above LTP — marketable
       });
       expect(marketable.status).toBe('TRADED');
-      expect((marketable as any).fill_price).toBeLessThanOrEqual(100.05); // filled at the better of {LTP, limit} + slippage, not at 105
+      expect((marketable as any).fill_price).toBeLessThanOrEqual(100.5); // filled at the better of {LTP, limit} + slippage, not at 105
     } finally {
       jest.useRealTimers();
     }
@@ -241,6 +243,40 @@ describe('RiskEngine — real-state circuit breakers', () => {
     expect(DEFAULT_RISK_LIMITS.dailyLossLimit).toBeGreaterThan(0);
     expect(DEFAULT_RISK_LIMITS.maxConsecutiveLosses).toBeGreaterThan(0);
   });
+
+  it('Portfolio Net Delta: does not block a single reasonable options position, but still catches real concentration', async () => {
+    // Regression test: the breaker measures option delta-NOTIONAL (the
+    // underlying's equivalent exposure) as a % of equity — inherently a
+    // triple/quadruple-digit number for any real options position, since
+    // that's what leverage means. The old default (150%) made a single
+    // NIFTY ATM lot (65 qty × ~0.5Δ × ~24000 spot ≈ 780% of the ₹100,000
+    // default paper wallet) read ERROR — and canTrade() blocks on ERROR —
+    // so the very first fill locked out every subsequent order.
+    const client = stubClient();
+    const market = stubMarket(100);
+    (market as any).quotes.set('13', { // NIFTY index securityId
+      securityId: '13', symbol: 'NIFTY', ltp: 24000, change: 0, pctChange: 0,
+      high: 24100, low: 23900, open: 24000, prevClose: 24000, volume: 0, oi: 0, updatedAt: Date.now(),
+    });
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    await resetPaperWallet(100000);
+
+    await executePaperOrder({ symbol: 'NIFTY24000CE', securityId: '55501', quantity: 65, transactionType: 'BUY', price: 100 });
+    const rowsOneLot = await risk.evaluate();
+    const oneLot = rowsOneLot.find((r) => r.rule === 'Portfolio Net Delta')!;
+    expect(oneLot.state).not.toBe('ERROR');
+    expect(risk.canTrade().allowed).toBe(true);
+
+    // A clearly excessive same-direction pile-up must still trip it.
+    await executePaperOrder({ symbol: 'NIFTY24000CE', securityId: '55501', quantity: 65 * 5, transactionType: 'BUY', price: 100 });
+    const rowsPiled = await risk.evaluate();
+    const piled = rowsPiled.find((r) => r.rule === 'Portfolio Net Delta')!;
+    expect(piled.state).toBe('ERROR');
+
+    await closePaperPosition('NIFTY24000CE');
+    risk.stop();
+  });
 });
 
 describe('MarketDataService — WebSocket failover', () => {
@@ -273,6 +309,141 @@ describe('MarketDataService — WebSocket failover', () => {
       service.stop();
       if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
       else process.env.DHAN_ACCESS_TOKEN = originalToken;
+    }
+  });
+
+  it('retries a connect() attempt that never settles instead of getting stuck forever', async () => {
+    // Regression test: wsConnecting was only ever cleared by the open/
+    // error/close handlers. A connect() that never fires any of them — a
+    // raw socket stuck at the TCP level with no timeout enforced by the WS
+    // library — left wsConnecting true permanently: every later retry hit
+    // the early guard and returned without scheduling another one, so the
+    // reconnect loop died forever.
+    const pending = new Promise<void>(() => {}); // never resolves or rejects
+    const market = Object.assign(new EventEmitter(), {
+      isConnected: false,
+      subscribe: jest.fn(),
+      connect: jest.fn(() => pending),
+      disconnect: jest.fn(),
+    });
+    const client = { ws: { market }, marketFeed: { quote: jest.fn() } } as any;
+    const service = new MarketDataService(client);
+    const originalToken = process.env.DHAN_ACCESS_TOKEN;
+    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+
+    try {
+      (service as any).tryStartWs();
+      expect(market.connect).toHaveBeenCalledTimes(1);
+
+      // A retry landing while the attempt is still "fresh" must not
+      // double-connect.
+      (service as any).tryStartWs();
+      expect(market.connect).toHaveBeenCalledTimes(1);
+
+      // Once the stuck attempt is stale, the next retry must try again
+      // rather than staying stuck behind the early guard forever.
+      (service as any).wsConnectingAt = Date.now() - 31_000;
+      (service as any).tryStartWs();
+      expect(market.connect).toHaveBeenCalledTimes(2);
+    } finally {
+      service.stop();
+      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
+      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+    }
+  });
+
+  it('schedules a retry instead of dying silently when isConnected reads stale-true after a forced disconnect', async () => {
+    // Regression test: the SDK only flips isConnected to false inside the
+    // underlying transport's own ASYNC 'close' event — not synchronously
+    // inside disconnect() (confirmed against the SDK's BaseWS source). A
+    // retry landing before that event fires sees isConnected still true,
+    // skips connect() entirely, and — since nothing else in tryStartWs()
+    // scheduled a retry for that branch — the reconnect loop died
+    // permanently: wsStarted stayed false, isConnected stayed stale-true,
+    // and connect() was never called again.
+    const market = Object.assign(new EventEmitter(), {
+      isConnected: false,
+      subscribe: jest.fn(),
+      connect: jest.fn(() => Promise.resolve()),
+      disconnect: jest.fn(), // deliberately does NOT flip isConnected — the close event hasn't "fired" yet
+    });
+    const client = { ws: { market }, marketFeed: { quote: jest.fn() } } as any;
+    const service = new MarketDataService(client);
+    const originalToken = process.env.DHAN_ACCESS_TOKEN;
+    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+
+    try {
+      (service as any).tryStartWs();
+      market.isConnected = true;
+      market.emit('open');
+      expect((service as any).wsStarted).toBe(true);
+
+      // Simulate a forced disconnect (armSilenceWatch/the 429 handler):
+      // wsStarted flips false, but isConnected stays stale-true.
+      (service as any).wsStarted = false;
+      market.disconnect();
+      expect(market.isConnected).toBe(true);
+
+      expect((service as any).wsRetryTimer).toBeNull();
+      (service as any).tryStartWs();
+      expect((service as any).wsRetryTimer).not.toBeNull();
+    } finally {
+      service.stop();
+      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
+      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+    }
+  });
+});
+
+describe('getFillablePrice — off-hours freshness bound (allowClosed)', () => {
+  // Regression coverage: schedulePolling() backs the REST poll interval off
+  // to 30s off-hours (vs 3s during market hours), but getFillablePrice's
+  // default maxAgeMs was a flat 15s regardless of allowClosed — rejecting
+  // the SAME still-freshest-available off-hours quote for roughly half of
+  // every 30s poll cycle, purely by timing luck. Affected real callers:
+  // seedStandardStrategies' spot lookups, EOD square-off, and the kill
+  // switch's close-all price all call with allowClosed:true and no
+  // explicit maxAgeMs.
+  function ageQuote(market: MarketDataService, securityId: string, ltp: number, ageMs: number) {
+    (market as any).quotes.set(securityId, {
+      securityId, ltp, change: 0, pctChange: 0, high: ltp, low: ltp, open: ltp, prevClose: ltp,
+      volume: 0, oi: 0, updatedAt: Date.now() - ageMs,
+    });
+  }
+
+  it('accepts an allowClosed quote up to the 30s off-hours poll interval', () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T15:00:00.000Z')); // 20:30 IST Tuesday — well off-hours
+    try {
+      const market = stubMarket(null);
+      ageQuote(market, '44000', 100, 25_000); // 25s old — would have failed the old 15s default
+      expect(market.getFillablePrice('44000', { allowClosed: true })).toBe(100);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('still rejects an allowClosed quote clearly older than any normal poll cycle', () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T15:00:00.000Z'));
+    try {
+      const market = stubMarket(null);
+      ageQuote(market, '44000', 100, 90_000); // 90s old — a genuine feed dropout, not poll timing
+      expect(market.getFillablePrice('44000', { allowClosed: true })).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps the tight 15s bound for market-hours (non-allowClosed) calls, unaffected by this fix', () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST Tuesday — market open
+    try {
+      const market = stubMarket(null);
+      ageQuote(market, '44000', 100, 20_000); // 20s old — over the market-hours bound
+      expect(market.getFillablePrice('44000')).toBeNull();
+    } finally {
+      jest.useRealTimers();
     }
   });
 });
@@ -427,6 +598,46 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
       jest.useRealTimers();
     }
   });
+
+  it('unwinds a partially-filled leg even when canTrade() has since gone false — the exact condition that likely caused the partial fill', async () => {
+    // Regression test: the unwind used to call engine.placeOrder() for the
+    // reversing order, which re-checks risk.canTrade() — the SAME gate a
+    // breaker tripping or the kill switch arming BETWEEN legs would have
+    // just failed on leg 2. That left leg 1 open, naked, and (since
+    // monitor.untrack() ran unconditionally regardless of the unwind's own
+    // outcome) with no stop-loss either.
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z'));
+    try {
+      const { agent, risk } = await stubEngines(100);
+      // Leg 1's entry sees canTrade() allowed; every call after — leg 2's
+      // entry, and (pre-fix) the unwind itself — sees it blocked.
+      jest.spyOn(risk, 'canTrade')
+        .mockReturnValueOnce({ allowed: true })
+        .mockReturnValue({ allowed: false, reason: 'blocked mid-deploy' });
+
+      const strat = {
+        id: `exec01b_test_${Date.now()}`,
+        name: 'Test Bull Call Spread (gate race)',
+        symbol: 'NIFTY',
+        type: 'BULL_CALL_SPREAD' as any,
+        lots: 1,
+        estimatedNetPremium: 0,
+        lotSize: 50,
+        legs: [
+          { instrument: 'NIFTY24060CE', securityId: '44000', side: 'BUY' as const, qty: 50, strike: 24060, optionType: 'CE' as const, price: 100, exchangeSegment: 'NSE_FNO' },
+          { instrument: 'NIFTY24160CE', securityId: '99998', side: 'SELL' as const, qty: 50, strike: 24160, optionType: 'CE' as const, price: 0, exchangeSegment: 'NSE_FNO' },
+        ],
+      };
+      const result: any = await (agent as any).executeStrategy('run1b', 'deploy this spread', strat, true);
+      expect(result.status).toBe('FAILED');
+      expect(result.reason).toBe('partial_fill_unwound');
+      const pos = (await listPaperPositions()).find((p: any) => p.tradingSymbol === 'NIFTY24060CE');
+      expect(Number(pos?.netQty || 0)).toBe(0); // unwound despite canTrade() being false throughout
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('Database layer — fallback mode honesty', () => {
@@ -437,5 +648,45 @@ describe('Database layer — fallback mode honesty', () => {
 
   it('reports which persistence mode is active', () => {
     expect(['postgres', 'memory']).toContain(dbMode());
+  });
+
+  it('reconcileLedger no-ops in memory mode — nothing durable to compare mem against', async () => {
+    // This whole suite runs in memory mode (no TEST_DATABASE_URL) — the
+    // real Postgres-comparison path is covered separately in
+    // ledgerReconciler.test.ts, which requires a live database.
+    expect(dbMode()).toBe('memory');
+    const report = await reconcileLedger();
+    expect(report).toEqual({ ok: true, checkedPositions: 0, mismatches: [], missingInPostgres: [], missingInMem: [] });
+  });
+});
+
+describe('findMissingOrders — journal boot cross-check', () => {
+  beforeAll(async () => { await initDatabase(); });
+
+  it('finds nothing missing for an entry order matched by correlation_id', async () => {
+    const order = await executePaperOrder({
+      symbol: 'FMO_ENTRY', securityId: '88001', quantity: 50,
+      transactionType: 'BUY', price: 100, correlationId: 'fmo_corr_1',
+    });
+    expect(order.status).toBe('TRADED');
+    expect(await findMissingOrders(['fmo_corr_1'])).toEqual([]);
+  });
+
+  it('finds nothing missing for an exit order matched by the generated order id', async () => {
+    await executePaperOrder({ symbol: 'FMO_EXIT', securityId: '88002', quantity: 50, transactionType: 'BUY', price: 100 });
+    const close = await closePaperPosition('FMO_EXIT', 110);
+    expect(close.status).toBe('TRADED');
+    // closePaperPosition's journaled "correlation_id" is the generated
+    // orderId (see db.ts's closePaperPosition) — this is exactly what
+    // core.ts's cross-check passes in from the journal.
+    expect(await findMissingOrders([(close as any).orderId])).toEqual([]);
+  });
+
+  it('reports an id with no matching order at all', async () => {
+    expect(await findMissingOrders(['never_placed_this_one'])).toEqual(['never_placed_this_one']);
+  });
+
+  it('returns an empty array for an empty input without querying anything', async () => {
+    expect(await findMissingOrders([])).toEqual([]);
   });
 });
