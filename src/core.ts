@@ -187,7 +187,15 @@ export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk
   if (priorEntries.length === 0) return;
   const summary = summarizeDay(priorEntries);
 
-  const missing = await findMissingOrders(summary.tradedCorrelationIds);
+  // findMissingOrders() only checks paper_orders — the durable table
+  // executePaperOrder() (paper.ts) writes to. Live/sandbox fills are
+  // journaled with status:'TRADED' too, but neither engine inserts into
+  // paper_orders, so outside paper mode EVERY trade would show "missing"
+  // on restart and (via the READY gate below) permanently lock trading.
+  // Skip this specific check outside paper mode until live/sandbox fills
+  // have their own durable order record to reconcile against.
+  const isPaperMode = (process.env.TRADING_MODE || 'paper') === 'paper';
+  const missing = isPaperMode ? await findMissingOrders(summary.tradedCorrelationIds) : [];
   if (missing.length > 0) {
     const msg = `Boot cross-check: journal recorded ${missing.length} trade(s) today with no matching durable order record (${missing.join(', ')}) — something may have altered the ledger outside the normal fill path`;
     eventBus.log('ERROR', msg, 'core');

@@ -67,6 +67,30 @@ describe('crossCheckJournalOnBoot', () => {
     expect(alertSpy).toHaveBeenCalledWith('ERROR', 'core', expect.stringContaining('ghost_trade_corr'));
   });
 
+  it('does NOT alert in sandbox mode — sandbox/live fills are never written to paper_orders, so this check would false-positive on every trade', async () => {
+    // Regression: SandboxExecutionEngine journals status:'TRADED' but never
+    // inserts into paper_orders (only executePaperOrder does). Before this
+    // fix, every sandbox trade would show "missing" on restart and (via the
+    // SystemState READY gate) permanently lock trading.
+    const priorMode = process.env.TRADING_MODE;
+    process.env.TRADING_MODE = 'sandbox';
+    try {
+      const { risk } = setup();
+      jest.spyOn(risk, 'isKilled').mockReturnValue(false);
+      const alertSpy = jest.spyOn(db, 'pushAlert');
+
+      const entries: JournalEntry[] = [
+        entry(1, 'order_result', { correlation_id: 'sandbox_trade_corr', status: 'TRADED' }),
+      ];
+      await crossCheckJournalOnBoot(entries, risk);
+
+      expect(alertSpy).not.toHaveBeenCalledWith('ERROR', expect.anything(), expect.anything());
+    } finally {
+      if (priorMode === undefined) delete process.env.TRADING_MODE;
+      else process.env.TRADING_MODE = priorMode;
+    }
+  });
+
   it('alerts WARN when the journal\'s last kill action was ARM but the risk engine reports not killed', async () => {
     const { risk } = setup();
     jest.spyOn(risk, 'isKilled').mockReturnValue(false);
