@@ -3,11 +3,12 @@ import { eventBus } from './eventBus';
 import { journal } from './journal';
 import { marketClock, istNow } from './marketHours';
 import type { MarketDataService } from './marketData';
+import { toTrailConfig } from './marketData';
 import type { RiskEngine } from './riskEngine';
 import type { AgentOrchestrator } from './agent';
 import {
   listPaperStrategies, listPaperPositions, markPositionsToMarket,
-  closePaperPosition, updatePaperStrategyStatus, getPaperWallet,
+  closePaperPosition, updatePaperStrategyStatus, getPaperWallet, pushAlert,
 } from '../db';
 
 /**
@@ -124,6 +125,7 @@ export class AutonomyEngine {
         if (clock.isMarketOpen && mark.staleCount > 0) {
           eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
         }
+        await this.reconcileMonitor();
         await this.publishPortfolioSnapshot();
         await this.enforceStrategyLimits();
 
@@ -198,6 +200,66 @@ export class AutonomyEngine {
     const posMap = new Map(positions.map((p: any) => [p.tradingSymbol, p]));
     const stillOpen = (strat.legs || []).some((l: any) => Number(posMap.get(l.instrument)?.netQty || 0) !== 0);
     if (!stillOpen) await updatePaperStrategyStatus(strat.id, 'STOPPED');
+  }
+
+  /**
+   * Reconciles PositionMonitor's in-memory tracked set against the actual
+   * open-position ledger, once per cycle. Two directions of drift, both
+   * silent until now:
+   *
+   *  - Orphaned monitor entries: a tracked position with no matching open
+   *    position (its close path failed to untrack it, or a bug elsewhere
+   *    leaves it dangling). Left alone, RE-ENTERING the same security later
+   *    would inherit the PREVIOUS trade's stop/target and could exit
+   *    immediately at a price that has nothing to do with the new position.
+   *  - Missing protection: an open position in the ledger with a
+   *    stop/target/trailing-stop configured that ISN'T tracked (a restart
+   *    that predates this reconciler, or a track() call that silently
+   *    failed). Left alone, the position trades with no protection at all
+   *    until a human notices.
+   *
+   * Every correction is logged AND alerted — drift here means the risk
+   * layer was blind to something, which is exactly what should never pass
+   * silently.
+   */
+  private async reconcileMonitor(): Promise<void> {
+    const positions = await listPaperPositions();
+    const open = new Map<string, any>();
+    for (const p of positions) {
+      if (p.netQty !== 0 && p.securityId && p.securityId !== '0') {
+        open.set(`${p.exchangeSegment || 'NSE_FNO'}:${p.securityId}`, p);
+      }
+    }
+
+    const tracked = this.market.monitor.tracked();
+    for (const t of tracked) {
+      const key = `${t.exchangeSegment}:${t.securityId}`;
+      if (open.has(key)) continue;
+      this.market.monitor.untrack(t.exchangeSegment, t.securityId);
+      eventBus.log('WARN', `Reconciler: untracked stale monitor entry ${key} — no matching open position`, 'autonomy');
+      await pushAlert('WARN', 'autonomy', `Monitor/position drift corrected: untracked stale entry ${key}`);
+    }
+
+    // Re-check after untracking above rather than reusing `tracked` — keeps
+    // the two passes independent instead of assuming untrack() synchronously
+    // affects a stale local list correctly (it does, but this is cheap and
+    // makes that assumption unnecessary to reason about).
+    const trackedKeys = new Set(this.market.monitor.tracked().map((t) => `${t.exchangeSegment}:${t.securityId}`));
+    for (const [key, p] of open) {
+      if (trackedKeys.has(key)) continue;
+      if (!p.stopLoss && !p.target && !p.trailingStop) continue;
+      this.market.monitor.track({
+        securityId: String(p.securityId),
+        exchangeSegment: p.exchangeSegment || 'NSE_FNO',
+        quantity: p.netQty,
+        entryPrice: p.netQty > 0 ? p.buyAvg : p.sellAvg,
+        stopLoss: p.stopLoss ?? undefined,
+        target: p.target ?? undefined,
+        trail: toTrailConfig(p.trailingStop),
+      });
+      eventBus.log('WARN', `Reconciler: re-armed missing protection for ${key}`, 'autonomy');
+      await pushAlert('WARN', 'autonomy', `Monitor/position drift corrected: re-armed protection for ${key}`);
+    }
   }
 
   private async publishPortfolioSnapshot(): Promise<void> {
