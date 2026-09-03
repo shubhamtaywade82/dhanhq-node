@@ -17,6 +17,7 @@ import { moduleLogger, logError } from './lib/logger';
 import { requestLogger, errorHandler, notFoundHandler } from './lib/requestLogger';
 import { attachBusLoggerBridge } from './lib/busLoggerBridge';
 import { clientLogsRoutes } from './routes/clientLogs';
+import { researchRoutes } from './routes/research';
 
 dotenv.config();
 
@@ -84,6 +85,7 @@ async function main() {
   app.use('/api/infra', infraRoutes(streamManager, { market: core.market, risk: core.risk, autonomy: core.autonomy, agent: core.agent, stream: streamManager }));
   app.use('/api/control', controlRoutes(core.client, core.risk, core.autonomy, core.agent, core.market));
   app.use('/api/client-logs', clientLogsRoutes());
+  app.use('/api/research', researchRoutes(core.research));
 
   app.get('/api/health', (_req, res) => {
     res.json({

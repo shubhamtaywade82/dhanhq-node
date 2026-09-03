@@ -46,6 +46,8 @@ const mem = {
   riskState: null as any,
   errorPatterns: new Map<string, any>(),
   systemRules: [] as any[],
+  researchRuns: new Map<string, any>(),
+  researchEvidence: new Map<string, any[]>(),
   autoid: 0,
 };
 
@@ -106,6 +108,19 @@ const SCHEMA_SQL = `
     id SERIAL PRIMARY KEY, rule TEXT NOT NULL, pattern TEXT NOT NULL UNIQUE,
     hit_count INTEGER NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS research_runs (
+    id VARCHAR(64) PRIMARY KEY, symbol VARCHAR(32) NOT NULL,
+    exchange VARCHAR(16) NOT NULL DEFAULT 'NSE', status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+    quality_score NUMERIC(5, 2), valuation_score NUMERIC(5, 2), verdict VARCHAR(16),
+    data JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS research_evidence (
+    id VARCHAR(64) PRIMARY KEY, run_id VARCHAR(64) NOT NULL,
+    category VARCHAR(32) NOT NULL, claim TEXT NOT NULL,
+    metric VARCHAR(64), value NUMERIC(16, 4), source VARCHAR(64) NOT NULL,
+    confidence NUMERIC(4, 2) NOT NULL DEFAULT 1.0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
   INSERT INTO paper_wallet (id, initial_balance, available_margin, used_margin, realized_pnl)
   VALUES ('default', 100000.00, 100000.00, 0.00, 0.00)
@@ -1070,3 +1085,83 @@ export async function findMissingOrders(ids: string[]): Promise<string[]> {
   }
   return [...remaining];
 }
+
+export async function saveResearchRun(run: {
+  id: string; symbol: string; exchange?: string; status?: string;
+  quality_score?: number; valuation_score?: number; verdict?: string; data: any;
+}): Promise<void> {
+  const row = {
+    id: run.id, symbol: run.symbol, exchange: run.exchange || 'NSE', status: run.status || 'COMPLETED',
+    quality_score: run.quality_score ?? null, valuation_score: run.valuation_score ?? null,
+    verdict: run.verdict ?? null, data: run.data, created_at: new Date(), updated_at: new Date(),
+  };
+  mem.researchRuns.set(run.id, row);
+  if (mode === 'postgres') {
+    const q = `
+      INSERT INTO research_runs (id, symbol, exchange, status, quality_score, valuation_score, verdict, data, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      ON CONFLICT (id) DO UPDATE SET
+        status = EXCLUDED.status, quality_score = EXCLUDED.quality_score,
+        valuation_score = EXCLUDED.valuation_score, verdict = EXCLUDED.verdict,
+        data = EXCLUDED.data, updated_at = NOW();
+    `;
+    await pool.query(q, [row.id, row.symbol, row.exchange, row.status, row.quality_score, row.valuation_score, row.verdict, JSON.stringify(row.data)]).catch((e: any) => {
+      log.warn({ err: { message: e.message } }, 'saveResearchRun failed');
+    });
+  }
+}
+
+export async function getResearchRun(id: string): Promise<any | null> {
+  if (mem.researchRuns.has(id)) return mem.researchRuns.get(id);
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT * FROM research_runs WHERE id = $1', [id]);
+      if (res.rows[0]) {
+        mem.researchRuns.set(id, res.rows[0]);
+        return res.rows[0];
+      }
+    } catch { /* return null */ }
+  }
+  return null;
+}
+
+export async function listResearchRuns(limit = 20): Promise<any[]> {
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT id, symbol, exchange, status, quality_score, valuation_score, verdict, created_at FROM research_runs ORDER BY created_at DESC LIMIT $1', [limit]);
+      return res.rows;
+    } catch { /* fallback to mem */ }
+  }
+  return Array.from(mem.researchRuns.values()).slice(-limit).reverse();
+}
+
+export async function saveResearchEvidence(items: any[]): Promise<void> {
+  if (items.length === 0) return;
+  const runId = items[0].runId;
+  const existing = mem.researchEvidence.get(runId) || [];
+  mem.researchEvidence.set(runId, [...existing, ...items]);
+
+  if (mode === 'postgres') {
+    for (const item of items) {
+      const q = `
+        INSERT INTO research_evidence (id, run_id, category, claim, metric, value, source, confidence)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (id) DO NOTHING;
+      `;
+      await pool.query(q, [item.id, item.runId, item.category, item.claim, item.metric || null, item.value ?? null, item.source, item.confidence]).catch(() => {});
+    }
+  }
+}
+
+export async function getResearchEvidenceByRun(runId: string): Promise<any[]> {
+  if (mem.researchEvidence.has(runId)) return mem.researchEvidence.get(runId)!;
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT * FROM research_evidence WHERE run_id = $1 ORDER BY id ASC', [runId]);
+      mem.researchEvidence.set(runId, res.rows);
+      return res.rows;
+    } catch { /* fallback */ }
+  }
+  return [];
+}
+

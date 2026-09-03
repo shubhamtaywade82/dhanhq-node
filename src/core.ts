@@ -15,8 +15,10 @@ import { SandboxExecutionEngine } from './engines/sandbox';
 import { marketClock } from './services/marketHours';
 import { hasHolidayCoverage } from './services/holidays';
 import { journal, summarizeDay, type JournalEntry } from './services/journal';
+import { OllamaClient } from '@nemesis-oss/ollama-sdk';
 import { PaperPortfolioSource, BrokerPortfolioSource, type PortfolioSource } from './services/portfolioSource';
 import { getSystemState, setSystemState } from './services/systemState';
+import { ResearchOrchestrator } from './services/research/researchOrchestrator';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -29,6 +31,7 @@ export interface Core {
   risk: RiskEngine;
   autonomy: AutonomyEngine;
   agent: AgentOrchestrator;
+  research: ResearchOrchestrator;
   paper: PaperExecutionEngine;
   live: LiveExecutionEngine;
   sandbox?: SandboxExecutionEngine;
@@ -118,6 +121,10 @@ export async function startCore(): Promise<Core> {
   const sandboxClient = createSandboxDhanClient();
   const sandbox = sandboxClient ? new SandboxExecutionEngine(sandboxClient, market, risk) : undefined;
   const agent = new AgentOrchestrator(client, market, risk, paper, live, sandbox);
+  const ollama = process.env.OLLAMA_ENABLED !== 'false'
+    ? new OllamaClient({ baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434', timeoutMs: 15000, retries: 0 })
+    : null;
+  const research = new ResearchOrchestrator(client, market, undefined, ollama);
   autonomy.setAgent(agent);
   autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, paper, risk));
 
@@ -170,7 +177,7 @@ export async function startCore(): Promise<Core> {
   eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
-  return { client, market, risk, autonomy, agent, paper, live, sandbox, tracker, selfHealing };
+  return { client, market, risk, autonomy, agent, research, paper, live, sandbox, tracker, selfHealing };
 }
 
 /**
