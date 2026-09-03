@@ -505,7 +505,6 @@ export async function resetPaperWallet(initialBalance = 100000) {
       );
       await client.query('DELETE FROM paper_positions');
       await client.query('DELETE FROM paper_orders');
-      await client.query('DELETE FROM paper_strategies');
       await client.query('DELETE FROM alerts');
       await client.query('DELETE FROM agent_events');
       await client.query(`UPDATE risk_state SET killed = FALSE, killed_reason = NULL, killed_date = NULL, limits = '{}', consecutive_losses = 0, updated_at = NOW() WHERE id = 'default'`);
@@ -521,7 +520,6 @@ export async function resetPaperWallet(initialBalance = 100000) {
   mem.wallet = { id: 'default', initial_balance: initialBalance, available_margin: initialBalance, used_margin: 0, realized_pnl: 0, total_charges: 0, session_realized_base: 0, session_date: null, updated_at: new Date() };
   mem.orders = [];
   mem.positions.clear();
-  mem.strategies = [];
   mem.alerts = [];
   mem.agentEvents = [];
   mem.riskState = { killed: false, killedReason: null, limits: {}, consecutiveLosses: 0 };
@@ -619,7 +617,7 @@ async function resolveMarginRequired(u: PositionUpdate, securityId: string, exch
 
 /** Per-fill F&O charges (not round-trip): brokerage on every fill, STT only
  * on the sell leg, stamp duty only on the buy leg — Indian options rules. */
-function calculateOrderCharges(side: 'BUY' | 'SELL', price: number, qty: number): number {
+export function calculateOrderCharges(side: 'BUY' | 'SELL', price: number, qty: number): number {
   const turnover = price * qty;
   const brokerage = 20;
   const stt = side === 'SELL' ? Number((turnover * 0.0010).toFixed(2)) : 0;

@@ -6,8 +6,11 @@ import type { MarketDataService } from './marketData';
 import { toTrailConfig } from './marketData';
 import type { RiskEngine } from './riskEngine';
 import type { AgentOrchestrator } from './agent';
+import type { AdaptiveSupertrendScanner } from './adaptiveSupertrendScanner';
+import { LongOptionPositionManager } from './longOptionPositionManager';
 import {
-  listPaperStrategies, updatePaperStrategyStatus, pushAlert,
+  listPaperStrategies, listPaperPositions, markPositionsToMarket,
+  updatePaperStrategyStatus, pushAlert,
   reconcileLedger, correctLedgerFromPostgres,
 } from '../db';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
@@ -23,12 +26,15 @@ import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
  *   4. Periodically scans for autonomous option opportunities (09:20-15:15 IST).
  *   5. Closes every position at 15:20 IST EOD square-off.
  */
+export const MAX_CONCURRENT_POSITIONS = 4;
+
 export class AutonomyEngine {
   private client: DhanClient;
   private market: MarketDataService;
   private risk: RiskEngine;
   private portfolio: PortfolioSource;
   private agent: AgentOrchestrator | null = null;
+  private scanner: AdaptiveSupertrendScanner | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private enabled = true;
   private scanEnabled = process.env.AUTONOMOUS_SCAN_ENABLED !== 'false';
@@ -42,16 +48,23 @@ export class AutonomyEngine {
   private handledExits = new Set<string>();
   private unsubBus: Array<() => void> = [];
   private tickMarkScheduled = false;
+  readonly longOptionManager: LongOptionPositionManager;
 
   constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, portfolio: PortfolioSource = new PaperPortfolioSource()) {
     this.client = client;
     this.market = market;
     this.risk = risk;
     this.portfolio = portfolio;
+    this.longOptionManager = new LongOptionPositionManager(market);
   }
 
   setAgent(agent: AgentOrchestrator): void {
     this.agent = agent;
+  }
+
+  setScanner(scanner: AdaptiveSupertrendScanner): void {
+    this.scanner = scanner;
+    eventBus.log('SYSTEM', 'Adaptive Supertrend scanner armed (1m/5m, naked ATM CE/PE)', 'adaptive_supertrend');
   }
 
   setScanEnabled(on: boolean): void {
@@ -93,6 +106,7 @@ export class AutonomyEngine {
     return {
       enabled: this.enabled,
       scanEnabled: this.scanEnabled,
+      longOptionPolicyEnabled: this.longOptionManager.isEnabled(),
       cycles: this.cycles,
       lastCycleAt: this.lastCycleAt ? new Date(this.lastCycleAt).toISOString() : null,
       lastCycleAgoSec: this.lastCycleAt ? Math.round((Date.now() - this.lastCycleAt) / 1000) : null,
@@ -132,6 +146,7 @@ export class AutonomyEngine {
         await this.reconcileMonitor();
         await this.reconcileUnmanagedLivePositions();
         await this.reconcileLedgerAgainstPostgres();
+        await this.longOptionManager.evaluate(clock.squareOffWindow);
         await this.publishPortfolioSnapshot();
         await this.enforceStrategyLimits();
 
@@ -141,6 +156,7 @@ export class AutonomyEngine {
         }
 
         await this.evaluateAutonomousScan(clock);
+        if (this.scanner) await this.scanner.evaluate(clock);
       }
 
       const nextDelay = clock.isMarketOpen ? 2000 : 30000;
@@ -162,6 +178,8 @@ export class AutonomyEngine {
 
     const positions = await this.portfolio.getPositions();
     if (positions.filter((p) => p.netQty !== 0).length >= 4) return;
+    const paperPositions = await listPaperPositions();
+    if (paperPositions.filter((p) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
 
     this.lastScanAt = Date.now();
     try {
@@ -385,6 +403,8 @@ export class AutonomyEngine {
       this.tickMarkScheduled = false;
       try {
         await this.portfolio.markToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
+        await markPositionsToMarket((secId: string) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
+        await this.longOptionManager.evaluate(marketClock().squareOffWindow);
         await this.publishPortfolioSnapshot();
       } catch { /* the 2s cycle below is the fallback */ }
     });

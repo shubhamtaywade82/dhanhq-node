@@ -37,7 +37,8 @@ export type StrategyType =
   | 'ORB_PREMIUM_200'
   | 'VWAP_RSI_PULLBACK'
   | 'EMA_CROSSOVER'
-  | 'NAKED_BUY';
+  | 'NAKED_BUY'
+  | 'ADAPTIVE_SUPERTREND';
 
 export interface ConstructedStrategy {
   id: string;
@@ -296,6 +297,42 @@ export function buildDirectionalOptionBuy(
     name: `${symbol} Long ${optionType} (${leg.strike})`,
     symbol,
     type: 'NAKED_BUY',
+    lots,
+    legs: [leg],
+    estimatedNetPremium: Number((-(leg.price * qty)).toFixed(2)),
+    lotSize,
+  };
+}
+
+/**
+ * Builds a naked ATM option buy for the Adaptive Supertrend scanner
+ * (1m/5m Q-learning + fuzzy-logic signal, see services/adaptiveSupertrend/).
+ */
+export function buildAdaptiveSupertrendStrategy(
+  symbol: string,
+  spot: number,
+  chainRows: any[],
+  expiry: string,
+  lots = 1,
+  optionType: 'CE' | 'PE'
+): ConstructedStrategy | null {
+  const lotSize = getLotSize(symbol);
+  const qty = lots * lotSize;
+  const optType = optionType === 'CE' ? 'CALL' : 'PUT';
+  const strikeRow = selectStrikeByDelta(chainRows, 0.50, optType, spot, expiry);
+  if (!strikeRow) return null;
+
+  const leg = toLeg(strikeRow, optType, 'BUY', qty, symbol);
+  // Exits are fully owned by longOptionExitPolicy (let-runners-run ratchet),
+  // wired globally into every long FNO position — a fixed trailingStop here
+  // would compete with it instead of complementing it.
+  leg.trailingStop = undefined;
+
+  return {
+    id: `strat_ast_${Date.now().toString(36)}`,
+    name: `${symbol} Adaptive Supertrend ${optionType} (${leg.strike})`,
+    symbol,
+    type: 'ADAPTIVE_SUPERTREND',
     lots,
     legs: [leg],
     estimatedNetPremium: Number((-(leg.price * qty)).toFixed(2)),

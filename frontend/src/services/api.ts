@@ -123,6 +123,12 @@ export const api = {
   squareOffAll: () =>
     request<any>('/api/control/square-off', { method: 'POST', body: JSON.stringify({ reason: 'Manual square-off from control plane' }) }),
 
+  longOptionPolicy: () =>
+    request<{ enabled: boolean; positions: Array<{ tradingSymbol: string; remainingQuantity: number; peakNet: number; floorNet: number; captureRatioSoFar: number | null; partialTaken: boolean }> }>('/api/control/long-option-policy'),
+
+  setLongOptionPolicy: (enabled: boolean) =>
+    request<any>('/api/control/long-option-policy', { method: 'POST', body: JSON.stringify({ enabled }) }),
+
   getRiskLimits: () => request<any>('/api/control/risk-limits'),
 
   setRiskLimits: (patch: any) =>

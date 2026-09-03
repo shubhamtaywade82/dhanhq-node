@@ -10,17 +10,14 @@ const log = moduleLogger('telegram');
  * fallback behavior) wired onto this app's eventBus instead of Rails
  * service call sites.
  *
- * Forwards `log` channel events at WARN/ERROR/SYSTEM level, plus TRADE
- * events from `autonomy` specifically (auto-exit on SL/target/trailing, and
- * the EOD square-off summary) — standalone "what just happened" alerts.
- * Deliberately not a full feed of every fill — a multi-leg strategy deploy
- * would otherwise ping once per leg.
+ * Forwards only TRADE events from `autonomy` (auto-exit on SL/target/
+ * trailing, and the EOD square-off summary) — standalone "what just
+ * happened" alerts. Deliberately not a full feed of every fill — a
+ * multi-leg strategy deploy would otherwise ping once per leg.
  *
- * WARN/SYSTEM are repeat-throttled (see throttleRepeat): the same root
- * cause recurring every scanner cycle sends once, then a count-annotated
- * reminder at most every 30 minutes, not once per occurrence. ERROR and
- * TRADE always send immediately — never throttle a kill switch or an
- * actual fill/exit.
+ * WARN/ERROR/SYSTEM stay in the system logger only — they were flooding
+ * the bot and risking Telegram rate limits. TRADE always sends immediately,
+ * never throttled.
  */
 
 const TELEGRAM_API = 'https://api.telegram.org';
@@ -55,13 +52,12 @@ export function splitIntoChunks(text: string, maxLen = MAX_MESSAGE_LENGTH): stri
   return chunks;
 }
 
-/** WARN/ERROR/SYSTEM forward (subject to the repeat throttle below); TRADE
- * only forwards from `autonomy` — Auto-exit (SL/target/trailing hit) and
- * Square-off complete are standalone "here's what happened" events a trader
- * wants pushed. Per-leg fills (paper_engine/live_engine/portfolio deploy)
- * stay excluded — a 4-leg strategy would otherwise ping 4 times per entry. */
+/** Only TRADE from `autonomy` forwards — Auto-exit (SL/target/trailing hit)
+ * and Square-off complete are standalone "here's what happened" events a
+ * trader wants pushed. Per-leg fills (paper_engine/live_engine/portfolio
+ * deploy) stay excluded — a 4-leg strategy would otherwise ping 4 times per
+ * entry. WARN/ERROR/SYSTEM never forward — they stay in the system logger. */
 export function shouldForwardLog(level: string, source: string, _message: string): boolean {
-  if (level === 'WARN' || level === 'ERROR' || level === 'SYSTEM') return true;
   return level === 'TRADE' && source === 'autonomy';
 }
 
@@ -168,7 +164,7 @@ export function startTelegramNotifier(): () => void {
     log.info('Telegram notifications disabled (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set)');
     return () => {};
   }
-  log.info('Telegram notifications armed (WARN/ERROR/SYSTEM + trade exits, repeat-throttled)');
+  log.info('Telegram notifications armed (trade exits only)');
   return eventBus.on('log', (env) => {
     const { level, message, source } = env.payload || {};
     if (!shouldForwardLog(level, source, message)) return;
