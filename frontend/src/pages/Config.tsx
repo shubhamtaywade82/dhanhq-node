@@ -4,7 +4,7 @@ import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { StatusDot } from '../components/ui/StatusDot';
-import { Plug, Shield, Brain, Code, Power } from 'lucide-react';
+import { Plug, Shield, Brain, Code, Power, TrendingUp } from 'lucide-react';
 import { api } from '../services/api';
 
 /**
@@ -22,12 +22,14 @@ export function Config() {
   const [ollama, setOllama] = useState<{ status: string; error?: string } | null>(null);
   const [brokerStatus, setBrokerStatus] = useState<string>('');
   const [autonomyOn, setAutonomyOn] = useState<boolean | null>(null);
+  const [longOptionPolicyOn, setLongOptionPolicyOn] = useState<boolean | null>(null);
 
   const load = useCallback(async () => {
     try {
       const ctrl = await api.controlState();
       setMeta(ctrl);
       setAutonomyOn(!!ctrl.autonomy?.enabled);
+      setLongOptionPolicyOn(!!ctrl.autonomy?.longOptionPolicyEnabled);
       const lim = ctrl.risk?.limits || {};
       setLimits((prev: any) => ({ ...prev, ...lim }));
     } catch (e: any) {
@@ -83,6 +85,18 @@ export function Config() {
     }
   };
 
+  const toggleLongOptionPolicy = async (on: boolean) => {
+    try {
+      await api.setLongOptionPolicy(on);
+      setLongOptionPolicyOn(on);
+      showToast(`Long-option peak-profit policy ${on ? 'enabled' : 'disabled'}`, on ? 'success' : 'warning');
+      addSystemLog('WARN', `Long-option peak-profit policy ${on ? 'enabled' : 'disabled'} from control plane`, 'long_option_policy');
+      await refreshControlState();
+    } catch (e: any) {
+      showToast(`Failed: ${e.message}`, 'error');
+    }
+  };
+
   return (
     <div className="space-y-4">
       <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">System Configuration & Governance</div>
@@ -124,6 +138,24 @@ export function Config() {
           </div>
           <div className="text-[9.5px] font-mono text-muted">
             Kill switch: {state.killed ? <span className="text-danger font-bold">ENGAGED — trading halted</span> : <span className="text-accent">disarmed</span>}
+          </div>
+        </Card>
+
+        <Card className="p-4 space-y-3">
+          <div className="text-xs font-semibold text-white flex items-center gap-2"><TrendingUp size={14} className={longOptionPolicyOn ? 'text-accent' : 'text-danger'} /> Long-Option Peak-Profit Policy</div>
+          <div className="flex items-center justify-between p-2.5 rounded bg-surface-50 border border-border">
+            <div className="flex items-center gap-2">
+              <StatusDot status={longOptionPolicyOn ? 'live' : 'idle'} pulse={!!longOptionPolicyOn} />
+              <span className="text-xs font-mono text-white">{longOptionPolicyOn ? 'ACTIVE' : 'DISABLED'}</span>
+            </div>
+            <Button variant={longOptionPolicyOn ? 'ghost' : 'primary'} className="text-[11px] py-1" onClick={() => toggleLongOptionPolicy(!longOptionPolicyOn)}>
+              {longOptionPolicyOn ? 'Disable' : 'Enable'}
+            </Button>
+          </div>
+          <div className="text-[9.5px] font-mono text-muted">
+            Runs every tick against every open long-option paper position: ratchets a profit floor as peak P&amp;L rises,
+            takes a breakeven partial at +0.5R, and force-flattens by EOD — the goal is capturing gains, not giving them
+            back. Per-position peak/floor detail is on the Positions page.
           </div>
         </Card>
 
