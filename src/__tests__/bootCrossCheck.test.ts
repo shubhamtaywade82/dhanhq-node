@@ -67,6 +67,21 @@ describe('crossCheckJournalOnBoot', () => {
     expect(alertSpy).toHaveBeenCalledWith('ERROR', 'core', expect.stringContaining('ghost_trade_corr'));
   });
 
+  it('does not alert on live or sandbox trades when booted in paper mode', async () => {
+    const { risk } = setup();
+    jest.spyOn(risk, 'isKilled').mockReturnValue(false);
+    const alertSpy = jest.spyOn(db, 'pushAlert');
+
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'live_intent', mode: 'live' }),
+      entry(2, 'order_result', { correlation_id: 'live_intent', status: 'TRADED', is_paper: false, mode: 'live' }),
+      entry(3, 'order_result', { correlation_id: 'sbx_trade', status: 'TRADED', is_paper: false, mode: 'sandbox' }),
+    ];
+    await crossCheckJournalOnBoot(entries, risk, stubClient());
+
+    expect(alertSpy).not.toHaveBeenCalledWith('ERROR', expect.anything(), expect.anything());
+  });
+
   describe('sandbox/live mode — resolving orders via the broker instead of paper_orders', () => {
     // SandboxExecutionEngine/LiveExecutionEngine journal status:'TRADED'
     // results but never insert into paper_orders (only executePaperOrder

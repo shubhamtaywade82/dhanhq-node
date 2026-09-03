@@ -7,6 +7,7 @@ import { toTrailConfig } from './marketData';
 import type { RiskEngine } from './riskEngine';
 import type { AgentOrchestrator } from './agent';
 import type { AdaptiveSupertrendScanner } from './adaptiveSupertrendScanner';
+import type { ResearchOrchestrator } from './research/researchOrchestrator';
 import { LongOptionPositionManager } from './longOptionPositionManager';
 import {
   listPaperStrategies, updatePaperStrategyStatus, pushAlert,
@@ -33,6 +34,7 @@ export class AutonomyEngine {
   private risk: RiskEngine;
   private portfolio: PortfolioSource;
   private agent: AgentOrchestrator | null = null;
+  private research: ResearchOrchestrator | null = null;
   private scanner: AdaptiveSupertrendScanner | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private enabled = true;
@@ -59,6 +61,10 @@ export class AutonomyEngine {
 
   setAgent(agent: AgentOrchestrator): void {
     this.agent = agent;
+  }
+
+  setResearch(research: ResearchOrchestrator): void {
+    this.research = research;
   }
 
   setScanner(scanner: AdaptiveSupertrendScanner): void {

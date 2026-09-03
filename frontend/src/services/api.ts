@@ -1,7 +1,6 @@
 import { log } from './logger';
 
-const defaultHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
-const API_BASE = import.meta.env.VITE_API_URL || `http://${defaultHost}:3003`;
+const API_BASE = import.meta.env.VITE_API_URL || '';
 
 /**
  * Central API client.
@@ -162,4 +161,17 @@ export const api = {
 
   ollamaHealth: () => request<{ status: string }>('/api/ollama/health'),
   ollamaModels: () => request<any>('/api/ollama/models'),
+
+  // ── research ───────────────────────────────────────────────────────
+  researchAnalyze: (symbol: string, exchange?: string) =>
+    request<any>('/api/research/analyze', { method: 'POST', body: JSON.stringify({ symbol, exchange }) }),
+  researchRuns: (limit = 20) => request<{ count: number; runs: any[] }>(`/api/research/runs?limit=${limit}`),
+  researchRun: (runId: string) => request<any>(`/api/research/${runId}`),
+  researchEvidence: (runId: string) => request<{ runId: string; count: number; evidence: any[] }>(`/api/research/${runId}/evidence`),
+  researchSignal: (symbol: string) => request<any>(`/api/research/signal/${symbol}`),
+  researchUniverses: () => request<{ universes: any[] }>('/api/research/universes'),
+  researchScreen: (universe: string, preset: string) =>
+    request<any>('/api/research/screen', { method: 'POST', body: JSON.stringify({ universe, preset }) }),
+  researchScreenAndAnalyze: (universe: string, preset: string, topN = 3) =>
+    request<any>('/api/research/screen-and-analyze', { method: 'POST', body: JSON.stringify({ universe, preset, topN }) }),
 };

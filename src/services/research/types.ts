@@ -139,6 +139,34 @@ export interface InvestmentVerdict {
   summary: string;
 }
 
+export interface OptionsIntelligenceResult {
+  underlying: string;
+  spot: number;
+  atmIv: number;
+  ivRank: number | null;
+  pcrOi: number;
+  pcrVolume: number;
+  maxPainStrike: number;
+  callOiWall: number;
+  putOiWall: number;
+  expectedMove: number;
+  preferredStructure: 'BULL_CALL_SPREAD' | 'BEAR_PUT_SPREAD' | 'IRON_CONDOR' | 'IRON_BUTTERFLY' | 'NEUTRAL';
+  summary: string;
+}
+
+export interface ResearchTradeSignal {
+  symbol: string;
+  bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  conviction: number;
+  horizon: 'INTRADAY' | 'SWING' | 'POSITIONAL';
+  fairValue: { bear: number; base: number; bull: number };
+  marginOfSafetyPct: number;
+  entryConditions: string[];
+  invalidationTriggers: string[];
+  suggestedStructures: string[];
+  generatedAt: number;
+}
+
 export interface ResearchRun {
   runId: string;
   symbol: string;
@@ -150,8 +178,10 @@ export interface ResearchRun {
   financialValuation?: FinancialValuationResult;
   growthManagement?: GrowthManagementResult;
   technicalRisk?: TechnicalRiskResult;
+  optionsIntelligence?: OptionsIntelligenceResult;
   debate?: BullBearDebate;
   verdict?: InvestmentVerdict;
+  tradeSignal?: ResearchTradeSignal;
   evidenceCount: number;
   error?: string;
 }
@@ -160,3 +190,41 @@ export interface ResearchOptions {
   exchange?: 'NSE' | 'BSE';
   forceRefresh?: boolean;
 }
+
+export type ScreenerPresetName =
+  | 'QUALITY_COMPOUNDERS'
+  | 'VALUE_MARGIN_OF_SAFETY'
+  | 'MOMENTUM_BREAKOUT'
+  | 'OPTIONS_BULLISH';
+
+export interface ScreenerCandidate {
+  symbol: string;
+  name: string;
+  sector: string;
+  securityId: string;
+  cmp: number;
+  deterministicScore: number;
+  passed: boolean;
+  passedRules: string[];
+  failedRules: string[];
+  metrics: {
+    rsi14: number;
+    supertrend: 'BULLISH' | 'BEARISH';
+    cfoVsPat: number;
+    roicPct: number;
+    debtToEquity: number;
+    dcfMarginOfSafetyPct: number;
+    pcrOi?: number;
+  };
+}
+
+export interface ScreenerResult {
+  universe: string;
+  preset: ScreenerPresetName;
+  totalScreened: number;
+  totalPassed: number;
+  candidates: ScreenerCandidate[];
+  topPicks: string[];
+  screenedAt: number;
+}
+

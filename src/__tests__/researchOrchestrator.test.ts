@@ -77,4 +77,17 @@ describe('ResearchOrchestrator', () => {
     const dangerousMethods = properties.filter((p) => /order|trade|execute|cancel|modify/i.test(p));
     expect(dangerousMethods).toEqual([]);
   });
+
+  it('runs deterministic screening and two-stage funnel deep dive', async () => {
+    const screenRes = await orchestrator.screen('IT_TECH', 'QUALITY_COMPOUNDERS');
+    expect(screenRes.universe).toBe('IT_TECH');
+    expect(screenRes.candidates.length).toBeGreaterThanOrEqual(3);
+
+    const funnelRes = await orchestrator.screenAndAnalyze('IT_TECH', 'QUALITY_COMPOUNDERS', 2);
+    expect(funnelRes.screener).toBeDefined();
+    expect(funnelRes.analyzedRuns.length).toBeLessThanOrEqual(2);
+    if (funnelRes.analyzedRuns.length > 0) {
+      expect(funnelRes.analyzedRuns[0].verdict).toBeDefined();
+    }
+  });
 });

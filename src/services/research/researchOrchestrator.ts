@@ -11,7 +11,10 @@ import { GrowthManagementSkill } from './skills/growthManagementSkill';
 import { TechnicalRiskSkill } from './skills/technicalRiskSkill';
 import { BullBearDebateSkill } from './skills/bullBearDebateSkill';
 import { VerdictSkill } from './skills/verdictSkill';
-import type { ResearchOptions, ResearchRun } from './types';
+import { OptionsIntelligenceSkill } from './skills/optionsIntelligenceSkill';
+import { ResearchTradeBridge } from './tradeBridge';
+import { StockScreener } from './screener';
+import type { ResearchOptions, ResearchRun, ResearchTradeSignal, ScreenerPresetName, ScreenerResult } from './types';
 import { saveResearchRun, getResearchRun, listResearchRuns, saveResearchEvidence, getResearchEvidenceByRun } from '../../db';
 
 const log = moduleLogger('research_orchestrator');
@@ -27,9 +30,13 @@ export class ResearchOrchestrator {
   private financialSkill = new FinancialValuationSkill();
   private growthSkill = new GrowthManagementSkill();
   private technicalSkill = new TechnicalRiskSkill();
+  private optionsSkill = new OptionsIntelligenceSkill();
+  private tradeBridge = new ResearchTradeBridge();
+  private screener = new StockScreener();
   private debateSkill: BullBearDebateSkill;
   private verdictSkill = new VerdictSkill();
   private inMemoryRuns = new Map<string, ResearchRun>();
+  private latestSignals = new Map<string, ResearchTradeSignal>();
 
   constructor(
     private client: DhanClient,
@@ -79,8 +86,16 @@ export class ResearchOrchestrator {
       this.emitTelemetry(runId, 'ANALYSIS', 'Auditing governance & management track record');
       run.growthManagement = this.growthSkill.analyze(statements, ledger);
 
+      this.emitTelemetry(runId, 'ANALYSIS', 'Analyzing options chain & derivatives positioning');
+      run.optionsIntelligence = this.optionsSkill.analyze({ underlying: instrument.symbol, spot: quote.ltp }, ledger);
+
       this.emitTelemetry(runId, 'ANALYSIS', 'Calculating technical indicators & risk register');
-      run.technicalRisk = this.technicalSkill.analyze(instrument.symbol, candles, undefined, ledger);
+      run.technicalRisk = this.technicalSkill.analyze(instrument.symbol, candles, {
+        pcrOi: run.optionsIntelligence.pcrOi,
+        maxPain: run.optionsIntelligence.maxPainStrike,
+        callOiWall: run.optionsIntelligence.callOiWall,
+        putOiWall: run.optionsIntelligence.putOiWall,
+      }, ledger);
 
       // 3. Adversarial Bull vs Bear Red-Team Debate
       this.emitTelemetry(runId, 'DEBATE', 'Running adversarial Bull vs Bear debate judge');
@@ -97,6 +112,10 @@ export class ResearchOrchestrator {
         technical: run.technicalRisk,
         debate: run.debate,
       });
+
+      // 5. Research-to-Trading Signal Bridge
+      run.tradeSignal = this.tradeBridge.generateSignal(instrument.symbol, run.verdict, run.optionsIntelligence);
+      this.latestSignals.set(instrument.symbol.toUpperCase(), run.tradeSignal);
 
       run.status = 'COMPLETED';
       run.completedAt = Date.now();
@@ -133,6 +152,31 @@ export class ResearchOrchestrator {
 
   async getEvidence(runId: string): Promise<any[]> {
     return getResearchEvidenceByRun(runId).catch(() => []);
+  }
+
+  getSignal(symbol: string): ResearchTradeSignal | null {
+    return this.latestSignals.get(symbol.toUpperCase()) || null;
+  }
+
+  async screen(universeId: string, preset: ScreenerPresetName = 'QUALITY_COMPOUNDERS'): Promise<ScreenerResult> {
+    this.emitTelemetry('screen', 'SCREENER', `Screening ${universeId} with ${preset}`);
+    return this.screener.screen(universeId, preset, this.marketProvider, this.fundamentalProvider);
+  }
+
+  async screenAndAnalyze(
+    universeId: string,
+    preset: ScreenerPresetName = 'QUALITY_COMPOUNDERS',
+    topN = 3,
+  ): Promise<{ screener: ScreenerResult; analyzedRuns: ResearchRun[] }> {
+    const screener = await this.screen(universeId, preset);
+    const topCandidates = screener.candidates.filter((c) => c.passed).slice(0, topN);
+    this.emitTelemetry('funnel', 'AGENTIC_DEEP_DIVE', `Deep analyzing ${topCandidates.length} passed candidates`);
+
+    const analyzedRuns: ResearchRun[] = [];
+    for (const cand of topCandidates) {
+      analyzedRuns.push(await this.analyze(cand.symbol));
+    }
+    return { screener, analyzedRuns };
   }
 
   private emitTelemetry(runId: string, step: string, message: string): void {

@@ -206,4 +206,22 @@ describe('summarizeDay', () => {
     ];
     expect(summarizeDay(entries).unresolvedIntents).toEqual([]);
   });
+
+  it('filters orders by trading mode when mode is provided', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'paper_1', mode: 'paper' }),
+      entry(2, 'order_result', { correlation_id: 'paper_1', status: 'TRADED', is_paper: true }),
+      entry(3, 'order_intent', { correlation_id: 'live_1', mode: 'live' }),
+      entry(4, 'order_result', { correlation_id: 'live_1', status: 'TRADED', is_paper: false, mode: 'live' }),
+      entry(5, 'order_intent', { correlation_id: 'unresolved_paper', mode: 'paper' }),
+      entry(6, 'order_intent', { correlation_id: 'unresolved_live', mode: 'live' }),
+    ];
+    const paperSummary = summarizeDay(entries, 'paper');
+    expect(paperSummary.tradedCorrelationIds).toEqual(['paper_1']);
+    expect(paperSummary.unresolvedIntents).toEqual(['unresolved_paper']);
+
+    const liveSummary = summarizeDay(entries, 'live');
+    expect(liveSummary.tradedCorrelationIds).toEqual(['live_1']);
+    expect(liveSummary.unresolvedIntents).toEqual(['unresolved_live']);
+  });
 });

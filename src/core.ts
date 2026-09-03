@@ -126,6 +126,7 @@ export async function startCore(): Promise<Core> {
     : null;
   const research = new ResearchOrchestrator(client, market, undefined, ollama);
   autonomy.setAgent(agent);
+  autonomy.setResearch(research);
   autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, paper, risk));
 
   // Bridge core events into Redis pub/sub (Rails sidecar compat) when up.
@@ -194,8 +195,8 @@ export async function crossCheckJournalOnBoot(
   priorEntries: JournalEntry[], risk: RiskEngine, client: DhanClient, sandboxClient?: DhanClient,
 ): Promise<void> {
   if (priorEntries.length === 0) return;
-  const summary = summarizeDay(priorEntries);
   const mode = process.env.TRADING_MODE || 'paper';
+  const summary = summarizeDay(priorEntries, mode);
   const problems: string[] = [];
 
   if (mode === 'paper') {

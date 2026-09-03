@@ -33,6 +33,19 @@ describe('Research Routes HTTP API', () => {
       getEvidence: jest.fn().mockResolvedValue([
         { id: 'EV-0001', claim: 'Revenue grew 18%', metric: 'revenue_growth', confidence: 0.95 },
       ]),
+      screen: jest.fn().mockResolvedValue({
+        universe: 'FNO_HEAVYWEIGHTS',
+        preset: 'QUALITY_COMPOUNDERS',
+        totalScreened: 10,
+        totalPassed: 4,
+        candidates: [],
+        topPicks: ['RELIANCE', 'TCS'],
+        screenedAt: Date.now(),
+      }),
+      screenAndAnalyze: jest.fn().mockResolvedValue({
+        screener: { totalPassed: 2, topPicks: ['RELIANCE'] },
+        analyzedRuns: [{ symbol: 'RELIANCE', verdict: { stance: 'BUY' } }],
+      }),
     };
 
     app = express();
@@ -102,5 +115,36 @@ describe('Research Routes HTTP API', () => {
     const data: any = await res.json();
     expect(data.count).toBe(1);
     expect(data.evidence[0].id).toBe('EV-0001');
+  });
+
+  it('GET /universes returns available stock universes', async () => {
+    const res = await fetch(`${baseUrl}/universes`);
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.universes.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('POST /screen triggers deterministic screening', async () => {
+    const res = await fetch(`${baseUrl}/screen`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ universe: 'FNO_HEAVYWEIGHTS', preset: 'QUALITY_COMPOUNDERS' }),
+    });
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.totalScreened).toBe(10);
+    expect(data.topPicks).toContain('RELIANCE');
+  });
+
+  it('POST /screen-and-analyze executes two-stage funnel', async () => {
+    const res = await fetch(`${baseUrl}/screen-and-analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ universe: 'FNO_HEAVYWEIGHTS', preset: 'QUALITY_COMPOUNDERS', topN: 2 }),
+    });
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.screener).toBeDefined();
+    expect(data.analyzedRuns.length).toBe(1);
   });
 });

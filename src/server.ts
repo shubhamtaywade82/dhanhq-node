@@ -66,7 +66,17 @@ async function main() {
     log.warn('CONTROL_PLANE_TOKEN not set — order/kill-switch endpoints are unauthenticated (CORS-origin-restricted only). Set it to require a bearer token.');
   }
   const app = express();
-  app.use(cors({ origin: ALLOWED_ORIGIN, credentials: true }));
+  const allowedOrigins = [ALLOWED_ORIGIN, 'http://localhost:5175', 'http://127.0.0.1:5175', 'http://localhost:5173', 'http://127.0.0.1:5173'];
+  app.use(cors({
+    origin: (origin, cb) => {
+      if (!origin || allowedOrigins.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) {
+        cb(null, true);
+      } else {
+        cb(new Error(`Origin ${origin} not allowed by CORS`));
+      }
+    },
+    credentials: true,
+  }));
   app.use(express.json());
   app.use(requestLogger); // access logs + req.log child (requestId/traceId)
   app.use((req, res, next) => {

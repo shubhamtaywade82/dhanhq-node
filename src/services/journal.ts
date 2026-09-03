@@ -1,4 +1,5 @@
 import { createWriteStream, existsSync, mkdirSync, readFileSync, type WriteStream } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { moduleLogger } from '../lib/logger';
 import { marketClock } from './marketHours';
@@ -53,7 +54,12 @@ export interface JournalEntry<T = any> {
 // reloaded, which a cached `const DIR = process.env.JOURNAL_DIR ...`
 // evaluated once at import time would silently ignore.
 function journalDir(): string {
-  return process.env.JOURNAL_DIR || join(process.cwd(), '.journal');
+  if (process.env.JOURNAL_DIR) return process.env.JOURNAL_DIR;
+  // Prevent tests from accidentally appending to the runtime journal when JOURNAL_DIR is unset.
+  if (process.env.NODE_ENV === 'test') {
+    return join(tmpdir(), 'dhanhq-node-test-journal');
+  }
+  return join(process.cwd(), '.journal');
 }
 
 export class Journal {
@@ -189,18 +195,34 @@ export interface DayReplaySummary {
  * drift. Order-existence and kill-state are the two things a single day's
  * journal can check without that ambiguity.
  */
-export function summarizeDay(entries: JournalEntry[]): DayReplaySummary {
+function matchesMode(e: JournalEntry, mode?: string): boolean {
+  if (!mode) return true;
+  if (mode === 'paper') {
+    return e.payload?.is_paper !== false && e.payload?.mode !== 'live' && e.payload?.mode !== 'sandbox';
+  }
+  if (mode === 'sandbox') {
+    return e.payload?.is_paper !== true && e.payload?.mode !== 'paper' && e.payload?.mode !== 'live';
+  }
+  if (mode === 'live') {
+    return e.payload?.is_paper !== true && e.payload?.mode !== 'paper' && e.payload?.mode !== 'sandbox';
+  }
+  return true;
+}
+
+export function summarizeDay(entries: JournalEntry[], mode?: string): DayReplaySummary {
   const tradedCorrelationIds: string[] = [];
   const intentIds = new Set<string>();
   const resolvedIds = new Set<string>();
   let lastKillAction: 'arm' | 'disarm' | null = null;
   for (const e of entries) {
     if (e.kind === 'order_intent' && e.payload?.correlation_id) {
-      intentIds.add(String(e.payload.correlation_id));
+      if (matchesMode(e, mode)) intentIds.add(String(e.payload.correlation_id));
     }
     if (e.kind === 'order_result' && e.payload?.correlation_id) {
-      resolvedIds.add(String(e.payload.correlation_id));
-      if (e.payload?.status === 'TRADED') tradedCorrelationIds.push(String(e.payload.correlation_id));
+      if (matchesMode(e, mode)) {
+        resolvedIds.add(String(e.payload.correlation_id));
+        if (e.payload?.status === 'TRADED') tradedCorrelationIds.push(String(e.payload.correlation_id));
+      }
     }
     if (e.kind === 'kill' && (e.payload?.action === 'arm' || e.payload?.action === 'disarm')) {
       lastKillAction = e.payload.action;
