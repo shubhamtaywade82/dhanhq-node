@@ -310,7 +310,12 @@ export class AgentOrchestrator {
     
     // Confluence-driven directional bias (PCR OI + PCR Vol + Max Pain pull)
     const pcrBias = analytics.pcrOi > 1.15 ? 'BULLISH' : analytics.pcrOi < 0.85 ? 'BEARISH' : 'NEUTRAL';
-    const painBias = analytics.maxPain ? (spot < analytics.maxPain - 50 ? 'BULLISH' : spot > analytics.maxPain + 50 ? 'BEARISH' : 'NEUTRAL') : 'NEUTRAL';
+    // analyzeOptionChain() returns this field as maxPainStrike (see
+    // OptionChainAnalytics), not maxPain — reading the wrong name here made
+    // painBias always NEUTRAL, silently dropping the max-pain half of this
+    // confluence check and leaving `direction` to fall through to pcrBias
+    // or, when that's also neutral, the hardcoded BULLISH default.
+    const painBias = analytics.maxPainStrike ? (spot < analytics.maxPainStrike - 50 ? 'BULLISH' : spot > analytics.maxPainStrike + 50 ? 'BEARISH' : 'NEUTRAL') : 'NEUTRAL';
     const direction: 'BULLISH' | 'BEARISH' = pcrBias !== 'NEUTRAL' ? pcrBias : (painBias !== 'NEUTRAL' ? painBias : 'BULLISH');
 
     // Conservative capital allocation (30% pool, ~1-1.5% max risk).
