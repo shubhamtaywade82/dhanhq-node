@@ -158,8 +158,24 @@ export class RiskEngine {
 
   /**
    * Arm the kill switch for real. Paper mode squares off every open
-   * position at the freshest LTP; live mode calls DhanHQ Trader's Control
-   * (kill switch + P&L exit) and then squares off intraday positions.
+   * position at the freshest LTP; live mode ALSO halts order flow at the
+   * broker itself via DhanHQ Trader's Control before squaring off.
+   *
+   * The broker call is intentionally isolated in its own try/catch: it must
+   * never be able to block the actual square-off below, which is the real
+   * safety mechanism. (An earlier version of this method called
+   * traderControls.killSwitch()/.pnlExit() — neither exists on the SDK;
+   * TraderControls only exposes setKillSwitch(status) and setPnlExit(req).
+   * Because both calls used optional chaining, a wrong method name resolved
+   * to undefined and silently no-opped rather than throwing — the broker's
+   * own kill switch never actually engaged in live mode, while this method
+   * proceeded to record brokerKillSwitch as engaged anyway. setPnlExit is
+   * not used here at all: it configures the broker's own auto-exit
+   * thresholds (profitValue/lossValue), which would need real, deliberately
+   * chosen values this system has no basis to invent — closeAll() below
+   * already handles actually exiting every position, so ACTIVATE (which
+   * only blocks new order placement, exits nothing on its own) is
+   * sufficient and doesn't duplicate it.)
    */
   async armKillSwitch(reason: string): Promise<{ status: string; details: any }> {
     if (this.killed) return { status: 'already_killed', details: { reason: this.killedReason } };
@@ -171,13 +187,17 @@ export class RiskEngine {
 
     const details: any = { mode: process.env.TRADING_MODE || 'paper', positionsClosed: 0 };
 
-    try {
-      if ((process.env.TRADING_MODE || 'paper') === 'live') {
-        // DhanHQ Trader's Control: halt order flow at the broker itself.
-        await (this.client as any).traderControls?.killSwitch?.('ENABLE');
-        details.brokerKillSwitch = 'ENABLED';
-        await (this.client as any).traderControls?.pnlExit?.({ type: 'PROFIT', value: 0 }).catch(() => {});
+    if ((process.env.TRADING_MODE || 'paper') === 'live') {
+      try {
+        await (this.client as any).traderControls?.setKillSwitch?.('ACTIVATE');
+        details.brokerKillSwitch = 'ACTIVATE';
+      } catch (e: any) {
+        details.brokerKillSwitchError = e.message;
+        eventBus.log('ERROR', `Broker kill switch ACTIVATE failed: ${e.message} — proceeding to square off locally anyway`, 'risk_engine');
       }
+    }
+
+    try {
       const openBefore = await this.portfolio.getPositions();
       const closes = (await this.portfolio.closeAll((secId, _sym) => this.market.getFillablePrice(secId, { allowClosed: true }) ?? this.market.getLtp(secId))) as any[];
       details.positionsClosed = closes.filter((c) => c && c.status === 'TRADED').length;
@@ -216,7 +236,7 @@ export class RiskEngine {
     await saveRiskState({ killed: false, killedDate: null, limits: this.limits });
     try {
       if ((process.env.TRADING_MODE || 'paper') === 'live') {
-        await (this.client as any).traderControls?.killSwitch?.('DISABLE');
+        await (this.client as any).traderControls?.setKillSwitch?.('DEACTIVATE');
       }
     } catch { /* broker may reject if not armed */ }
     eventBus.log('INFO', 'Kill switch disarmed — trading re-enabled', 'risk_engine');
