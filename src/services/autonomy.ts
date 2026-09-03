@@ -7,10 +7,10 @@ import { toTrailConfig } from './marketData';
 import type { RiskEngine } from './riskEngine';
 import type { AgentOrchestrator } from './agent';
 import {
-  listPaperStrategies, listPaperPositions, markPositionsToMarket,
-  closePaperPosition, updatePaperStrategyStatus, getPaperWallet, pushAlert,
+  listPaperStrategies, updatePaperStrategyStatus, pushAlert,
   reconcileLedger, correctLedgerFromPostgres,
 } from '../db';
+import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 
 /**
  * Autonomy engine — the heartbeat that keeps the system trading when no
@@ -27,6 +27,7 @@ export class AutonomyEngine {
   private client: DhanClient;
   private market: MarketDataService;
   private risk: RiskEngine;
+  private portfolio: PortfolioSource;
   private agent: AgentOrchestrator | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private enabled = true;
@@ -42,10 +43,11 @@ export class AutonomyEngine {
   private unsubBus: Array<() => void> = [];
   private tickMarkScheduled = false;
 
-  constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine) {
+  constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, portfolio: PortfolioSource = new PaperPortfolioSource()) {
     this.client = client;
     this.market = market;
     this.risk = risk;
+    this.portfolio = portfolio;
   }
 
   setAgent(agent: AgentOrchestrator): void {
@@ -123,7 +125,7 @@ export class AutonomyEngine {
       }
 
       if (this.enabled) {
-        const mark = await markPositionsToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
+        const mark = await this.portfolio.markToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
         if (clock.isMarketOpen && mark.staleCount > 0) {
           eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
         }
@@ -157,8 +159,8 @@ export class AutonomyEngine {
     const gate = this.risk.canTrade();
     if (!gate.allowed) return;
 
-    const positions = await listPaperPositions();
-    if (positions.filter((p: any) => p.netQty !== 0).length >= 4) return;
+    const positions = await this.portfolio.getPositions();
+    if (positions.filter((p) => p.netQty !== 0).length >= 4) return;
 
     this.lastScanAt = Date.now();
     try {
@@ -174,15 +176,15 @@ export class AutonomyEngine {
 
     eventBus.log('WARN', `Exit signal (${p.reason}) for ${p.securityId}`, 'autonomy');
     try {
-      const positions = await listPaperPositions();
-      const pos = positions.find((x: any) => String(x.securityId) === String(p.securityId) && x.netQty !== 0);
+      const positions = await this.portfolio.getPositions();
+      const pos = positions.find((x) => String(x.securityId) === String(p.securityId) && x.netQty !== 0);
       if (pos) {
         const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
         // A triggered stop (hard SL or trailing) crosses the spread on the
         // adverse move that fired it — priced with extra slippage vs. a
         // target hit or a manual close, which fill more like a resting order.
         const kind = p.reason === 'stop_loss' || p.reason === 'trailing_stop' ? 'STOP' : 'EXIT';
-        const res = await closePaperPosition(pos.tradingSymbol, ltp, undefined, kind);
+        const res = await this.portfolio.closePosition(pos.tradingSymbol, ltp, kind);
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         eventBus.log('TRADE', `Auto-exit ${pos.tradingSymbol}: ${res.status} @ ₹${ltp} (${p.reason})`, 'autonomy');
         await this.closeParentStrategyIfFlat(pos.tradingSymbol);
@@ -199,8 +201,8 @@ export class AutonomyEngine {
     const strategies = await listPaperStrategies();
     const strat = strategies.find((s: any) => s.status === 'RUNNING' && (s.legs || []).some((l: any) => l.instrument === tradingSymbol));
     if (!strat) return;
-    const positions = await listPaperPositions();
-    const posMap = new Map(positions.map((p: any) => [p.tradingSymbol, p]));
+    const positions = await this.portfolio.getPositions();
+    const posMap = new Map(positions.map((p) => [p.tradingSymbol, p]));
     const stillOpen = (strat.legs || []).some((l: any) => Number(posMap.get(l.instrument)?.netQty || 0) !== 0);
     if (!stillOpen) await updatePaperStrategyStatus(strat.id, 'STOPPED');
   }
@@ -226,7 +228,7 @@ export class AutonomyEngine {
    * silently.
    */
   private async reconcileMonitor(): Promise<void> {
-    const positions = await listPaperPositions();
+    const positions = await this.portfolio.getPositions();
     const open = new Map<string, any>();
     for (const p of positions) {
       if (p.netQty !== 0 && p.securityId && p.securityId !== '0') {
@@ -278,6 +280,12 @@ export class AutonomyEngine {
    * never silently.
    */
   private async reconcileLedgerAgainstPostgres(): Promise<void> {
+    // In-memory-vs-Postgres drift only exists for the paper ledger — broker
+    // mode has no local mem mirror to drift from Postgres, it reads the
+    // account straight from DhanHQ on every poll. (The equivalent check for
+    // broker mode — local book vs the actual broker book — is a separate,
+    // not-yet-built reconciler; see PortfolioSource's docstring.)
+    if (this.portfolio.kind !== 'paper') return;
     if (Date.now() - this.lastLedgerCheckAt < 60_000) return;
     this.lastLedgerCheckAt = Date.now();
 
@@ -300,7 +308,7 @@ export class AutonomyEngine {
 
   private async publishPortfolioSnapshot(): Promise<void> {
     try {
-      const [positions, wallet] = await Promise.all([listPaperPositions(), getPaperWallet()]);
+      const [positions, wallet] = await Promise.all([this.portfolio.getPositions(), this.portfolio.getWallet()]);
       eventBus.emit('portfolio', { positions, funds: wallet, markedAt: Date.now() });
     } catch { /* snapshot failure is non-fatal */ }
   }
@@ -311,7 +319,7 @@ export class AutonomyEngine {
     setImmediate(async () => {
       this.tickMarkScheduled = false;
       try {
-        await markPositionsToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
+        await this.portfolio.markToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
         await this.publishPortfolioSnapshot();
       } catch { /* the 2s cycle below is the fallback */ }
     });
@@ -320,8 +328,8 @@ export class AutonomyEngine {
   private async enforceStrategyLimits(): Promise<void> {
     const limit = this.risk.getLimits().perStrategyLossLimit;
     const strategies = await listPaperStrategies();
-    const positions = await listPaperPositions();
-    const posMap = new Map(positions.map((p: any) => [p.tradingSymbol, p]));
+    const positions = await this.portfolio.getPositions();
+    const posMap = new Map(positions.map((p) => [p.tradingSymbol, p]));
 
     for (const strat of strategies) {
       if (strat.status !== 'RUNNING') continue;
@@ -344,7 +352,7 @@ export class AutonomyEngine {
       const pos = positions.find((p) => p.tradingSymbol === leg.instrument);
       if (pos && pos.netQty !== 0) {
         const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
-        await closePaperPosition(leg.instrument, ltp).catch(() => {});
+        await this.portfolio.closePosition(leg.instrument, ltp).catch(() => {});
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       }
     }
@@ -352,12 +360,12 @@ export class AutonomyEngine {
 
   async squareOffAll(reason: string): Promise<number> {
     eventBus.log('WARN', `Square-off triggered: ${reason}`, 'autonomy');
-    const positions = await listPaperPositions();
+    const positions = await this.portfolio.getPositions();
     let closed = 0;
     for (const pos of positions) {
       if (pos.netQty === 0) continue;
       const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
-      await closePaperPosition(pos.tradingSymbol, ltp).catch(() => {});
+      await this.portfolio.closePosition(pos.tradingSymbol, ltp).catch(() => {});
       this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       closed++;
     }

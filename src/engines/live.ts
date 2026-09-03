@@ -5,6 +5,7 @@ import { journal } from '../services/journal';
 import type { MarketDataService } from '../services/marketData';
 import { toTrailConfig } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
+import type { PortfolioSource } from '../services/portfolioSource';
 
 /**
  * Live execution engine — places REAL orders through DhanHQ v2.
@@ -20,13 +21,15 @@ export class LiveExecutionEngine {
   private monitor: PositionMonitor;
   private market: MarketDataService;
   private risk: RiskEngine;
+  private portfolio?: PortfolioSource;
 
-  constructor(client: DhanClient, tracker: OrderTracker, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine) {
+  constructor(client: DhanClient, tracker: OrderTracker, monitor: PositionMonitor, market: MarketDataService, risk: RiskEngine, portfolio?: PortfolioSource) {
     this.client = client;
     this.tracker = tracker;
     this.monitor = monitor;
     this.market = market;
     this.risk = risk;
+    this.portfolio = portfolio;
   }
 
   async placeOrder(intent: any): Promise<any> {
@@ -40,6 +43,7 @@ export class LiveExecutionEngine {
       eventBus.log('WARN', `Live order BLOCKED for ${correlation_id}: ${gate.reason}`, 'live_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
       journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason });
+      this.portfolio?.recordOrderOutcome({ status: 'REJECTED' });
       return { status: 'REJECTED', reason: gate.reason };
     }
 
@@ -80,6 +84,7 @@ export class LiveExecutionEngine {
 
     eventBus.emit('order', { kind: 'fill', ...fillPayload });
     journal.append('order_result', { status: fill.status || 'TRADED', ...fillPayload });
+    this.portfolio?.recordOrderOutcome({ status: fill.status === 'REJECTED' ? 'REJECTED' : 'TRADED' });
     await redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
     if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {

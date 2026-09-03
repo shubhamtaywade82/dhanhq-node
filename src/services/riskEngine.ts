@@ -6,9 +6,9 @@ import type { MarketDataService } from './marketData';
 import { INDEX_INSTRUMENTS } from './marketData';
 import { nearestIndexExpiry } from './marketHours';
 import { calculateGreeks } from './optionsAnalytics';
+import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 import {
-  getPaperWallet, listPaperPositions, getTodayOrderStats,
-  pushAlert, getRiskState, saveRiskState, closeAllPaperPositions,
+  pushAlert, getRiskState, saveRiskState,
   listPaperStrategies, updatePaperStrategyStatus,
 } from '../db';
 
@@ -57,6 +57,7 @@ export interface CircuitBreakerRow {
 export class RiskEngine {
   private client: DhanClient;
   private market: MarketDataService;
+  private portfolio: PortfolioSource;
   private limits: RiskLimits = { ...DEFAULT_RISK_LIMITS };
   private killed = false;
   private killedReason: string | null = null;
@@ -68,9 +69,10 @@ export class RiskEngine {
   private tickEvalScheduled = false;
   private lastRiskEmitAt = 0;
 
-  constructor(client: DhanClient, market: MarketDataService) {
+  constructor(client: DhanClient, market: MarketDataService, portfolio: PortfolioSource = new PaperPortfolioSource()) {
     this.client = client;
     this.market = market;
+    this.portfolio = portfolio;
   }
 
   async start(): Promise<void> {
@@ -176,8 +178,8 @@ export class RiskEngine {
         details.brokerKillSwitch = 'ENABLED';
         await (this.client as any).traderControls?.pnlExit?.({ type: 'PROFIT', value: 0 }).catch(() => {});
       }
-      const openBefore = await listPaperPositions();
-      const closes = (await closeAllPaperPositions((secId, _sym) => this.market.getFillablePrice(secId, { allowClosed: true }) ?? this.market.getLtp(secId))) as any[];
+      const openBefore = await this.portfolio.getPositions();
+      const closes = (await this.portfolio.closeAll((secId, _sym) => this.market.getFillablePrice(secId, { allowClosed: true }) ?? this.market.getLtp(secId))) as any[];
       details.positionsClosed = closes.filter((c) => c && c.status === 'TRADED').length;
       for (const c of closes) {
         if (c && c.status === 'TRADED') {
@@ -233,20 +235,48 @@ export class RiskEngine {
    * nearest weekly expiry and a flat 15% IV — a coarse but honest estimate,
    * refreshed every evaluate() cycle rather than pretending precision it
    * doesn't have. */
+  /** A real DhanHQ trading symbol's exact string format is not the
+   * synthesized "<UNDERLYING><STRIKE><CE|PE>" shape the paper engine
+   * invents (see NormalizedPosition.strike's docstring) — but every
+   * broker's option symbol still names its underlying at the front, so a
+   * starts-with match against the known watchlist works for both. None of
+   * NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/SENSEX is a prefix of another, so
+   * this can't cross-match. */
+  private identifyUnderlying(tradingSymbol: string): string | null {
+    const sym = String(tradingSymbol || '').toUpperCase();
+    for (const key of Object.keys(INDEX_INSTRUMENTS)) {
+      if (key === 'INDIAVIX') continue; // not an options underlying
+      if (sym.startsWith(key)) return key;
+    }
+    return null;
+  }
+
   private estimatePortfolioDeltaNotional(positions: any[]): number {
     let deltaNotional = 0;
     for (const p of positions) {
       const netQty = Number(p.netQty ?? p.net_qty ?? 0);
       if (netQty === 0) continue;
-      const m = String(p.tradingSymbol || '').match(/^([A-Z]+?)(\d+)(CE|PE)$/);
-      if (!m) continue;
-      const [, underlying, strikeStr, optType] = m;
+
+      const underlying = this.identifyUnderlying(p.tradingSymbol);
+      if (!underlying) continue;
       const inst = (INDEX_INSTRUMENTS as any)[underlying];
-      if (!inst) continue;
       const spot = this.market.getLtp(inst.securityId);
       if (!spot) continue;
+
+      // Prefer the broker's own strike/optionType (real DhanHQ positions —
+      // see NormalizedPosition.strike) over parsing tradingSymbol, which
+      // only matches the paper engine's synthesized format.
+      let strike: number | null = p.strike ?? null;
+      let optType: 'CALL' | 'PUT' | null = p.optionType ?? null;
+      if (strike == null || optType == null) {
+        const m = String(p.tradingSymbol || '').match(/^([A-Z]+?)(\d+)(CE|PE)$/);
+        if (!m) continue;
+        strike = Number(m[2]);
+        optType = m[3] === 'CE' ? 'CALL' : 'PUT';
+      }
+
       const expiry = nearestIndexExpiry(underlying);
-      const g = calculateGreeks(spot, Number(strikeStr), expiry, optType === 'CE' ? 'CALL' : 'PUT', 0.15);
+      const g = calculateGreeks(spot, strike, expiry, optType, 0.15);
       deltaNotional += netQty * g.delta * spot;
     }
     return deltaNotional;
@@ -255,10 +285,14 @@ export class RiskEngine {
   async evaluate(): Promise<CircuitBreakerRow[]> {
     this.lastEvalAt = Date.now();
     const [wallet, positions, orderStats, strategies] = await Promise.all([
-      getPaperWallet(), listPaperPositions(), getTodayOrderStats(), listPaperStrategies(),
+      this.portfolio.getWallet(), this.portfolio.getPositions(), this.portfolio.getTodayOrderStats(), listPaperStrategies(),
     ]);
 
-    const unrealized = positions.reduce((acc, p) => acc + (Number(p.unrealizedPnl) || 0), 0);
+    // unrealizedProfit, not unrealizedPnl — the latter is a paper-only
+    // legacy alias db.ts's listPaperPositions() also sets; NormalizedPosition
+    // (broker mode included) only carries unrealizedProfit, matching the
+    // DhanHQ PositionResponse field name.
+    const unrealized = positions.reduce((acc, p) => acc + (Number(p.unrealizedProfit) || 0), 0);
     const dayPnl = Number(wallet.sessionRealizedPnl) + unrealized;
     const total = Number(wallet.totalBalance) || 1;
     const utilPct = (Number(wallet.usedMargin) / total) * 100;
