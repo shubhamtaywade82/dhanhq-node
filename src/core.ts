@@ -10,6 +10,8 @@ import { startTelegramNotifier } from './services/telegramNotifier';
 import { eventBus } from './services/eventBus';
 import { PaperExecutionEngine } from './engines/paper';
 import { LiveExecutionEngine } from './engines/live';
+import { marketClock } from './services/marketHours';
+import { hasHolidayCoverage } from './services/holidays';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -79,6 +81,15 @@ export async function startCore(): Promise<Core> {
   const selfHealing = new SelfHealingService();
   selfHealing.start();
   startTelegramNotifier();
+
+  // The holiday table is hand-maintained per calendar year (see holidays.ts)
+  // — running into an uncovered year would silently treat every day as
+  // tradeable again, which is exactly the bug this table exists to close.
+  // Loud at boot, not a per-cycle log spam source.
+  const todayIst = marketClock().istDate;
+  if (!hasHolidayCoverage(todayIst)) {
+    eventBus.log('ERROR', `No trading-holiday data for ${todayIst.slice(0, 4)} — market-closed days will NOT be detected. Update src/services/holidays.ts.`, 'core');
+  }
 
   await market.start();
   // risk/autonomy register their exit-signal and evaluation listeners here —
