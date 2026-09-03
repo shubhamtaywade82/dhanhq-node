@@ -9,7 +9,7 @@ import { EventEmitter } from 'events';
 import {
   initDatabase, dbMode, executePaperOrder, getPaperWallet,
   listPaperPositions, closeAllPaperPositions, markPositionsToMarket,
-  resetPaperWallet, pool, saveRiskState,
+  resetPaperWallet, pool, saveRiskState, reconcileLedger,
 } from '../db';
 
 /**
@@ -438,5 +438,14 @@ describe('Database layer — fallback mode honesty', () => {
 
   it('reports which persistence mode is active', () => {
     expect(['postgres', 'memory']).toContain(dbMode());
+  });
+
+  it('reconcileLedger no-ops in memory mode — nothing durable to compare mem against', async () => {
+    // This whole suite runs in memory mode (no TEST_DATABASE_URL) — the
+    // real Postgres-comparison path is covered separately in
+    // ledgerReconciler.test.ts, which requires a live database.
+    expect(dbMode()).toBe('memory');
+    const report = await reconcileLedger();
+    expect(report).toEqual({ ok: true, checkedPositions: 0, mismatches: [], missingInPostgres: [], missingInMem: [] });
   });
 });

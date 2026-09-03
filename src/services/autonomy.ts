@@ -9,6 +9,7 @@ import type { AgentOrchestrator } from './agent';
 import {
   listPaperStrategies, listPaperPositions, markPositionsToMarket,
   closePaperPosition, updatePaperStrategyStatus, getPaperWallet, pushAlert,
+  reconcileLedger, correctLedgerFromPostgres,
 } from '../db';
 
 /**
@@ -33,6 +34,7 @@ export class AutonomyEngine {
   private running = false;
   private lastCycleAt = 0;
   private lastScanAt = 0;
+  private lastLedgerCheckAt = 0;
   private cycles = 0;
   private eodDone = false;
   private eodDate = '';
@@ -126,6 +128,7 @@ export class AutonomyEngine {
           eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
         }
         await this.reconcileMonitor();
+        await this.reconcileLedgerAgainstPostgres();
         await this.publishPortfolioSnapshot();
         await this.enforceStrategyLimits();
 
@@ -260,6 +263,39 @@ export class AutonomyEngine {
       eventBus.log('WARN', `Reconciler: re-armed missing protection for ${key}`, 'autonomy');
       await pushAlert('WARN', 'autonomy', `Monitor/position drift corrected: re-armed protection for ${key}`);
     }
+  }
+
+  /**
+   * Compares the in-memory ledger (the read path every position/wallet
+   * query goes through) against what's actually durable in Postgres, once
+   * a minute — a handful of indexed queries, not worth running every 2s
+   * cycle. They're expected to always agree; a mismatch means a write
+   * silently diverged (a commit that appeared to fail but partially
+   * applied, a manual SQL change, a future bug that updates one store and
+   * not the other). Postgres is the durable source of truth, so every
+   * correction pulls mem back in line with it — consistent with the
+   * monitor/position reconciler above: auto-correct AND alert loudly,
+   * never silently.
+   */
+  private async reconcileLedgerAgainstPostgres(): Promise<void> {
+    if (Date.now() - this.lastLedgerCheckAt < 60_000) return;
+    this.lastLedgerCheckAt = Date.now();
+
+    const report = await reconcileLedger();
+    if (report.ok) return;
+
+    const summary = [
+      ...report.mismatches.map((m) => `${m.subject}.${m.field}: mem=${m.mem} pg=${m.postgres}`),
+      ...report.missingInPostgres.map((s) => `${s}: open in mem, no Postgres row`),
+      ...report.missingInMem.map((s) => `${s}: open in Postgres, missing from mem`),
+    ].join('; ');
+
+    eventBus.log('ERROR', `Ledger drift detected — correcting mem from Postgres: ${summary}`, 'autonomy');
+    await pushAlert('ERROR', 'autonomy', `Ledger drift corrected (Postgres wins): ${summary}`);
+    journal.append('risk_decision', { rule: 'Ledger Consistency', from: 'OK', to: 'ERROR', current: summary, threshold: 'mem === postgres', action: 'Corrected mem from Postgres' });
+
+    await correctLedgerFromPostgres(report);
+    await this.publishPortfolioSnapshot();
   }
 
   private async publishPortfolioSnapshot(): Promise<void> {
