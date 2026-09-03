@@ -4,6 +4,7 @@ import { marketClock, istNow } from './marketHours';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
 import type { AgentOrchestrator } from './agent';
+import { LongOptionPositionManager } from './longOptionPositionManager';
 import {
   listPaperStrategies, listPaperPositions, markPositionsToMarket,
   closePaperPosition, updatePaperStrategyStatus, getPaperWallet,
@@ -37,11 +38,13 @@ export class AutonomyEngine {
   private handledExits = new Set<string>();
   private unsubBus: Array<() => void> = [];
   private tickMarkScheduled = false;
+  readonly longOptionManager: LongOptionPositionManager;
 
   constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine) {
     this.client = client;
     this.market = market;
     this.risk = risk;
+    this.longOptionManager = new LongOptionPositionManager(market);
   }
 
   setAgent(agent: AgentOrchestrator): void {
@@ -87,6 +90,7 @@ export class AutonomyEngine {
     return {
       enabled: this.enabled,
       scanEnabled: this.scanEnabled,
+      longOptionPolicyEnabled: this.longOptionManager.isEnabled(),
       cycles: this.cycles,
       lastCycleAt: this.lastCycleAt ? new Date(this.lastCycleAt).toISOString() : null,
       lastCycleAgoSec: this.lastCycleAt ? Math.round((Date.now() - this.lastCycleAt) / 1000) : null,
@@ -118,6 +122,7 @@ export class AutonomyEngine {
         if (clock.isMarketOpen && mark.staleCount > 0) {
           eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
         }
+        await this.longOptionManager.evaluate(clock.squareOffWindow);
         await this.publishPortfolioSnapshot();
         await this.enforceStrategyLimits();
 
@@ -204,6 +209,7 @@ export class AutonomyEngine {
       this.tickMarkScheduled = false;
       try {
         await markPositionsToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
+        await this.longOptionManager.evaluate(marketClock().squareOffWindow);
         await this.publishPortfolioSnapshot();
       } catch { /* the 2s cycle below is the fallback */ }
     });

@@ -615,7 +615,7 @@ async function resolveMarginRequired(u: PositionUpdate, securityId: string, exch
 
 /** Per-fill F&O charges (not round-trip): brokerage on every fill, STT only
  * on the sell leg, stamp duty only on the buy leg — Indian options rules. */
-function calculateOrderCharges(side: 'BUY' | 'SELL', price: number, qty: number): number {
+export function calculateOrderCharges(side: 'BUY' | 'SELL', price: number, qty: number): number {
   const turnover = price * qty;
   const brokerage = 20;
   const stt = side === 'SELL' ? Number((turnover * 0.0010).toFixed(2)) : 0;

@@ -23,10 +23,10 @@ describe('Telegram notifier', () => {
     expect(chunks.join('')).toBe(longLine);
   });
 
-  it('forwards WARN, ERROR, and SYSTEM levels', () => {
-    expect(shouldForwardLog('WARN', 'risk_engine', 'anything')).toBe(true);
-    expect(shouldForwardLog('ERROR', 'paper_engine', 'anything')).toBe(true);
-    expect(shouldForwardLog('SYSTEM', 'core', 'anything')).toBe(true);
+  it('drops WARN, ERROR, and SYSTEM — those stay in the system logger, not Telegram', () => {
+    expect(shouldForwardLog('WARN', 'risk_engine', 'anything')).toBe(false);
+    expect(shouldForwardLog('ERROR', 'paper_engine', 'anything')).toBe(false);
+    expect(shouldForwardLog('SYSTEM', 'core', 'anything')).toBe(false);
   });
 
   it('drops INFO and TRADE except the autonomy EOD summary line', () => {

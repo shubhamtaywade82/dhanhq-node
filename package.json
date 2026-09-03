@@ -12,6 +12,7 @@
     "dev:frontend": "cd frontend && npm run dev",
     "dev:all": "npm run dev:server & npm run dev:frontend",
     "subscribe:indices": "ts-node scripts/subscribe-indices.ts",
+    "backtest:long-option-policy": "ts-node scripts/backtest-long-option-policy.ts",
     "test": "jest --forceExit"
   },
   "dependencies": {
