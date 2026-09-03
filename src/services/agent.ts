@@ -49,6 +49,42 @@ const idlePersonas = (): Record<AgentKey, { status: 'idle' | 'active'; steps: nu
   risk: { status: 'idle', steps: 0 }, critic: { status: 'idle', steps: 0 },
 });
 
+export type RegimeBucket = 'RANGE_BOUND_THETA' | 'BREAKOUT_MOMENTUM' | 'EXPIRY_GAMMA' | 'TRENDING_DRIFT';
+
+/**
+ * Which "professional institutional regime" bucket governs strategy
+ * selection in synthesizeStrategy() below — checked in this exact priority
+ * order (a range-bound/theta-selling setup and a breakout/momentum setup
+ * are both checked BEFORE the expiry-day override, so on expiry day with
+ * an ALSO-low vix, RANGE_BOUND_THETA fires first; that ordering predates
+ * this function and isn't something this extraction set out to change).
+ *
+ * Previously this checked analytics.regime against 'THETA_DECAY',
+ * 'RANGE_BOUND' and 'GAMMA_BLAST' — none of which analyzeOptionChain's
+ * classifyRegime() (optionsAnalytics.ts) ever produces; its real values are
+ * 'HIGH_IV_RANGE' | 'LOW_IV_TREND' | 'EXPIRY_GAMMA' | 'NEUTRAL'. Those three
+ * comparisons could never be true, so only the vix thresholds ever actually
+ * drove dispatch. Mapped to the real values here by matching STRATEGY
+ * INTENT, not by requiring the same vix range as the existing threshold —
+ * the two conditions in each OR are independent, complementary triggers for
+ * the same decision, not required to agree on IV direction:
+ *   - HIGH_IV_RANGE ("high IV, but contained") means rich premium with no
+ *     breakout brewing — the textbook setup to SELL defined-risk premium,
+ *     same decision the branch's own vix<13.5 heuristic (broad-market calm)
+ *     already made for a different reason.
+ *   - LOW_IV_TREND ("low IV, but trending" — vix<12.5 with a strong PCR
+ *     skew) means cheap premium with a directional catalyst already
+ *     emerging — the textbook setup to BUY premium ahead of a move, same
+ *     decision the branch's own vix>=15.5 heuristic (a breakout already
+ *     under way) already made for a different reason.
+ */
+export function classifyDispatchRegime(analyticsRegime: string | undefined, vix: number): RegimeBucket {
+  if (analyticsRegime === 'HIGH_IV_RANGE' || vix < 13.5) return 'RANGE_BOUND_THETA';
+  if (analyticsRegime === 'LOW_IV_TREND' || vix >= 15.5) return 'BREAKOUT_MOMENTUM';
+  if (analyticsRegime === 'EXPIRY_GAMMA') return 'EXPIRY_GAMMA';
+  return 'TRENDING_DRIFT';
+}
+
 export class AgentOrchestrator {
   private client: DhanClient;
   private market: MarketDataService;
@@ -358,8 +394,15 @@ export class AgentOrchestrator {
     if (obj.includes('vwap') || obj.includes('pullback')) return buildVwapPullbackStrategy(target, spot, rows, expiry, buyLots, direction);
 
     // ── Professional Institutional Regime Dispatcher ──
-    // 1. Low IV / Rangebound / Theta Trap Regime: Maximize Theta Decay with defined risk wings
-    if (analytics.regime === 'THETA_DECAY' || analytics.regime === 'RANGE_BOUND' || vix < 13.5) {
+    const regimeBucket = classifyDispatchRegime(analytics.regime, vix);
+
+    // 1. Range-Bound / Theta Trap Regime: Maximize Theta Decay with defined risk wings.
+    // Fires on EITHER analyzeOptionChain's own regime classifier reporting
+    // HIGH_IV_RANGE (rich premium, contained — the textbook sell setup) OR
+    // the simpler vix<13.5 heuristic (broad-market calm) — independent,
+    // complementary triggers for the same "sell defined-risk premium"
+    // decision, not required to agree on IV direction.
+    if (regimeBucket === 'RANGE_BOUND_THETA') {
       // vix<13.5 is broad-market IV; this index's own IV rank can already be
       // crushed even when overall VIX looks moderate — double-low means no
       // edge left to sell. Skip rather than force a bad trade.
@@ -369,14 +412,17 @@ export class AgentOrchestrator {
         || buildIronCondor(target, spot, rows, expiry, condorLots);
     }
 
-    // 2. High IV / Breakout / Gamma Blast Regime: Exploit Directional Momentum with defined risk
-    if (analytics.regime === 'GAMMA_BLAST' || vix >= 15.5) {
+    // 2. Breakout / Momentum Regime: Exploit Directional Momentum with defined risk.
+    // Fires on EITHER LOW_IV_TREND (cheap premium + an emerging directional
+    // skew — the textbook buy-ahead-of-a-move setup) OR the vix>=15.5
+    // heuristic (a breakout already underway) — same reasoning as above.
+    if (regimeBucket === 'BREAKOUT_MOMENTUM') {
       return buildOrbBuyingStrategy(target, spot, rows, expiry, buyLots, direction)
         || buildDebitSpread(target, direction, spot, rows, expiry, spreadLots);
     }
 
     // 3. Expiry Day Regime (0DTE Gamma Pin / Decay):
-    if (analytics.regime === 'EXPIRY_GAMMA') {
+    if (regimeBucket === 'EXPIRY_GAMMA') {
       if (ivTooLowToSell) return null;
       return buildIronButterfly(target, spot, rows, expiry, condorLots)
         || buildCreditSpread(target, direction, spot, rows, expiry, spreadLots);
