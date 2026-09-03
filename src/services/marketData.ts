@@ -126,10 +126,18 @@ export class MarketDataService {
         // monitoring, real-time UI) needs that far more than live OI, which
         // the option-chain page already refreshes via periodic REST anyway.
         ws.market.mode = 'ticker';
-        // Register subscriptions upfront so onOpen automatically transmits them
-        ws.market.subscribe(
-          INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
-        );
+        // Register subscriptions upfront so onOpen automatically transmits them.
+        // Every reconnect creates a fresh WS session with no memory of prior
+        // subscriptions — re-send extraSubscriptions (option legs of open
+        // positions) too, or every reconnect silently downgrades their SL/
+        // target monitoring from sub-second WS ticks to the 3-15s REST poll.
+        ws.market.subscribe([
+          ...INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
+          ...[...this.extraSubscriptions].map((k) => {
+            const [exchangeSegment, securityId] = k.split(':');
+            return { exchangeSegment, securityId };
+          }),
+        ]);
       }
       if (!this.wsListenersAttached) {
         this.wsListenersAttached = true;

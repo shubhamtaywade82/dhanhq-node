@@ -86,6 +86,43 @@ describe('Paper execution engine — real-LTP pricing policy', () => {
     }
   });
 
+  it('rejects a non-positive or non-integer quantity', async () => {
+    const { paper } = await stubEngines(100);
+    for (const quantity of [-50, 0, 1.5]) {
+      const result: any = await paper.placeOrder({
+        correlation_id: `test_bad_qty_${quantity}`,
+        intent_id: 'i_bad_qty',
+        params: { security_id: '44000', quantity, transaction_type: 'BUY', order_type: 'MARKET' },
+      });
+      expect(result.status).toBe('REJECTED');
+    }
+  });
+
+  it('re-arms PositionMonitor against the NET position, not the latest order (add-to fill)', async () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST, Tuesday
+    try {
+      const { paper, market } = await stubEngines(100);
+      // Distinct symbol so this test's position isn't polluted by another
+      // test in this file that also fills security '44000' under the
+      // default SEC_44000 symbol — netQty is keyed by symbol, not securityId.
+      await paper.placeOrder({
+        correlation_id: 'test_addto_1', intent_id: 'i3',
+        params: { security_id: '44000', symbol: 'ADDTOTEST', quantity: 50, transaction_type: 'BUY', order_type: 'MARKET' },
+        risk_limits: { stop_loss: 90 },
+      });
+      await paper.placeOrder({
+        correlation_id: 'test_addto_2', intent_id: 'i3',
+        params: { security_id: '44000', symbol: 'ADDTOTEST', quantity: 30, transaction_type: 'BUY', order_type: 'MARKET' },
+        risk_limits: { stop_loss: 90 },
+      });
+      const tracked = market.monitor.tracked().find((p: any) => p.securityId === '44000');
+      expect(tracked?.quantity).toBe(80); // net of both fills, not just the second order's 30
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('REJECTS orders while the kill switch is engaged', async () => {
     const { paper, risk } = await stubEngines(100);
     await risk.armKillSwitch('test kill');
@@ -97,6 +134,65 @@ describe('Paper execution engine — real-LTP pricing policy', () => {
     expect(result.status).toBe('REJECTED');
     expect(String(result.reason)).toMatch(/kill switch/i);
     await risk.disarmKillSwitch();
+  });
+});
+
+describe('Money-path math — fees, margin, sign flips', () => {
+  beforeAll(async () => { await initDatabase(); });
+  beforeEach(async () => { await resetPaperWallet(100000); });
+  afterAll(async () => { await resetPaperWallet(100000); });
+
+  it('charges brokerage+stampDuty+exchange+GST on a BUY, brokerage+STT+exchange+GST on a SELL', async () => {
+    const buy = await executePaperOrder({ symbol: 'FEETEST', securityId: '44000', quantity: 50, transactionType: 'BUY', price: 100 });
+    // turnover 5000: brokerage 20 + stampDuty 0.15 + exchange 2.5 + sebiFee ~0 + GST 18% of (20+2.5) = 4.05
+    expect((buy as any).charges).toBeCloseTo(26.70, 2);
+
+    const sell = await executePaperOrder({ symbol: 'FEETEST2', securityId: '44001', quantity: 50, transactionType: 'SELL', price: 100 });
+    // turnover 5000: brokerage 20 + STT 5.00 + exchange 2.5 + sebiFee ~0 + GST 4.05, no stamp duty
+    expect((sell as any).charges).toBeCloseTo(31.55, 2);
+  });
+
+  it('blocks full premium on a long open, the resolver-provided multiple on a short open', async () => {
+    await executePaperOrder({ symbol: 'MARGINLONG', securityId: '44000', quantity: 10, transactionType: 'BUY', price: 100 });
+    const wLong = await getPaperWallet();
+    expect(wLong.usedMargin).toBeCloseTo(1000, 2); // full premium, no leverage
+
+    await resetPaperWallet(100000);
+    await executePaperOrder({ symbol: 'MARGINSHORT', securityId: '44001', quantity: 10, transactionType: 'SELL', price: 100 });
+    const wShort = await getPaperWallet();
+    expect(wShort.usedMargin).toBeCloseTo(10000, 2); // defaultMarginResolver's 10x fallback multiple
+  });
+
+  it('handles a same-fill sign flip (long to short) with correct realized PnL and resulting side', async () => {
+    await executePaperOrder({ symbol: 'FLIPTEST', securityId: '44000', quantity: 50, transactionType: 'BUY', price: 100 });
+    await executePaperOrder({ symbol: 'FLIPTEST', securityId: '44000', quantity: 80, transactionType: 'SELL', price: 110 });
+    const pos = (await listPaperPositions()).find((p: any) => p.tradingSymbol === 'FLIPTEST');
+    expect(pos?.netQty).toBe(-30); // 50 long closed, 30 short opened in the same fill
+    expect(pos?.sellAvg).toBeCloseTo(110, 2);
+    const w = await getPaperWallet();
+    expect(w.realizedPnl).toBeCloseTo(500, 2); // (110-100)*50 on the closed portion only
+  });
+
+  it('rejects a non-marketable LIMIT order instead of filling at an arbitrary price', async () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST, Tuesday
+    try {
+      const { paper } = await stubEngines(100); // live LTP = 100
+      const notMarketable = await paper.placeOrder({
+        correlation_id: 'test_limit_bad', intent_id: 'i_limit',
+        params: { security_id: '44000', quantity: 50, transaction_type: 'BUY', order_type: 'LIMIT', price: 90 }, // BUY limit below LTP
+      });
+      expect(notMarketable.status).toBe('REJECTED');
+
+      const marketable = await paper.placeOrder({
+        correlation_id: 'test_limit_ok', intent_id: 'i_limit',
+        params: { security_id: '44000', quantity: 50, transaction_type: 'BUY', order_type: 'LIMIT', price: 105 }, // BUY limit above LTP — marketable
+      });
+      expect(marketable.status).toBe('TRADED');
+      expect((marketable as any).fill_price).toBeLessThanOrEqual(100.05); // filled at the better of {LTP, limit} + slippage, not at 105
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 

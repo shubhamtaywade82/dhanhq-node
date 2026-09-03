@@ -151,14 +151,18 @@ export class PaperExecutionEngine {
     eventBus.emit('order', { kind: 'fill', ...fillPayload });
     await redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
-    // Stop-loss / target / trailing monitoring via SDK PositionMonitor,
-    // fed by MarketDataService ticks (live, not dead code anymore).
-    if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {
+    // Stop-loss / target / trailing monitoring via SDK PositionMonitor, fed
+    // by MarketDataService ticks. Uses the FILL's resulting net position
+    // (result.netQty/avgPrice), not this order's own quantity/fillPrice —
+    // those only coincide when the order opens a flat position; an add-to
+    // or a same-order sign flip would otherwise arm the monitor against a
+    // position that doesn't match the account's actual net exposure.
+    if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target) && result.netQty !== 0) {
       this.monitor.track({
         securityId: String(security_id),
         exchangeSegment: params.exchange_segment || 'NSE_FNO',
-        quantity,
-        entryPrice: fillPrice,
+        quantity: result.netQty,
+        entryPrice: result.avgPrice,
         stopLoss: risk_limits.stop_loss,
         target: risk_limits.target,
         trail: risk_limits.trailing_stop,

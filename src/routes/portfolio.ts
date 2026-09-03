@@ -120,6 +120,9 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       if (!symbol || !quantity || !transactionType) {
         return res.status(400).json({ error: 'symbol, quantity, and transactionType are required' });
       }
+      if (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0 || !Number.isInteger(Number(quantity))) {
+        return res.status(400).json({ error: 'quantity must be a positive integer' });
+      }
       if (!paper) {
         return res.status(503).json({ error: 'Paper execution engine not available' });
       }
@@ -187,7 +190,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
         let totalPnl = 0;
         const legs = (s.legs || []).map((l: any) => {
           const p = posMap.get(l.instrument);
-          const ltp = p ? p.ltp : l.ltp || l.bAvg || l.sAvg || 0;
+          const ltp = p ? p.ltp : l.ltp || l.price || 0;
           const pnl = p ? p.pnl : 0;
           totalPnl += pnl;
           return { ...l, ltp, pnl };

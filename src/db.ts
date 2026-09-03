@@ -716,6 +716,9 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
   if (!fillPrice || fillPrice <= 0) {
     throw new Error('Fill price required — paper orders must be priced from live market LTP (pass explicit price for LIMIT orders)');
   }
+  if (!Number.isInteger(qty) || qty <= 0) {
+    throw new Error(`Invalid quantity ${input.quantity} — must be a positive integer`);
+  }
 
   const latencyMs = Math.max(1, Date.now() - t0 + Math.floor(Math.random() * 20));
   const charges = calculateOrderCharges(input.transactionType, fillPrice, qty);
@@ -779,7 +782,15 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
   pushOrderToMem(orderId, sym, securityId, exchangeSegment, input, qty, fillPrice, latencyMs, u.realized, charges);
   applyFillToMem(sym, u, newRealized, fillPrice, marginRequired, input, charges);
 
-  return { orderId, symbol: sym, side: input.transactionType, quantity: qty, fillPrice, charges, status: 'TRADED', latencyMs };
+  return {
+    orderId, symbol: sym, side: input.transactionType, quantity: qty, fillPrice, charges, status: 'TRADED', latencyMs,
+    // The resulting NET position after this fill — distinct from `quantity`
+    // (this order's qty) and `fillPrice` (this order's price), which are
+    // only equal to the position's own state for a fill into a flat position.
+    // A caller re-arming stop/target monitoring needs these, not the order's.
+    netQty: u.netQty,
+    avgPrice: u.netQty > 0 ? u.buyAvg : u.netQty < 0 ? u.sellAvg : 0,
+  };
 }
 
 export async function closePaperPosition(symbol: string, currentLtp?: number, marginResolver?: MarginResolver) {
