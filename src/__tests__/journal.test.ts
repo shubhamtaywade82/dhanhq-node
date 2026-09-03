@@ -104,6 +104,38 @@ describe('Journal', () => {
     await j.close();
   });
 
+  it('self-opening on first append still continues the seq from an existing file, not restart at 1', async () => {
+    // Regression test: append() used to compute `seq: ++this.seq` BEFORE
+    // checking whether it needed to self-open. On a fresh Journal instance
+    // (this.seq starts at 0) writing into a day that already has entries
+    // from an earlier boot, that built the entry with seq 1 — then the
+    // self-open call immediately after reset seq to 0 and re-derived it
+    // from the file's real max (e.g. 57), leaving the counter at 57 for
+    // every SUBSEQUENT append while the entry just written stayed
+    // mislabeled seq 1, duplicating an existing line's sequence number.
+    // No explicit date on either side — both open() (first) and append()'s
+    // internal self-open (second) resolve today's real IST date the same
+    // way, so they land in the same file. Passing a hardcoded date to only
+    // one side would make them write to different files and pass for the
+    // wrong reason.
+    const first = new Journal();
+    first.open();
+    const todaysDate = first.currentSessionDate();
+    first.append('order_intent', { correlation_id: 'a' });
+    first.append('order_result', { correlation_id: 'a', status: 'TRADED' });
+    await first.close(); // day so far ends at seq 2, file closed — simulates process exit
+
+    const second = new Journal(); // simulates a restart — open() not called yet
+    const entry = second.append('kill', { action: 'arm' }); // self-opens internally
+    expect(entry.seq).toBe(3); // continues from the file's max, not 1
+    await second.close();
+
+    const raw = readFileSync(join(dir, `${second.currentSessionDate()}.ndjson`), 'utf8');
+    expect(second.currentSessionDate()).toEqual(todaysDate);
+    const seqs = raw.trim().split('\n').map((l) => JSON.parse(l).seq);
+    expect(seqs).toEqual([1, 2, 3]); // no duplicate/out-of-order seq
+  });
+
   it('close() resolves only once the write stream has actually finished, not merely scheduled', async () => {
     // The bug this guards against: close() used to return void immediately
     // after calling stream.end() (which only SCHEDULES the flush) — a

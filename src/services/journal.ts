@@ -116,13 +116,17 @@ export class Journal {
    * journaling is worth journaling durably before this function returns,
    * not batched and lost if the process dies in the next few seconds. */
   append<T>(kind: JournalKind, payload: T): JournalEntry<T> {
-    const entry: JournalEntry<T> = { seq: ++this.seq, ts: Date.now(), kind, payload };
     if (!this.stream) {
       // Never silently drop a decision because open() wasn't called yet —
       // that would defeat the entire point during exactly the boot window
-      // most likely to have surprises.
+      // most likely to have surprises. Must happen BEFORE seq is read below:
+      // open() resets seq to 0 and re-derives it from the existing file, so
+      // computing seq first would build the entry with a stale number that
+      // open() then clobbers the counter behind — writing a duplicate,
+      // out-of-order seq into the file instead of the next real one.
       this.open();
     }
+    const entry: JournalEntry<T> = { seq: ++this.seq, ts: Date.now(), kind, payload };
     try {
       this.stream!.write(JSON.stringify(entry) + '\n');
     } catch (e: any) {
