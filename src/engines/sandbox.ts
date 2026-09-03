@@ -75,4 +75,30 @@ export class SandboxExecutionEngine {
     this.market.addInstruments([{ securityId: String(security_id), exchangeSegment: exchange_segment }]);
     return { status: (settled as any).orderStatus || 'TRADED', orderId, ...fillPayload };
   }
+
+  /**
+   * Reverses a filled leg via a real MARKET order at the Sandbox account —
+   * used to unwind a partial multi-leg fill. Deliberately bypasses
+   * risk.canTrade(): an exit must keep working while the entry gate blocks
+   * new orders (kill switch, system not READY), same as PortfolioSource.
+   * closePosition() does for paper/live. Sandbox fills live only at the
+   * Dhan Sandbox account — never in PortfolioSource — so unwinding here
+   * cannot go through portfolio.closePosition() like the other two modes.
+   */
+  async closeLeg(leg: { securityId: string; exchangeSegment?: string; qty: number; side: 'BUY' | 'SELL'; instrument?: string }, price: number): Promise<{ status: string; orderId?: string }> {
+    const placed = await this.client.orders.place({
+      correlationId: `unwind_${leg.securityId}_${Date.now()}`,
+      securityId: String(leg.securityId),
+      exchangeSegment: (leg.exchangeSegment || 'NSE_FNO') as any,
+      transactionType: leg.side === 'BUY' ? 'SELL' : 'BUY',
+      orderType: 'MARKET',
+      quantity: leg.qty,
+      price,
+      productType: 'INTRADAY',
+    }).catch(() => null);
+    if (!placed) return { status: 'REJECTED' };
+    const orderId = placed.data.orderId;
+    const settled = await this.client.orders.getById(orderId).catch(() => placed.data);
+    return { status: (settled as any).orderStatus || 'TRADED', orderId };
+  }
 }

@@ -1,4 +1,5 @@
 import { RiskEngine, DEFAULT_RISK_LIMITS } from '../services/riskEngine';
+import { getSystemState, setSystemState } from '../services/systemState';
 import { MarketDataService } from '../services/marketData';
 import { AgentOrchestrator } from '../services/agent';
 import { PaperExecutionEngine } from '../engines/paper';
@@ -212,6 +213,22 @@ describe('RiskEngine — real-state circuit breakers', () => {
     // A fresh wallet is far from the daily loss limit.
     const daily = rows.find((r) => r.rule === 'Daily Loss Limit')!;
     expect(daily.state).toBe('OK');
+  });
+
+  it('canTrade() refuses new entries while the system is not READY, independent of the kill switch/EOD checks', async () => {
+    // A fresh, un-mocked RiskEngine — stubEngines() mocks canTrade() for
+    // every OTHER test in this file to decouple them from wall-clock
+    // EOD/kill-switch state, which would also hide this gate.
+    const risk = new RiskEngine(stubClient(), stubMarket(100));
+    const priorState = getSystemState();
+    try {
+      setSystemState('DEGRADED', 'test');
+      const gate = risk.canTrade();
+      expect(gate.allowed).toBe(false);
+      expect(gate.reason).toMatch(/not ready/i);
+    } finally {
+      setSystemState(priorState);
+    }
   });
 
   it('arms the kill switch when the daily loss limit is breached', async () => {

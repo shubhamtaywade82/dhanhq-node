@@ -49,6 +49,9 @@
     "forceExit": true,
     "testMatch": [
       "<rootDir>/src/**/__tests__/**/*.test.ts"
+    ],
+    "setupFilesAfterEnv": [
+      "<rootDir>/src/__tests__/setup.ts"
     ]
   }
 }

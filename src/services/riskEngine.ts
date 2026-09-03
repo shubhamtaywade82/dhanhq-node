@@ -7,6 +7,7 @@ import { INDEX_INSTRUMENTS } from './marketData';
 import { nearestIndexExpiry } from './marketHours';
 import { calculateGreeks } from './optionsAnalytics';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
+import { getSystemState } from './systemState';
 import {
   pushAlert, getRiskState, saveRiskState,
   listPaperStrategies, updatePaperStrategyStatus,
@@ -164,6 +165,8 @@ export class RiskEngine {
 
   /** Gate every order (paper or live) through this. */
   canTrade(): { allowed: boolean; reason?: string } {
+    const state = getSystemState();
+    if (state !== 'READY') return { allowed: false, reason: `System not ready (state=${state})` };
     if (this.killed) return { allowed: false, reason: 'Kill switch engaged' };
     const clock = marketClock();
     if (clock.squareOffWindow) return { allowed: false, reason: 'EOD square-off window — no new entries' };

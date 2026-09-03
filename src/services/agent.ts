@@ -7,17 +7,34 @@ import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules } 
 import { INDEX_INSTRUMENTS } from './marketData';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { LiveExecutionEngine } from '../engines/live';
-import type { SandboxExecutionEngine } from '../engines/sandbox';
+import { SandboxExecutionEngine } from '../engines/sandbox';
 import { analyzeOptionChain, recordIvSample, getIvRank, selectStrikeByDelta } from './optionsAnalytics';
 import {
   buildIronCondor, buildIronButterfly, buildCreditSpread, buildDebitSpread,
   buildStraddle, buildStrangle, buildOrbBuyingStrategy, buildOrb30mStrategy,
   buildVwapPullbackStrategy, evaluateStrategyBacktest, calculateCapitalAllocationLots, getLotSize,
-  resolveNearestExpiry, type ConstructedStrategy
+  resolveNearestExpiry, type ConstructedStrategy, type StrategyLeg
 } from './strategyConstructor';
 import { analyzeOptionsBehavior } from '../routes/market';
 
 export type AgentKey = 'planner' | 'analyst' | 'strategy' | 'execution' | 'risk' | 'critic';
+
+export interface TradeProposal {
+  proposalId: string;
+  target: string;
+  strategy: ConstructedStrategy;
+  regime: string;
+  score: number;
+  backtest: {
+    winRate: number;
+    profitFactor: number;
+    totalDays: number;
+    passedValidation: boolean;
+  };
+  thesis: string;
+  confidence: number;
+  createdAt: string;
+}
 
 export interface AgentStep {
   id: string;
@@ -84,6 +101,77 @@ export function classifyDispatchRegime(analyticsRegime: string | undefined, vix:
   if (analyticsRegime === 'LOW_IV_TREND' || vix >= 15.5) return 'BREAKOUT_MOMENTUM';
   if (analyticsRegime === 'EXPIRY_GAMMA') return 'EXPIRY_GAMMA';
   return 'TRENDING_DRIFT';
+}
+
+type ExecutionEngine = PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine;
+
+/**
+ * Places every leg of a multi-leg strategy through ONE engine (paper, live,
+ * or sandbox — all share the same `placeOrder(intent)` shape) and unwinds
+ * on a partial fill. Previously duplicated: PaperExecutionEngine had its
+ * own copy (deployStrategy/unwindPartialLegs), live/sandbox had a second,
+ * hand-maintained copy inline here — a fix to one never reached the other.
+ */
+async function deployMultiLeg(
+  engine: ExecutionEngine, strat: ConstructedStrategy, runId: string,
+  market: MarketDataService, risk: RiskEngine,
+): Promise<{ status: 'TRADED' | 'FAILED'; legsFilled?: number; reason?: string }> {
+  const filledLegs: StrategyLeg[] = [];
+  for (const leg of strat.legs) {
+    const res = await engine.placeOrder({
+      correlation_id: `${strat.id}_${leg.securityId}`,
+      intent_id: `${runId}_${leg.securityId}`,
+      params: {
+        security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
+        transaction_type: leg.side, order_type: 'MARKET', exchange_segment: leg.exchangeSegment || 'NSE_FNO',
+        product_type: 'INTRADAY', price: leg.price,
+      },
+      risk_limits: { stop_loss: leg.stopLoss, target: leg.target, trailing_stop: leg.trailingStop },
+    });
+    if (res && (res.status === 'TRADED' || res.orderId)) filledLegs.push(leg);
+    else break;
+  }
+
+  if (filledLegs.length > 0 && filledLegs.length < strat.legs.length) {
+    await unwindLegs(engine, filledLegs, market, risk);
+    return { status: 'FAILED', reason: 'partial_fill_unwound' };
+  }
+  if (filledLegs.length === strat.legs.length && filledLegs.length > 0) {
+    return { status: 'TRADED', legsFilled: filledLegs.length };
+  }
+  return { status: 'FAILED', reason: 'all_legs_rejected' };
+}
+
+/**
+ * Closes each already-filled leg after a partial multi-leg fill. Deliberately
+ * bypasses risk.canTrade() (an exit must work even when the entry gate is
+ * blocked — kill switch, system not READY) — same as EOD square-off and the
+ * kill switch's own closeAll().
+ *
+ * Sandbox is the odd one out: a sandbox fill lives only at the real Dhan
+ * Sandbox account, never in PortfolioSource (which — for a non-'live' mode —
+ * is the LOCAL PAPER ledger). Closing it through portfolio.closePosition()
+ * would silently "close" a paper position that was never opened while the
+ * real sandbox leg stays live — so sandbox unwinds through the engine's own
+ * closeLeg() (a real reversing order), not PortfolioSource.
+ */
+async function unwindLegs(engine: ExecutionEngine, filledLegs: StrategyLeg[], market: MarketDataService, risk: RiskEngine): Promise<void> {
+  const portfolio = risk.getPortfolio();
+  for (const leg of filledLegs) {
+    const unwindPrice = market.getFillablePrice(leg.securityId, { allowClosed: true }) ?? leg.price;
+    const result = engine instanceof SandboxExecutionEngine
+      ? await engine.closeLeg({ securityId: leg.securityId, exchangeSegment: leg.exchangeSegment, qty: leg.qty, side: leg.side, instrument: leg.instrument }, unwindPrice).catch((e: any) => ({ status: 'REJECTED', reason: e.message }))
+      : await portfolio.closePosition(leg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
+
+    if (result.status === 'TRADED') {
+      market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
+    } else {
+      // Untracking on a failed unwind would leave an unhedged position
+      // without stop-loss protection.
+      eventBus.log('ERROR', `Unwind FAILED for leg ${leg.instrument}: ${result.status}${(result as any).reason ? ` (${(result as any).reason})` : ''}`, 'agent');
+    }
+  }
+  eventBus.log('ERROR', `Multi-leg deploy partially filled (${filledLegs.length}) — unwound`, 'agent');
 }
 
 export class AgentOrchestrator {
@@ -301,6 +389,19 @@ export class AgentOrchestrator {
 
       const strategy = best?.strategy || null;
       const bt = best?.bt || { winRate: 0, totalDays: 0, totalPnlInr: 0, profitFactor: 0, passedValidation: false };
+
+      const proposal: TradeProposal | null = best && strategy ? {
+        proposalId: `prop_${runId}`,
+        target: best.target,
+        strategy,
+        regime: best.analytics?.regime || 'NEUTRAL',
+        score: best.score,
+        backtest: bt,
+        thesis: `Top candidate on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${bt.winRate}%, PF: ${bt.profitFactor})`,
+        confidence: Number(Math.min(0.95, Math.max(0.1, (best.score / 100))).toFixed(2)),
+        createdAt: new Date().toISOString(),
+      } : null;
+
       this.step(runId, 'strategy', 'ACT', `Selected Strategy: ${strategy?.name || 'NONE'} (${strategy?.lots || 0} lots) | Backtest: ${bt.winRate}% win rate across ${bt.totalDays}d (PF: ${bt.profitFactor})`, {
         tool: 'strategy.backtest', response: JSON.stringify({ winRate: bt.winRate, pnl: bt.totalPnlInr, pf: bt.profitFactor, pass: bt.passedValidation }),
       });
@@ -319,8 +420,21 @@ export class AgentOrchestrator {
         tool: 'risk_engine.evaluate', response: JSON.stringify({ allowed: gate.allowed, tripped: tripped.length, backtestPass: isBacktestPassing }),
       });
 
+      const approved = gate.allowed && tripped.length === 0 && isBacktestPassing;
+      // Emitted AFTER the risk gate resolves (not at strategy-selection time)
+      // so the proposal reflects whether the trade was actually approved,
+      // not just what the strategy engine picked before risk had a say.
+      if (proposal) {
+        eventBus.emit('system', {
+          type: 'trade_proposal',
+          proposal,
+          approved,
+          reason: approved ? undefined : (!gate.allowed ? gate.reason : 'statistical edge below threshold'),
+        });
+      }
+
       // 5. EXECUTION
-      const executed = await this.executeStrategy(runId, objective, strategy, gate.allowed && tripped.length === 0 && isBacktestPassing);
+      const executed = await this.executeStrategy(runId, objective, strategy, approved);
 
       // 6. CRITIC
       await this.reason(runId, 'critic', 'Review trading run & backtest metrics.', JSON.stringify({ executed: executed.status, backtest: bt }),
@@ -451,66 +565,20 @@ export class AgentOrchestrator {
     this.market.addInstruments(strat.legs.map((l) => ({ securityId: l.securityId, exchangeSegment: l.exchangeSegment || 'NSE_FNO' })));
     const mode = process.env.TRADING_MODE;
     const engine = mode === 'live' ? this.live : mode === 'sandbox' && this.sandbox ? this.sandbox : this.paper;
-    const filledLegs: typeof strat.legs = [];
-    for (const leg of strat.legs) {
-      const res = await engine.placeOrder({
-        correlation_id: `${strat.id}_${leg.optionType}_${leg.strike}`,
-        intent_id: runId,
-        params: {
-          security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
-          transaction_type: leg.side, order_type: 'MARKET', exchange_segment: leg.exchangeSegment || 'NSE_FNO',
-          product_type: 'INTRADAY', price: leg.price,
-        },
-        risk_limits: {
-          stop_loss: leg.stopLoss,
-          target: leg.target,
-          trailing_stop: leg.trailingStop,
-        },
-      });
-      if (res && (res.status === 'TRADED' || res.orderId)) {
-        filledLegs.push(leg);
-      } else {
-        // Stop rather than keep filling — more legs into a broken structure
-        // is more exposure to unwind, not less.
-        break;
-      }
-    }
 
-    if (filledLegs.length > 0 && filledLegs.length < strat.legs.length) {
-      // Partial fill on a multi-leg structure is worse than no fill — e.g. a
-      // short leg filling without its hedge is naked, undefined risk. Unwind
-      // whatever filled rather than leaving it to stand.
-      //
-      // Goes through PortfolioSource.closePosition(), NOT engine.placeOrder()
-      // — placeOrder() re-checks risk.canTrade(), the SAME gate whose
-      // failure typically caused THIS partial fill (a breaker tripping
-      // between legs, or the kill switch arming). A risk-REDUCING close must
-      // never be blocked by the entry gate; closePosition() (paper and
-      // broker alike) doesn't check it.
-      const portfolio = this.risk.getPortfolio();
-      for (const leg of filledLegs) {
-        const unwindPrice = this.market.getFillablePrice(leg.securityId, { allowClosed: true }) ?? leg.price;
-        const result = await portfolio.closePosition(leg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
-        if (result.status === 'TRADED') {
-          this.market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
-        } else {
-          // Untracking here would strip stop-loss/target from a leg that is
-          // STILL open — the same mistake fixed in RiskEngine.armKillSwitch
-          // for the exact same reason.
-          eventBus.log('ERROR', `Unwind FAILED for leg ${leg.instrument}: ${result.status}${(result as any).reason ? ` (${(result as any).reason})` : ''} — still open, protection left tracked`, 'agent');
-        }
+    const deployResult = await deployMultiLeg(engine, strat, runId, this.market, this.risk);
+    if (deployResult.status === 'TRADED') {
+      // Only paper mode persists a strategy record here — live/sandbox
+      // orders already live at the broker's own order book, matching the
+      // behavior this replaces (neither previously called createPaperStrategy).
+      if (engine === this.paper) {
+        await createPaperStrategy({ id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots, legs: strat.legs });
       }
-      eventBus.log('ERROR', `Multi-leg deploy ${strat.name} partially filled (${filledLegs.length}/${strat.legs.length}) — unwound`, 'agent');
-      this.step(runId, 'execution', 'ACT', `Strategy ${strat.name} partial fill unwound (${filledLegs.length}/${strat.legs.length})`);
-      return { status: 'FAILED', reason: 'partial_fill_unwound' };
+      this.step(runId, 'execution', 'ACT', `Strategy deployed: ${strat.name} (${deployResult.legsFilled}/${strat.legs.length} legs filled)`);
+    } else {
+      this.step(runId, 'execution', 'ACT', `Strategy ${strat.name} deployment failed: ${deployResult.reason || 'rejected'}`);
     }
-
-    if (filledLegs.length === strat.legs.length && filledLegs.length > 0) {
-      await createPaperStrategy({ id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots, legs: strat.legs });
-      this.step(runId, 'execution', 'ACT', `Strategy deployed: ${strat.name} (${filledLegs.length}/${strat.legs.length} legs filled)`);
-      return { status: 'TRADED', strategyId: strat.id, legsFilled: filledLegs.length };
-    }
-    return { status: 'FAILED' };
+    return deployResult;
   }
 
   private async backtestCandidate(target: string, secId: string, strat: ConstructedStrategy | null) {

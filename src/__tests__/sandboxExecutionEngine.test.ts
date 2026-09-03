@@ -43,3 +43,27 @@ describe('SandboxExecutionEngine.placeOrder', () => {
     expect(client.orders.place).not.toHaveBeenCalled();
   });
 });
+
+describe('SandboxExecutionEngine.closeLeg', () => {
+  function setup(settled: { orderStatus: string }) {
+    const client = stubClient();
+    jest.spyOn(client.orders, 'place').mockResolvedValue({ correlationId: 'c1', data: { orderId: 'sbx-close' } } as any);
+    jest.spyOn(client.orders, 'getById').mockResolvedValue(settled as any);
+    const market = new MarketDataService(client);
+    const risk = new RiskEngine(client, market);
+    const sandbox = new SandboxExecutionEngine(client, market, risk);
+    return { sandbox, client, risk };
+  }
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('places a reversing order and bypasses risk.canTrade() — unwinding a partial fill must work even when entries are blocked', async () => {
+    const { sandbox, client, risk } = setup({ orderStatus: 'TRADED' });
+    jest.spyOn(risk, 'canTrade').mockReturnValue({ allowed: false, reason: 'kill switch armed' });
+
+    const res = await sandbox.closeLeg({ securityId: '11111', qty: 50, side: 'BUY', instrument: 'NIFTY24000CE' }, 100);
+
+    expect(res.status).toBe('TRADED');
+    expect(client.orders.place).toHaveBeenCalledWith(expect.objectContaining({ transactionType: 'SELL', quantity: 50 }));
+  });
+});

@@ -16,6 +16,7 @@ import { marketClock } from './services/marketHours';
 import { hasHolidayCoverage } from './services/holidays';
 import { journal, summarizeDay, type JournalEntry } from './services/journal';
 import { PaperPortfolioSource, BrokerPortfolioSource, type PortfolioSource } from './services/portfolioSource';
+import { getSystemState, setSystemState } from './services/systemState';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -85,8 +86,10 @@ export async function startCore(): Promise<Core> {
     );
   }
 
+  setSystemState('BOOTING', 'Initializing database and clients');
   await initDatabase();
   const client = await createDhanClient();
+  setSystemState('SYNCING', 'Dhan client connected');
 
   const market = new MarketDataService(client);
   // The ONE place TRADING_MODE picks which account this whole stack reads/
@@ -153,11 +156,16 @@ export async function startCore(): Promise<Core> {
   // tick; seedStandardStrategies does slow network calls, so starting these
   // after it (as before) left a real window where a fired exit signal had
   // no listener yet and was silently lost.
+  setSystemState('RECONCILING', 'Reconciling ledger and arming positions');
   await risk.start();
   await crossCheckJournalOnBoot(priorEntries, risk);
   await autonomy.start();
   await seedExistingPositions(market, market.monitor);
   await seedStandardStrategies(client, market, paper);
+
+  if (getSystemState() === 'RECONCILING') {
+    setSystemState('READY', 'Core initialization complete');
+  }
 
   eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
@@ -184,6 +192,7 @@ export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk
     const msg = `Boot cross-check: journal recorded ${missing.length} trade(s) today with no matching durable order record (${missing.join(', ')}) — something may have altered the ledger outside the normal fill path`;
     eventBus.log('ERROR', msg, 'core');
     await pushAlert('ERROR', 'core', msg);
+    setSystemState('DEGRADED', `Missing durable orders: ${missing.length}`);
   }
 
   if (summary.lastKillAction === 'arm' && !risk.isKilled()) {
