@@ -532,7 +532,17 @@ export class MarketDataService {
     if (!clock.isMarketOpen && !opts.allowClosed) return null;
     const snap = this.quotes.get(String(securityId));
     if (!snap || !snap.ltp || snap.ltp <= 0) return null;
-    const maxAgeMs = opts.maxAgeMs ?? 15_000;
+    // schedulePolling() backs the REST poll interval off to 30s off-hours
+    // (vs 3s during market hours) — a 15s bound tuned for live market-hours
+    // fills rejected the SAME still-freshest-available quote for roughly
+    // half of every 30s off-hours cycle, purely by timing luck: whether
+    // seedStandardStrategies' spot lookups, EOD square-off, or the kill
+    // switch's close-all price happened to run just after a poll (fresh)
+    // or just before the next one (same value, now "stale"). allowClosed
+    // callers are explicitly the off-hours-tolerant ones, so give them a
+    // bound comfortably above that poll interval instead of silently
+    // inheriting the market-hours-tuned default.
+    const maxAgeMs = opts.maxAgeMs ?? (opts.allowClosed ? 40_000 : 15_000);
     if (Date.now() - snap.updatedAt > maxAgeMs) return null;
     return snap.ltp;
   }

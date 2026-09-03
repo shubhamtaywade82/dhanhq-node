@@ -395,6 +395,59 @@ describe('MarketDataService — WebSocket failover', () => {
   });
 });
 
+describe('getFillablePrice — off-hours freshness bound (allowClosed)', () => {
+  // Regression coverage: schedulePolling() backs the REST poll interval off
+  // to 30s off-hours (vs 3s during market hours), but getFillablePrice's
+  // default maxAgeMs was a flat 15s regardless of allowClosed — rejecting
+  // the SAME still-freshest-available off-hours quote for roughly half of
+  // every 30s poll cycle, purely by timing luck. Affected real callers:
+  // seedStandardStrategies' spot lookups, EOD square-off, and the kill
+  // switch's close-all price all call with allowClosed:true and no
+  // explicit maxAgeMs.
+  function ageQuote(market: MarketDataService, securityId: string, ltp: number, ageMs: number) {
+    (market as any).quotes.set(securityId, {
+      securityId, ltp, change: 0, pctChange: 0, high: ltp, low: ltp, open: ltp, prevClose: ltp,
+      volume: 0, oi: 0, updatedAt: Date.now() - ageMs,
+    });
+  }
+
+  it('accepts an allowClosed quote up to the 30s off-hours poll interval', () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T15:00:00.000Z')); // 20:30 IST Tuesday — well off-hours
+    try {
+      const market = stubMarket(null);
+      ageQuote(market, '44000', 100, 25_000); // 25s old — would have failed the old 15s default
+      expect(market.getFillablePrice('44000', { allowClosed: true })).toBe(100);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('still rejects an allowClosed quote clearly older than any normal poll cycle', () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T15:00:00.000Z'));
+    try {
+      const market = stubMarket(null);
+      ageQuote(market, '44000', 100, 90_000); // 90s old — a genuine feed dropout, not poll timing
+      expect(market.getFillablePrice('44000', { allowClosed: true })).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps the tight 15s bound for market-hours (non-allowClosed) calls, unaffected by this fix', () => {
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST Tuesday — market open
+    try {
+      const market = stubMarket(null);
+      ageQuote(market, '44000', 100, 20_000); // 20s old — over the market-hours bound
+      expect(market.getFillablePrice('44000')).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
 describe('RiskEngine — IST session rollover (RISK-01)', () => {
   beforeAll(async () => { await initDatabase(); });
   beforeEach(async () => { await resetPaperWallet(100000); });
