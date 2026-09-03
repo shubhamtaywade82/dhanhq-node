@@ -5,6 +5,7 @@ import { PaperExecutionEngine } from '../engines/paper';
 import { LiveExecutionEngine } from '../engines/live';
 import { eventBus } from '../services/eventBus';
 import { DhanClient } from '@nemesis-oss/dhanhq-sdk';
+import { EventEmitter } from 'events';
 import {
   initDatabase, dbMode, executePaperOrder, getPaperWallet,
   listPaperPositions, closeAllPaperPositions, markPositionsToMarket,
@@ -239,6 +240,40 @@ describe('RiskEngine — real-state circuit breakers', () => {
   it('defaults are sane', () => {
     expect(DEFAULT_RISK_LIMITS.dailyLossLimit).toBeGreaterThan(0);
     expect(DEFAULT_RISK_LIMITS.maxConsecutiveLosses).toBeGreaterThan(0);
+  });
+});
+
+describe('MarketDataService — WebSocket failover', () => {
+  it('allows one handshake and falls back to REST during a 429 cooldown', async () => {
+    const market = Object.assign(new EventEmitter(), {
+      isConnected: false,
+      subscribe: jest.fn(),
+      connect: jest.fn(() => Promise.resolve()),
+      disconnect: jest.fn(),
+    });
+    const quote = jest.fn().mockResolvedValue({ data: { IDX_I: {} } });
+    const client = { ws: { market }, marketFeed: { quote } } as any;
+    const service = new MarketDataService(client);
+    const originalToken = process.env.DHAN_ACCESS_TOKEN;
+    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+
+    try {
+      (service as any).tryStartWs();
+      (service as any).tryStartWs();
+      expect(market.connect).toHaveBeenCalledTimes(1);
+
+      market.emit('error', new Error('Unexpected server response: 429'));
+      await new Promise((resolve) => setImmediate(resolve));
+      (service as any).tryStartWs();
+
+      expect(market.disconnect).toHaveBeenCalledTimes(1);
+      expect(market.connect).toHaveBeenCalledTimes(1);
+      expect(quote).toHaveBeenCalledTimes(1);
+    } finally {
+      service.stop();
+      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
+      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+    }
   });
 });
 

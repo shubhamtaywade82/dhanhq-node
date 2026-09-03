@@ -60,12 +60,15 @@ export class MarketDataService {
   private source: 'ws' | 'rest' | 'none' = 'none';
   private rateLimitedUntil = 0;                           // backoff gate after a 429
   private consecutiveRateLimits = 0;
+  private lastWs429At = 0;                                // backoff timestamp for WebSocket 429 rate limit
   private wsListenersAttached = false;
   private wsRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private wsRetryAttempts = 0;
   private wsSilenceWatch: ReturnType<typeof setInterval> | null = null;
   private extraSubscriptions = new Set<string>();        // 'SEG:SECID' keys
   private unsubEventBus: (() => void) | null = null;
+  private wsConnecting = false;
+  private pollInFlight = false;
   readonly monitor = new PositionMonitor();
 
   constructor(client: DhanClient) {
@@ -102,9 +105,7 @@ export class MarketDataService {
   }
 
   private tryStartWs(): void {
-    // Only bring up the DhanHQ binary WS when a token is actually
-    // resolvable — the SDK's WS auth throws (in an event handler) when
-    // credentials are absent, which would crash the process.
+    // Only bring up the DhanHQ binary WS when a token is actually resolvable
     const tokenResolvable = !!(process.env.DHAN_ACCESS_TOKEN && process.env.DHAN_ACCESS_TOKEN !== 'your_access_token')
       || !!(process.env.DHAN_PIN && process.env.DHAN_TOTP_SECRET)
       || !!(process.env.DHAN_AUTH_PROVIDER_URL && process.env.DHAN_AUTH_PROVIDER_TOKEN);
@@ -112,25 +113,21 @@ export class MarketDataService {
       eventBus.log('WARN', 'No DhanHQ credentials configured — binary WS disabled, REST polling will serve market data when a token appears', 'market_data');
       return;
     }
+
+    // Back off if recently rate-limited (429) on WebSocket
+    if (this.wsConnecting) return;
+    if (Date.now() - this.lastWs429At < 60_000) {
+      this.scheduleWsRetry(60_000 - (Date.now() - this.lastWs429At));
+      return;
+    }
+
     try {
       patchOrderWsSafety();
       const ws: any = (this.client as any).ws;
+      if (!ws) return;
+
       if (ws.market) {
-        // 'full' mode (RequestCode 21) was tried here for OI on option-chain
-        // legs, but DhanHQ silently drops IDX_I subscriptions under it —
-        // verified directly (0 ticks in 15s on 'full' vs 67 ticks in 8s on
-        // 'ticker', same securityIds). The whole ws.market connection shares
-        // one mode, so it broke every index tick, forcing 100% REST-poll
-        // dependency and the resulting rate-limit spam. 'ticker' is what
-        // actually delivers LTP — the safety-critical path (SL/target
-        // monitoring, real-time UI) needs that far more than live OI, which
-        // the option-chain page already refreshes via periodic REST anyway.
         ws.market.mode = 'ticker';
-        // Register subscriptions upfront so onOpen automatically transmits them.
-        // Every reconnect creates a fresh WS session with no memory of prior
-        // subscriptions — re-send extraSubscriptions (option legs of open
-        // positions) too, or every reconnect silently downgrades their SL/
-        // target monitoring from sub-second WS ticks to the 3-15s REST poll.
         ws.market.subscribe([
           ...INDEX_SEC_IDS.map((id) => ({ exchangeSegment: 'IDX_I', securityId: id })),
           ...[...this.extraSubscriptions].map((k) => {
@@ -139,8 +136,17 @@ export class MarketDataService {
           }),
         ]);
       }
+
       if (!this.wsListenersAttached) {
         this.wsListenersAttached = true;
+        ws.market?.on?.('open', () => {
+          this.wsConnecting = false;
+          this.wsStarted = true;
+          this.wsRetryAttempts = 0;
+          this.lastWsTickAt = Date.now();
+          eventBus.log('INFO', 'DhanHQ binary WebSocket connected — real-time tick stream live', 'market_data');
+          this.armSilenceWatch();
+        });
         ws.market?.on?.('tick', (tick: any) => {
           this.wsTickCount++;
           this.lastTickAt = Date.now();
@@ -148,47 +154,65 @@ export class MarketDataService {
           this.source = 'ws';
           this.ingestTick(tick);
         });
-        ws.orders?.on?.('order', (order: any) => {
-          eventBus.emit('order', { kind: 'order_update', order });
-        });
-        // Promise.allSettled never rejects, so a .then()/.catch() pair on it
-        // used to always run .then() — wsStarted=true and a "connected" log
-        // fired even when every connect attempt failed, and the .catch()
-        // retry path was dead code. A real close/error also went unhandled,
-        // so a mid-session drop silently degraded to REST for the rest of
-        // the day with no reconnect and no signal. Fixed below: inspect the
-        // settled results, and treat the socket's own lifecycle as normal
-        // (a drop is expected, not exceptional).
         ws.market?.on?.('close', (code: number) => {
-          if (!this.wsStarted) return; // already handled by the connect-failure path
+          this.wsConnecting = false;
+          if (!this.wsStarted) return;
           this.wsStarted = false;
           eventBus.log('WARN', `Market WS closed (code=${code}) — reconnecting`, 'market_data');
           eventBus.emit('system', { type: 'feed_degraded', source: 'rest' });
           this.scheduleWsRetry();
         });
         ws.market?.on?.('error', (e: any) => {
-          eventBus.log('WARN', `Market WS error: ${e?.message || e}`, 'market_data');
+          const msg = e?.message || String(e);
+          if (msg.includes('429')) {
+            const now = Date.now();
+            this.wsConnecting = false;
+            if (now - this.lastWs429At > 30_000) {
+              eventBus.log('WARN', 'DhanHQ Market WS rate-limited (429) — backing off 60s, REST polling active', 'market_data');
+            }
+            this.lastWs429At = now;
+            this.wsStarted = false;
+            try { ws.market?.disconnect?.(); } catch { /* noop */ }
+            this.requestRestRefresh();
+            this.scheduleWsRetry(60_000);
+            return;
+          }
+          eventBus.log('WARN', `Market WS error: ${msg}`, 'market_data');
+        });
+
+        // Always register error and close handlers on orders WS to prevent Uncaught Exception
+        ws.orders?.on?.('open', () => {
+          eventBus.log('INFO', 'DhanHQ orders WebSocket connected', 'market_data');
+        });
+        ws.orders?.on?.('order', (order: any) => {
+          eventBus.emit('order', { kind: 'order_update', order });
+        });
+        ws.orders?.on?.('error', (e: any) => {
+          const msg = e?.message || String(e);
+          if (!msg.includes('429')) {
+            eventBus.log('WARN', `Orders WS error: ${msg}`, 'market_data');
+          }
+        });
+        ws.orders?.on?.('close', (code: number) => {
+          eventBus.log('INFO', `Orders WS closed (code=${code})`, 'market_data');
         });
       }
-      const connects: Promise<any>[] = [];
-      if (ws.market?.connect) connects.push(ws.market.connect());
-      if (ws.orders?.connect) connects.push(ws.orders.connect().catch(() => {}));
-      Promise.allSettled(connects).then((results) => {
-        const ok = results.length > 0 && results.some((r) => r.status === 'fulfilled');
-        if (!ok) {
-          const why = results
-            .map((r) => (r.status === 'rejected' ? (r.reason?.message || String(r.reason)) : ''))
-            .filter(Boolean).join('; ') || 'no connect attempts succeeded';
-          eventBus.log('WARN', `DhanHQ WebSocket connect failed (${why}) — REST polling only`, 'market_data');
-          this.scheduleWsRetry();
-          return;
-        }
-        this.wsStarted = true;
-        this.wsRetryAttempts = 0;
-        this.lastWsTickAt = Date.now(); // grace period starts from connect, not epoch 0
-        eventBus.log('INFO', 'DhanHQ binary WebSocket connected — real-time tick stream live', 'market_data');
-        this.armSilenceWatch();
-      });
+
+      if (!ws.market?.isConnected) {
+        this.wsConnecting = true;
+        ws.market?.connect?.().catch((e: any) => {
+          this.wsConnecting = false;
+          const msg = e?.message || String(e);
+          if (msg.includes('429')) {
+            this.lastWs429At = Date.now();
+            this.requestRestRefresh();
+            this.scheduleWsRetry(60_000);
+          }
+        });
+      }
+      if (!ws.orders?.isConnected) {
+        ws.orders?.connect?.().catch(() => {});
+      }
     } catch (e: any) {
       eventBus.log('WARN', `DhanHQ WebSocket start failed (${e?.message || e}) — REST polling only`, 'market_data');
       this.scheduleWsRetry();
@@ -210,12 +234,11 @@ export class MarketDataService {
     }, 10_000);
   }
 
-  // A single failed handshake (e.g. a transient 429) used to disable the WS
-  // for the rest of the process's life. Retry with capped exponential backoff instead.
-  private scheduleWsRetry(): void {
-    if (this.wsStarted || this.wsRetryTimer) return;
+  // Capped exponential backoff with custom override for 429 rate limits
+  private scheduleWsRetry(customDelay?: number): void {
+    if (this.wsRetryTimer) return;
     this.wsRetryAttempts++;
-    const delay = Math.min(15_000 * 2 ** (this.wsRetryAttempts - 1), 5 * 60_000);
+    const delay = customDelay || Math.min(15_000 * 2 ** (this.wsRetryAttempts - 1), 5 * 60_000);
     this.wsRetryTimer = setTimeout(() => {
       this.wsRetryTimer = null;
       this.tryStartWs();
@@ -235,11 +258,25 @@ export class MarketDataService {
       if (this.pollTimer) clearTimeout(this.pollTimer);
       this.pollTimer = setTimeout(tick, interval);
       if (backoffRemaining <= 0) {
-        await this.pollIndices();
-        await this.pollExtraInstruments();
+        await this.refreshRestQuotes();
       }
     };
     tick();
+  }
+
+  private requestRestRefresh(): void {
+    if (Date.now() >= this.rateLimitedUntil) void this.refreshRestQuotes();
+  }
+
+  private async refreshRestQuotes(): Promise<void> {
+    if (this.pollInFlight) return;
+    this.pollInFlight = true;
+    try {
+      await this.pollIndices();
+      await this.pollExtraInstruments();
+    } finally {
+      this.pollInFlight = false;
+    }
   }
 
   private async pollIndices(): Promise<void> {
@@ -496,6 +533,18 @@ export class MarketDataService {
 }
 
 function patchOrderWsSafety(): void {
+  const baseProto = Object.getPrototypeOf(OrderUpdateWS.prototype);
+  if (baseProto && !baseProto.__safetyPatched) {
+    baseProto.__safetyPatched = true;
+    const origConnect = baseProto.connect;
+    baseProto.connect = async function (this: any) {
+      if (typeof this.listenerCount === 'function' && this.listenerCount('error') === 0) {
+        this.on('error', () => { /* prevent unhandled EventEmitter throw */ });
+      }
+      return origConnect.apply(this, arguments as any);
+    };
+  }
+
   const proto = (OrderUpdateWS as any)?.prototype;
   if (!proto || proto.__safetyPatched) return;
   proto.__safetyPatched = true;

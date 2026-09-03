@@ -94,8 +94,15 @@ export async function createDhanClient(): Promise<DhanClient> {
     activeTokenAt = Date.now();
   }
 
+  let lastAuthorityFailAt = 0;
+
   const resolveToken = async (): Promise<string> => {
-    // 1. Primary: Read live rotating token from Redis (written by algo_scalper_api)
+    // 1. In-memory token if fresh (< 12 hours) — zero network overhead
+    if (activeToken && Date.now() - activeTokenAt < 12 * 3600 * 1000) {
+      return activeToken;
+    }
+
+    // 2. Primary: Read live rotating token from Redis (written by algo_scalper_api or TOTP)
     if (await redisAvailable()) {
       try {
         const rToken = await redisPublisher.get("dhan:auth:access_token").catch(() => null);
@@ -107,22 +114,21 @@ export async function createDhanClient(): Promise<DhanClient> {
       } catch { /* Redis fallback */ }
     }
 
-    // 2. Secondary: Query algo_scalper_api REST endpoint (GET /api/dhan_access_token)
-    if (authProviderUrl) {
+    // 3. Secondary: Query algo_scalper_api REST endpoint (with 60s cooldown on failure)
+    if (authProviderUrl && Date.now() - lastAuthorityFailAt > 60_000) {
       try {
         const rToken = await fetchTokenFromRails(authProviderUrl, authProviderToken);
         activeToken = rToken;
         activeTokenAt = Date.now();
         log.info("DhanHQ access token acquired from algo_scalper_api");
+        if (await redisAvailable()) {
+          await redisPublisher.set("dhan:auth:access_token", rToken, "EX", 82800).catch(() => {});
+        }
         return rToken;
       } catch (e: any) {
-        log.debug({ err: { message: e.message } }, "algo_scalper_api authority endpoint not responding");
+        lastAuthorityFailAt = Date.now();
+        log.debug({ err: { message: e.message } }, "algo_scalper_api authority endpoint not responding (backing off 60s)");
       }
-    }
-
-    // 3. In-memory token if recently set and no rotation triggered
-    if (activeToken && Date.now() - activeTokenAt < 12 * 3600 * 1000) {
-      return activeToken;
     }
 
     // 4. Standalone fallback: Generate via TOTP if credentials provided
