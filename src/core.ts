@@ -34,21 +34,30 @@ export interface Core {
 import { seedStandardStrategies } from './services/strategyConstructor';
 
 export async function startCore(): Promise<Core> {
-  // LiveExecutionEngine places real broker orders but writes no position/
-  // wallet state of its own — RiskEngine, AutonomyEngine, the kill switch
-  // and EOD square-off all read/act on the PAPER tables regardless of
-  // TRADING_MODE. In live mode that means real capital trades with the
-  // entire risk layer blind to it: the daily-loss breaker sees ₹0, EOD
-  // square-off closes paper positions while real ones stay open, and the
-  // kill switch's "positions closed" count is fabricated from an empty
-  // paper book. Refusing to boot is safer than an unmonitored live book —
-  // this must be resolved (a real PortfolioSource behind risk/autonomy)
-  // before TRADING_MODE=live is usable again.
+  // The gap this guard originally existed for is closed: RiskEngine,
+  // AutonomyEngine and LiveExecutionEngine all read/act through
+  // PortfolioSource now, BrokerPortfolioSource polls the real DhanHQ
+  // account, and reconcileUnmanagedLivePositions (autonomy.ts) flattens and
+  // halts on any broker position PositionMonitor isn't tracking. Two
+  // silent-no-op bugs on the live kill-switch and capital-check paths
+  // (wrong SDK method names swallowed by optional chaining) were also found
+  // and fixed in the same pass.
+  //
+  // The guard stays in place anyway, by deliberate choice, not oversight:
+  // none of the above has ever run against a real DhanHQ account (this
+  // environment has no live credentials) — the reversing-order square-off
+  // path, the broker kill switch call, and the assumption that a flattened
+  // position still reports realizedProfit in positions.list() are all
+  // verified only against the SDK's type declarations and mocks. Lift this
+  // only after a supervised first live session (minimum lot size, one
+  // index) confirms the kill switch and reconciler actually fire correctly
+  // against the real account — not as a standalone code change.
   if (process.env.TRADING_MODE === 'live') {
     throw new Error(
-      'TRADING_MODE=live is currently unsafe: risk engine, autonomy loop, EOD square-off, and the kill switch ' +
-      'all operate on paper position/wallet state, not the live broker book. Live orders would execute ' +
-      'completely unmonitored. Set TRADING_MODE=paper until a live PortfolioSource is wired through.'
+      'TRADING_MODE=live is deliberately disabled pending a supervised first live session: PortfolioSource, ' +
+      'the broker kill switch, and the unmanaged-position reconciler are implemented and tested against mocks, ' +
+      'but have never run against a real DhanHQ account. Set TRADING_MODE=paper, or remove this guard only ' +
+      'after that verification (see the comment above this block).'
     );
   }
   await initDatabase();
