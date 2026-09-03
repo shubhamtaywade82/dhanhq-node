@@ -5,6 +5,7 @@ import type { AutonomyEngine } from '../services/autonomy';
 import type { AgentOrchestrator } from '../services/agent';
 import type { MarketDataService } from '../services/marketData';
 import { eventBus } from '../services/eventBus';
+import { journal } from '../services/journal';
 import { listAlerts, pushAlert } from '../db';
 import { evaluateStrategyBacktest } from '../services/strategyConstructor';
 import { analyzeOptionsBehavior } from './market';
@@ -54,6 +55,7 @@ export function controlRoutes(
         return res.status(400).json({ error: 'Send {"confirm":"CONFIRM"} to arm the kill switch' });
       }
       const result = await risk.armKillSwitch(reason || 'Manual kill switch from control plane');
+      journal.append('control_command', { route: 'POST /kill', reason, result });
       res.json(result);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -63,6 +65,7 @@ export function controlRoutes(
   router.post('/kill/reset', async (_req, res) => {
     try {
       const result = await risk.disarmKillSwitch();
+      journal.append('control_command', { route: 'POST /kill/reset', result });
       res.json(result);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -74,18 +77,22 @@ export function controlRoutes(
     const { enabled } = req.body || {};
     autonomy.setEnabled(!!enabled);
     await pushAlert('INFO', 'control_plane', `Autonomy engine ${enabled ? 'resumed' : 'paused'} via control plane`);
+    journal.append('control_command', { route: 'POST /autonomy', enabled: !!enabled });
     res.json({ status: 'ok', enabled: autonomy.isEnabled(), stats: autonomy.stats() });
   });
 
   router.post('/scanner', (req, res) => {
     const { enabled } = req.body || {};
     autonomy.setScanEnabled(!!enabled);
+    journal.append('control_command', { route: 'POST /scanner', enabled: !!enabled });
     res.json({ status: 'ok', stats: autonomy.stats() });
   });
 
   router.post('/square-off', async (req, res) => {
     try {
-      const closed = await autonomy.squareOffAll(req.body?.reason || 'Manual square-off from control plane');
+      const reason = req.body?.reason || 'Manual square-off from control plane';
+      const closed = await autonomy.squareOffAll(reason);
+      journal.append('control_command', { route: 'POST /square-off', reason, closed });
       res.json({ status: 'ok', closed });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -106,7 +113,9 @@ export function controlRoutes(
     if (patch.maxConsecutiveLosses != null) clean.maxConsecutiveLosses = Math.max(1, Number(patch.maxConsecutiveLosses));
     if (patch.maxRejectionRatePct != null) clean.maxRejectionRatePct = Math.max(1, Number(patch.maxRejectionRatePct));
     if (patch.staleTickSec != null) clean.staleTickSec = Math.max(3, Number(patch.staleTickSec));
-    res.json(await risk.setLimits(clean));
+    const updated = await risk.setLimits(clean);
+    journal.append('control_command', { route: 'POST /risk-limits', patch: clean, updated });
+    res.json(updated);
   });
 
   // ── agent ───────────────────────────────────────────────────────────
@@ -117,6 +126,7 @@ export function controlRoutes(
         return res.status(400).json({ error: 'objective (string, ≥4 chars) required' });
       }
       const result = await agent.run(objective.trim(), 'control_plane');
+      journal.append('control_command', { route: 'POST /agent/run', objective: objective.trim(), result });
       res.json(result);
     } catch (e: any) {
       res.status(e.message?.includes('already in progress') ? 409 : 500).json({ error: e.message });

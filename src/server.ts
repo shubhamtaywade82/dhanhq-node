@@ -12,6 +12,7 @@ import { controlRoutes } from './routes/control';
 import { MarketStreamManager } from './ws/marketStream';
 import { dbMode } from './db';
 import { eventBus } from './services/eventBus';
+import { journal } from './services/journal';
 import { moduleLogger, logError } from './lib/logger';
 import { requestLogger, errorHandler, notFoundHandler } from './lib/requestLogger';
 import { attachBusLoggerBridge } from './lib/busLoggerBridge';
@@ -129,13 +130,17 @@ async function main() {
   });
 
   // Graceful shutdown — stop services cleanly, keep positions consistent.
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     log.info({ signal }, 'Shutdown initiated — stopping services cleanly');
     eventBus.log('SYSTEM', `Shutdown initiated (${signal})`, 'server');
     core.autonomy.stop();
     core.risk.stop();
     core.market.stop();
     core.selfHealing.stop();
+    // Awaited: stream.end() only SCHEDULES the flush — exiting right after
+    // calling it (as this function does next) can race the write and lose
+    // the last entries from exactly the shutdown being journaled.
+    await journal.close();
     wss.close();
     server.close();
     log.info({ signal }, 'Shutdown complete');

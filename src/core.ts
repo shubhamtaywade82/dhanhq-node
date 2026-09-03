@@ -12,6 +12,7 @@ import { PaperExecutionEngine } from './engines/paper';
 import { LiveExecutionEngine } from './engines/live';
 import { marketClock } from './services/marketHours';
 import { hasHolidayCoverage } from './services/holidays';
+import { journal } from './services/journal';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -90,6 +91,13 @@ export async function startCore(): Promise<Core> {
   if (!hasHolidayCoverage(todayIst)) {
     eventBus.log('ERROR', `No trading-holiday data for ${todayIst.slice(0, 4)} — market-closed days will NOT be detected. Update src/services/holidays.ts.`, 'core');
   }
+
+  // Durable audit trail — order intents/results, risk/kill decisions, EOD
+  // square-offs, control commands (journal.ts). Opened before anything can
+  // journal to it; a prior boot's entries from the same trading day (a
+  // restart) are read back for a diagnostic count, not replayed into state.
+  const priorEntries = journal.open(todayIst);
+  eventBus.log('SYSTEM', `Journal opened for ${todayIst} (${priorEntries.length} entr${priorEntries.length === 1 ? 'y' : 'ies'} from earlier this session)`, 'core');
 
   await market.start();
   // risk/autonomy register their exit-signal and evaluation listeners here —

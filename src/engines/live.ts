@@ -1,6 +1,7 @@
 import type { DhanClient, OrderTracker, PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
 import { redisPublisher } from '../auth';
 import { eventBus } from '../services/eventBus';
+import { journal } from '../services/journal';
 import type { MarketDataService } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 
@@ -30,12 +31,14 @@ export class LiveExecutionEngine {
   async placeOrder(intent: any): Promise<any> {
     const { correlation_id, intent_id, params, risk_limits } = intent;
     const { security_id, quantity, transaction_type, order_type = 'MARKET', exchange_segment = 'NSE_FNO', price = 0 } = params;
+    journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'live' });
 
     // Risk gate — kill switch blocks live orders too.
     const gate = this.risk.canTrade();
     if (!gate.allowed) {
       eventBus.log('WARN', `Live order BLOCKED for ${correlation_id}: ${gate.reason}`, 'live_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason });
       return { status: 'REJECTED', reason: gate.reason };
     }
 
@@ -75,6 +78,7 @@ export class LiveExecutionEngine {
     };
 
     eventBus.emit('order', { kind: 'fill', ...fillPayload });
+    journal.append('order_result', { status: fill.status || 'TRADED', ...fillPayload });
     await redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
     if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {

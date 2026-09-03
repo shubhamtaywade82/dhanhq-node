@@ -1,5 +1,6 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { eventBus } from './eventBus';
+import { journal } from './journal';
 import { marketClock } from './marketHours';
 import type { MarketDataService } from './marketData';
 import { INDEX_INSTRUMENTS } from './marketData';
@@ -201,6 +202,7 @@ export class RiskEngine {
     eventBus.log('ERROR', `*** KILL SWITCH ENGAGED *** reason=${reason} positionsClosed=${details.positionsClosed}`, 'risk_engine');
     eventBus.emit('system', { type: 'kill_switch', state: 'ENGAGED', reason });
     eventBus.emit('risk', this.snapshot());
+    journal.append('kill', { action: 'arm', reason, details });
     return { status: 'killed', details };
   }
 
@@ -218,6 +220,7 @@ export class RiskEngine {
     eventBus.log('INFO', 'Kill switch disarmed — trading re-enabled', 'risk_engine');
     eventBus.emit('system', { type: 'kill_switch', state: 'DISENGAGED' });
     eventBus.emit('risk', this.snapshot());
+    journal.append('kill', { action: 'disarm' });
     return { status: 'ok' };
   }
 
@@ -333,6 +336,7 @@ export class RiskEngine {
         const level = row.state === 'ERROR' ? 'ERROR' : 'WARN';
         await pushAlert(level, 'risk_engine', `${row.rule}: ${prev.state} → ${row.state} (current ${row.current}, threshold ${row.threshold}). Action: ${row.action}`);
         eventBus.emit('alert', { level, source: 'risk_engine', msg: `${row.rule} tripped — ${row.current} vs ${row.threshold}` });
+        journal.append('risk_decision', { rule: row.rule, from: prev.state, to: row.state, current: row.current, threshold: row.threshold, action: row.action });
       }
     }
 

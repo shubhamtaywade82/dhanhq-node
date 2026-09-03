@@ -2,6 +2,7 @@ import type { DhanClient, PositionMonitor } from '@nemesis-oss/dhanhq-sdk';
 import { redisPublisher } from '../auth';
 import { executePaperOrder, defaultMarginResolver, type MarginResolver } from '../db';
 import { eventBus } from '../services/eventBus';
+import { journal } from '../services/journal';
 import { applyFillSlippage } from '../services/fillModel';
 import type { MarketDataService } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
@@ -62,12 +63,14 @@ export class PaperExecutionEngine {
     const { correlation_id, intent_id, params, risk_limits } = intent;
     const { security_id, quantity, transaction_type, order_type = 'MARKET', price = 0 } = params;
     const symbol = params.symbol || params.trading_symbol || `SEC_${security_id}`;
+    journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'paper' });
 
     // Risk gate — the kill switch and EOD window block paper fills too.
     const gate = this.risk.canTrade();
     if (!gate.allowed) {
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${gate.reason}`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason });
       return { status: 'REJECTED', reason: gate.reason };
     }
 
@@ -87,6 +90,7 @@ export class PaperExecutionEngine {
         const reason = `LIMIT price ${price} not marketable vs LTP ${liveLtp}`;
         eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${reason}`, 'paper_engine');
         eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason });
+        journal.append('order_result', { correlation_id, status: 'REJECTED', reason });
         return { status: 'REJECTED', reason };
       }
       referencePrice = transaction_type === 'BUY' ? Math.min(liveLtp, price) : Math.max(liveLtp, price);
@@ -94,6 +98,7 @@ export class PaperExecutionEngine {
     if (referencePrice == null || referencePrice <= 0) {
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: no live LTP for ${symbol} (security ${security_id})`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: 'No live LTP available for instrument' });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: 'No live LTP available for instrument' });
       return { status: 'REJECTED', reason: 'No live LTP available for instrument' };
     }
 
@@ -129,6 +134,7 @@ export class PaperExecutionEngine {
       // a broker would, not a 500.
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${e.message}`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: e.message });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: e.message });
       return { status: 'REJECTED', reason: e.message };
     }
 
@@ -147,6 +153,7 @@ export class PaperExecutionEngine {
 
     eventBus.log('TRADE', `Paper fill ${transaction_type} ${quantity} ${symbol} @ ₹${result.fillPrice.toFixed(2)} (${correlation_id})`, 'paper_engine');
     eventBus.emit('order', { kind: 'fill', ...fillPayload });
+    journal.append('order_result', { status: 'TRADED', ...fillPayload });
     await redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
     // Stop-loss / target / trailing monitoring via SDK PositionMonitor, fed

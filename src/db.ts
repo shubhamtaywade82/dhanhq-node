@@ -2,6 +2,7 @@ import { Pool } from 'pg';
 import { moduleLogger } from './lib/logger';
 import { marketClock } from './services/marketHours';
 import { eventBus } from './services/eventBus';
+import { journal } from './services/journal';
 import { applyFillSlippage, type FillKind } from './services/fillModel';
 import { redisPublisher } from './auth';
 
@@ -841,6 +842,7 @@ export async function closePaperPosition(symbol: string, currentLtp?: number, ma
     };
     eventBus.log('TRADE', `Paper close ${transactionType} ${result.quantity} ${sym} @ ₹${result.fillPrice.toFixed(2)}`, 'paper_engine');
     eventBus.emit('order', { kind: 'fill', ...fillPayload });
+    journal.append('order_result', { status: 'TRADED', exitKind: kind, ...fillPayload });
     redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
   }
   return result;

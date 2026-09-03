@@ -1,5 +1,6 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { eventBus } from './eventBus';
+import { journal } from './journal';
 import { marketClock, istNow } from './marketHours';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
@@ -111,6 +112,11 @@ export class AutonomyEngine {
       if (clock.istDate !== this.eodDate) {
         this.eodDate = clock.istDate;
         this.eodDone = false;
+        // Roll the journal to a fresh per-day file too — without this a
+        // process that stays up across midnight would keep appending
+        // every subsequent day's entries into yesterday's file forever.
+        journal.open(clock.istDate);
+        eventBus.log('SYSTEM', `Journal rolled to new trading day: ${clock.istDate}`, 'autonomy');
       }
 
       if (this.enabled) {
@@ -261,6 +267,7 @@ export class AutonomyEngine {
       if (s.status === 'RUNNING') await updatePaperStrategyStatus(s.id, 'STOPPED');
     }
     eventBus.log('TRADE', `Square-off complete: ${closed} position(s) closed`, 'autonomy');
+    journal.append('eod', { reason, closed });
     await this.publishPortfolioSnapshot();
     return closed;
   }
