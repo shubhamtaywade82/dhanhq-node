@@ -5,6 +5,7 @@ import { MarketDataService, toTrailConfig } from './services/marketData';
 import { RiskEngine } from './services/riskEngine';
 import { AutonomyEngine } from './services/autonomy';
 import { AgentOrchestrator } from './services/agent';
+import { AdaptiveSupertrendScanner } from './services/adaptiveSupertrendScanner';
 import { SelfHealingService } from './services/selfHealing';
 import { startTelegramNotifier } from './services/telegramNotifier';
 import { eventBus } from './services/eventBus';
@@ -80,6 +81,7 @@ export async function startCore(): Promise<Core> {
   const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk);
   const agent = new AgentOrchestrator(client, market, risk, paper, live);
   autonomy.setAgent(agent);
+  autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, paper, risk));
 
   // Bridge core events into Redis pub/sub (Rails sidecar compat) when up.
   if (await redisAvailable()) {

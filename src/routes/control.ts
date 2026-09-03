@@ -88,6 +88,17 @@ export function controlRoutes(
     res.json({ status: 'ok', stats: autonomy.stats() });
   });
 
+  // ── long-option peak-profit policy ─────────────────────────────────
+  router.get('/long-option-policy', (_req, res) => {
+    res.json({ enabled: autonomy.longOptionManager.isEnabled(), positions: autonomy.longOptionManager.snapshot() });
+  });
+
+  router.post('/long-option-policy', (req, res) => {
+    const { enabled } = req.body || {};
+    autonomy.longOptionManager.setEnabled(!!enabled);
+    res.json({ status: 'ok', enabled: autonomy.longOptionManager.isEnabled() });
+  });
+
   router.post('/square-off', async (req, res) => {
     try {
       const reason = req.body?.reason || 'Manual square-off from control plane';

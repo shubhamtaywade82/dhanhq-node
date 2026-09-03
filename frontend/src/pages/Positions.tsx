@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -6,8 +7,30 @@ import { fmt, fmtINR, pnlClass, sideClass } from '../utils/formatters';
 import { RotateCcw, Power } from 'lucide-react';
 import { api } from '../services/api';
 
+type PolicyState = { peakNet: number; floorNet: number; captureRatioSoFar: number | null; partialTaken: boolean };
+
 export function Positions() {
   const { state, showToast, openModal, closeModal, addSystemLog, refreshPortfolio } = useApp();
+  const [policyEnabled, setPolicyEnabled] = useState(false);
+  const [policyBySymbol, setPolicyBySymbol] = useState<Record<string, PolicyState>>({});
+
+  // Local poll (not global store — same pattern Config.tsx uses for its own
+  // control-plane reads). Peak/floor move every tick; this just needs to be
+  // fresh enough for a human glance, not push-perfect.
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      try {
+        const res = await api.longOptionPolicy();
+        if (!mounted) return;
+        setPolicyEnabled(res.enabled);
+        setPolicyBySymbol(Object.fromEntries(res.positions.map((p) => [p.tradingSymbol, p])));
+      } catch { /* control plane unreachable — table just shows no lock data */ }
+    };
+    load();
+    const interval = setInterval(load, 3000);
+    return () => { mounted = false; clearInterval(interval); };
+  }, []);
 
   const realPositions = state.positions
     .filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0)
@@ -77,7 +100,10 @@ export function Positions() {
       <div className="flex items-center justify-between">
         <div>
           <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">Active Positions & MTM</div>
-          <div className="text-xs text-muted mt-0.5">PostgreSQL persistent paper positions with automated SL/TP & Trailing monitoring</div>
+          <div className="text-xs text-muted mt-0.5">
+            PostgreSQL persistent paper positions with automated SL/TP & Trailing monitoring
+            {policyEnabled && <span className="text-accent"> · long-option peak-profit policy active</span>}
+          </div>
         </div>
         <div className="flex gap-2">
           <Button variant="ghost" onClick={async () => { await refreshPortfolio(); showToast('Portfolio synced with database', 'success'); }}><RotateCcw size={12} className="mr-1" /> Refresh Positions</Button>
@@ -89,7 +115,7 @@ export function Positions() {
         <table className="data-table w-full">
           <thead>
             <tr>
-              {['Strategy', 'Instrument', 'Side', 'Net Qty', 'Avg Price', 'LTP', 'Stop Loss', 'Target (TP)', 'Trailing SL', 'P&L', 'Product', 'Actions'].map(h => (
+              {['Strategy', 'Instrument', 'Side', 'Net Qty', 'Avg Price', 'LTP', 'Stop Loss', 'Target (TP)', 'Trailing SL', 'Profit Lock', 'P&L', 'Product', 'Actions'].map(h => (
                 <th key={h} className="text-left px-2.5 py-2 text-muted font-medium border-b border-border text-[9.5px] uppercase tracking-[0.5px]">{h}</th>
               ))}
             </tr>
@@ -97,7 +123,7 @@ export function Positions() {
           <tbody>
             {realPositions.length === 0 ? (
               <tr>
-                <td colSpan={12} className="text-center py-8 text-muted text-xs">No open positions. Place a paper trade to start!</td>
+                <td colSpan={13} className="text-center py-8 text-muted text-xs">No open positions. Place a paper trade to start!</td>
               </tr>
             ) : (
               realPositions.map((p, i) => (
@@ -116,6 +142,18 @@ export function Positions() {
                   </td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-sky text-[10px]">
                     {p.trailingStop ? `±₹${p.trailingStop}` : <span className="text-muted font-normal">Active</span>}
+                  </td>
+                  <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-[10px]">
+                    {(() => {
+                      const pol = policyBySymbol[p.instrument];
+                      if (!pol) return <span className="text-muted font-normal">—</span>;
+                      return (
+                        <div className="flex flex-col leading-tight">
+                          <span className="text-accent">peak {fmtINR(pol.peakNet)}</span>
+                          <span className={pol.floorNet > 0 ? 'text-accent' : 'text-muted'}>floor {fmtINR(pol.floorNet)}</span>
+                        </div>
+                      );
+                    })()}
                   </td>
                   <td className={`px-2.5 py-[7px] border-b border-border/60 font-bold font-mono ${pnlClass(p.pnl)}`}><LerpNumber value={p.pnl} format={fmtINR} /></td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-muted text-[10px]">{p.product}</td>
