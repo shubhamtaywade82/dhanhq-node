@@ -561,10 +561,26 @@ export class MarketDataService {
   }
 }
 
-function patchOrderWsSafety(): void {
+// Exported for direct unit testing — the surrounding class methods that
+// call this require a live WS connection attempt to reach it, but the
+// patch itself has no dependency on `this` or any connection state.
+export function patchOrderWsSafety(): void {
+  // Two independent one-time patches, each guarded by its OWN flag name,
+  // checked with hasOwnProperty rather than a plain truthy read. They used
+  // to share one `__safetyPatched` name on two prototypes in the SAME
+  // chain — BaseWS.prototype is OrderUpdateWS.prototype's direct parent —
+  // so setting it on the base prototype below made a plain
+  // `OrderUpdateWS.prototype.__safetyPatched` read `true` too, via
+  // inheritance, even though it had never been set on OrderUpdateWS.
+  // prototype itself. That made the SECOND patch's own guard see "already
+  // patched" on its very first run and return immediately — the
+  // concatenated-JSON/malformed-frame onMessage patch below never
+  // installed, so a Dhan frame containing two concatenated `{...}{...}`
+  // objects hit the SDK's raw onMessage and could throw inside the socket
+  // handler instead of being safely split and parsed.
   const baseProto = Object.getPrototypeOf(OrderUpdateWS.prototype);
-  if (baseProto && !baseProto.__safetyPatched) {
-    baseProto.__safetyPatched = true;
+  if (baseProto && !Object.prototype.hasOwnProperty.call(baseProto, '__connectSafetyPatched')) {
+    baseProto.__connectSafetyPatched = true;
     const origConnect = baseProto.connect;
     baseProto.connect = async function (this: any) {
       if (typeof this.listenerCount === 'function' && this.listenerCount('error') === 0) {
@@ -575,8 +591,8 @@ function patchOrderWsSafety(): void {
   }
 
   const proto = (OrderUpdateWS as any)?.prototype;
-  if (!proto || proto.__safetyPatched) return;
-  proto.__safetyPatched = true;
+  if (!proto || Object.prototype.hasOwnProperty.call(proto, '__onMessageSafetyPatched')) return;
+  proto.__onMessageSafetyPatched = true;
   const origOnMessage = proto.onMessage;
   proto.onMessage = function (data: any) {
     try {
