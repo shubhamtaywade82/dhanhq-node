@@ -243,6 +243,40 @@ describe('RiskEngine — real-state circuit breakers', () => {
     expect(DEFAULT_RISK_LIMITS.dailyLossLimit).toBeGreaterThan(0);
     expect(DEFAULT_RISK_LIMITS.maxConsecutiveLosses).toBeGreaterThan(0);
   });
+
+  it('Portfolio Net Delta: does not block a single reasonable options position, but still catches real concentration', async () => {
+    // Regression test: the breaker measures option delta-NOTIONAL (the
+    // underlying's equivalent exposure) as a % of equity — inherently a
+    // triple/quadruple-digit number for any real options position, since
+    // that's what leverage means. The old default (150%) made a single
+    // NIFTY ATM lot (65 qty × ~0.5Δ × ~24000 spot ≈ 780% of the ₹100,000
+    // default paper wallet) read ERROR — and canTrade() blocks on ERROR —
+    // so the very first fill locked out every subsequent order.
+    const client = stubClient();
+    const market = stubMarket(100);
+    (market as any).quotes.set('13', { // NIFTY index securityId
+      securityId: '13', symbol: 'NIFTY', ltp: 24000, change: 0, pctChange: 0,
+      high: 24100, low: 23900, open: 24000, prevClose: 24000, volume: 0, oi: 0, updatedAt: Date.now(),
+    });
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    await resetPaperWallet(100000);
+
+    await executePaperOrder({ symbol: 'NIFTY24000CE', securityId: '55501', quantity: 65, transactionType: 'BUY', price: 100 });
+    const rowsOneLot = await risk.evaluate();
+    const oneLot = rowsOneLot.find((r) => r.rule === 'Portfolio Net Delta')!;
+    expect(oneLot.state).not.toBe('ERROR');
+    expect(risk.canTrade().allowed).toBe(true);
+
+    // A clearly excessive same-direction pile-up must still trip it.
+    await executePaperOrder({ symbol: 'NIFTY24000CE', securityId: '55501', quantity: 65 * 5, transactionType: 'BUY', price: 100 });
+    const rowsPiled = await risk.evaluate();
+    const piled = rowsPiled.find((r) => r.rule === 'Portfolio Net Delta')!;
+    expect(piled.state).toBe('ERROR');
+
+    await closePaperPosition('NIFTY24000CE');
+    risk.stop();
+  });
 });
 
 describe('MarketDataService — WebSocket failover', () => {

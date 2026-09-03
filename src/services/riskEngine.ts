@@ -32,7 +32,22 @@ export interface RiskLimits {
   maxRejectionRatePct: number;   // % rejected / total today
   staleTickSec: number;          // seconds without a tick during market hours
   maxConcurrentStrategies: number; // simultaneous RUNNING strategies, any index
-  maxPortfolioDeltaPct: number;    // |net delta-equivalent notional| as % of equity
+  /** |net delta-equivalent notional| as % of equity. Deliberately a
+   * triple/quadruple-digit-sized threshold, not a typo: an option's delta-
+   * notional is the UNDERLYING's equivalent exposure, not the premium paid
+   * for it — that's what leverage means. A single NIFTY ATM lot (65 ×
+   * ~0.5Δ × ~24000 spot) already runs to roughly 8x the ₹100,000 default
+   * paper wallet. A threshold sized like a plain margin-utilization
+   * percentage (the old default was 150) makes canTrade() permanently
+   * ERROR — and thus block every order — after the very first fill,
+   * defeating the entire point of an autonomous multi-strategy system.
+   * This default is tuned to read WARN (visible, non-blocking) around one
+   * lot's worth of exposure and ERROR (blocks further same-direction
+   * entries) once concentration roughly doubles that — a rough starting
+   * point given the account size and lot sizes this varies with, meant to
+   * be tuned to the REAL trading account's capital via
+   * RISK_MAX_PORTFOLIO_DELTA_PCT, not treated as a universal constant. */
+  maxPortfolioDeltaPct: number;
 }
 
 export const DEFAULT_RISK_LIMITS: RiskLimits = {
@@ -43,7 +58,7 @@ export const DEFAULT_RISK_LIMITS: RiskLimits = {
   maxRejectionRatePct: 10,
   staleTickSec: 10,
   maxConcurrentStrategies: Number(process.env.RISK_MAX_CONCURRENT_STRATEGIES) || 5,
-  maxPortfolioDeltaPct: Number(process.env.RISK_MAX_PORTFOLIO_DELTA_PCT) || 150,
+  maxPortfolioDeltaPct: Number(process.env.RISK_MAX_PORTFOLIO_DELTA_PCT) || 1000,
 };
 
 export interface CircuitBreakerRow {
