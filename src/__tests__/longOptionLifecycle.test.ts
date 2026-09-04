@@ -30,10 +30,10 @@ function setLtp(svc: MarketDataService, ltp: number): void {
   });
 }
 
-async function openLongOption(): Promise<void> {
+async function openLongOption(quantity = QTY, price = ENTRY): Promise<void> {
   await executePaperOrder({
     symbol: SYMBOL, securityId: SEC_ID, exchangeSegment: 'NSE_FNO',
-    transactionType: 'BUY', orderType: 'MARKET', productType: 'INTRADAY', quantity: QTY, price: ENTRY,
+    transactionType: 'BUY', orderType: 'MARKET', productType: 'INTRADAY', quantity, price,
   });
   // Mirrors what AdaptiveSupertrendScanner.deploy() registers — a single-leg
   // RUNNING strategy whose only exit is LongOptionPositionManager, so
@@ -146,6 +146,31 @@ describe('Long-option paper lifecycle (open -> partial -> hold -> full exit)', (
     const strategies = await listPaperStrategies();
     const strat = strategies.find((s) => s.id === 'lifecycle_strat');
     expect(strat?.status).toBe('STOPPED');
+  });
+
+  it('leaves a just-opened position untouched when the first tick lands at the entry price', async () => {
+    // The autonomy loop evaluates every open long option each cycle (~2s), so
+    // a freshly opened leg's first evaluation normally happens before price
+    // has moved at all. That must be a HOLD — it used to emergency-exit on
+    // `giveback_hard` against a peakNet still sitting at 0. Sized 25 @ 200
+    // (the BANKNIFTY leg this was first caught on): fee drag scales with the
+    // flat ₹20/fill brokerage while the giveback allowance scales with
+    // premium, so smaller/pricier legs tripped it hardest.
+    const qty = 25, entry = 200;
+    await openLongOption(qty, entry);
+    const market = stubMarket(entry); // price hasn't moved since the fill
+    const manager = new LongOptionPositionManager(market);
+
+    await manager.evaluate(false);
+
+    const [pos] = await listPaperPositions();
+    expect(pos.netQty).toBe(qty);
+    expect(pos.realizedProfit).toBe(0);
+    const wallet = await getPaperWallet();
+    expect(wallet.realizedPnl).toBe(0);
+    expect(wallet.totalCharges).toBe(calculateOrderCharges('BUY', entry, qty)); // entry fill only — no exit fill happened
+    const strat = (await listPaperStrategies()).find((s) => s.id === 'lifecycle_strat');
+    expect(strat?.status).toBe('RUNNING');
   });
 
   it('applies the hard 28% stop-loss on a losing move and updates balances correctly negative', async () => {
