@@ -4,7 +4,7 @@ import { moduleLogger } from '../lib/logger';
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
-import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules } from '../db';
+import { pushAgentEvent, listAgentEvents, createPaperStrategy, listPaperStrategies, getActiveRules } from '../db';
 import { INDEX_INSTRUMENTS } from './marketData';
 import { marketClock } from './marketHours';
 import type { PaperExecutionEngine } from '../engines/paper';
@@ -117,6 +117,9 @@ export type AgentObjectiveIntent = 'QUERY' | 'TRADE';
 export function classifyObjectiveIntent(objective: string): AgentObjectiveIntent {
   const clean = objective.trim().toLowerCase();
 
+  // Diagnostic inquiries and alert remediation bypass trade pipeline
+  if (/\b(diagnose|troubleshoot|remediate|investigate|alert)\b/i.test(clean)) return 'QUERY';
+
   // Explicit query prefixes or inquiry keywords
   const isQuestion = /^(what|why|how|when|where|who|which|is|are|can|show|list|tell|check|explain|describe|search|find|lookup|fetch|get)\b/i.test(clean)
     || clean.endsWith('?')
@@ -203,6 +206,18 @@ function resolveMarketFact(market: MarketDataService, obj: string): string | nul
     }
   }
   return null;
+}
+
+async function auditStrategyConcurrency(risk: RiskEngine) {
+  const [strategies, positions] = await Promise.all([
+    listPaperStrategies().catch(() => []),
+    risk.getPortfolio().getPositions().catch(() => []),
+  ]);
+  const running = strategies.filter((s: any) => s.status === 'RUNNING');
+  const flat = running.filter((s: any) => !(s.legs || []).some((leg: any) =>
+    positions.some((p: any) => (p.tradingSymbol === leg.instrument || p.symbol === leg.instrument) && Number(p.netQty ?? p.positionQty ?? 0) !== 0)
+  ));
+  return { running, flat, positions };
 }
 
 type ExecutionEngine = PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine;
@@ -446,7 +461,11 @@ export class AgentOrchestrator {
 
     // Read-only queries execute concurrently without exclusive trading mutex
     if (intent === 'QUERY') {
-      void this.handleQueryObjective(runId, objective, triggeredBy);
+      if (/\b(diagnose|troubleshoot|remediate|alert)\b/i.test(objective)) {
+        void this.handleDiagnosticObjective(runId, objective, triggeredBy);
+      } else {
+        void this.handleQueryObjective(runId, objective, triggeredBy);
+      }
       return { runId, status: 'started', triggeredBy };
     }
 
@@ -575,6 +594,42 @@ export class AgentOrchestrator {
     return null;
   }
 
+  private async resolveDiagnosticFact(runId: string, objective: string): Promise<string | null> {
+    const lower = objective.toLowerCase();
+    if (!/\b(diagnose|troubleshoot|remediate|investigate|alert|stale|error)\b/i.test(lower)) return null;
+
+    const clock = marketClock();
+    const parts: string[] = [`Exchange: ${clock.istTime} IST (${clock.isMarketOpen ? 'OPEN' : 'CLOSED'})`];
+
+    // Diagnose feed/tick latency against market hours to detect benign off-market drift vs real disconnects
+    if (/\b(stale|tick|feed|websocket|socket|market\s*data)\b/i.test(lower)) {
+      const lastTickAt = (this.market as any).lastTickAt;
+      const tickAge = lastTickAt ? Math.round((Date.now() - lastTickAt) / 1000) : null;
+      parts.push(`Feed Age: ${tickAge !== null ? `${tickAge}s` : 'None'}`);
+
+      const probe = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [13] } });
+      const nq = probe?.data?.IDX_I?.['13']?.last_price;
+      if (nq) parts.push(`NIFTY spot: ₹${nq}`);
+
+      if (!clock.isMarketOpen) {
+        parts.push('Analysis: Session closed; off-hours tick staleness is expected and benign.');
+      } else if (tickAge !== null && tickAge <= 10) {
+        parts.push('Status: WebSocket feed has recovered. Ticks are streaming nominally.');
+      } else {
+        parts.push('Action: Feed latency detected. Recommend verifying market feed subscriber connection.');
+      }
+    }
+
+    if (/\b(margin|fund|balance|capital|insufficient)\b/i.test(lower)) {
+      const funds = await this.callTool(runId, 'risk', 'dhan_funds', {});
+      const avail = funds?.availMargin ?? funds?.data?.availMargin;
+      if (avail !== undefined) parts.push(`Available Margin: ₹${Number(avail).toLocaleString('en-IN')}`);
+    }
+
+    parts.push(`Kill Switch: ${this.risk.isKilled() ? 'ENGAGED' : 'ARMED / OK'}`);
+    return `Diagnostic Findings: ${parts.join(' | ')}.`;
+  }
+
   private async handleQueryObjective(runId: string, objective: string, triggeredBy = 'control_plane'): Promise<void> {
     this.activeRunTriggers.set(runId, triggeredBy);
     try {
@@ -584,7 +639,8 @@ export class AgentOrchestrator {
       const portFact = !specFact ? await resolvePortfolioFact(this.risk, objective) : null;
       const marketFact = !specFact && !portFact ? resolveMarketFact(this.market, objective) : null;
       const toolFact = !specFact && !portFact && !marketFact ? await this.dispatchQueryTool(runId, objective) : null;
-      const knownFact = specFact?.answer || portFact || marketFact || toolFact;
+      const diagFact = !specFact && !portFact && !marketFact && !toolFact ? await this.resolveDiagnosticFact(runId, objective) : null;
+      const knownFact = specFact?.answer || portFact || marketFact || toolFact || diagFact;
 
       const systemPrompt = 'You are an institutional trading assistant for DhanHQ Axis Nexus. Answer the user question directly, accurately, and concisely based on the facts provided. Maximum 3 sentences.';
       const promptContext = knownFact
@@ -602,6 +658,47 @@ export class AgentOrchestrator {
       this.step(runId, 'analyst', 'OBSERVE', `Answer:\n${answer}`);
     } catch (e: any) {
       this.step(runId, 'critic', 'ERROR', `Query resolution error: ${e.message}`);
+    } finally {
+      this.activeRunTriggers.delete(runId);
+      eventBus.emit('system', { type: 'agent_run_complete', runId });
+    }
+  }
+
+  private async handleDiagnosticObjective(runId: string, objective: string, triggeredBy = 'control_plane'): Promise<void> {
+    this.activeRunTriggers.set(runId, triggeredBy);
+    try {
+      this.step(runId, 'planner', 'THINK', `Decomposing alert: 1. Audit circuit breakers & limits. 2. Inspect active strategies & positions. 3. Formulate concrete remediation.`);
+
+      const breakers = await this.risk.evaluate().catch(() => []);
+      const limits = this.risk.getLimits();
+      const tripped = breakers.filter((b: any) => b.state === 'ERROR' || b.state === 'WARN');
+      const breakerDesc = tripped.map((b: any) => `${b.rule}: ${b.state} (${b.current}/${b.threshold})`).join('; ') || 'All breakers nominal';
+      this.step(runId, 'risk', 'ACT', 'Circuit breakers & risk gates evaluated', { response: breakerDesc });
+
+      const { running, flat } = await auditStrategyConcurrency(this.risk);
+      const stratDesc = running.map((s: any) => `${s.name} (${s.id}): ${flat.includes(s) ? 'FLAT/IDLE' : 'ACTIVE'}`).join('; ');
+      this.step(runId, 'strategy', 'ACT', `Audited ${running.length} running strategies (${flat.length} idle/flat without open legs)`, { response: stratDesc });
+      this.step(runId, 'strategy', 'THINK', stratDesc ? `Strategy registry: ${stratDesc}` : 'No active strategies registered.');
+
+      const isConcurrencyIssue = /\b(concurrent|strategies|pile-up)\b/i.test(objective) || tripped.some((b: any) => b.rule === 'Concurrent Strategies');
+      let actionText = '';
+      let tagText = '';
+      if (isConcurrencyIssue && flat.length > 0) {
+        actionText = `Remediation: Stop ${flat.length} idle strategy(ies) (${flat.map((s: any) => s.name).join(', ')}) to reduce concurrency from ${running.length} to ${running.length - flat.length}/${limits.maxConcurrentStrategies}.`;
+        tagText = `\n[REMEDIATION: STOP_STRATEGIES ids=${flat.map((s: any) => s.id).join(',')} count=${flat.length}]`;
+      } else if (isConcurrencyIssue) {
+        actionText = `All ${running.length} running strategies have active legs. Recommend increasing maxConcurrentStrategies or waiting for target exits.`;
+      } else {
+        const diagFact = await this.resolveDiagnosticFact(runId, objective);
+        actionText = diagFact || 'Verify system status and market data feed connectivity.';
+      }
+
+      this.step(runId, 'execution', 'THINK', actionText);
+
+      const answer = `Diagnosis: ${breakerDesc}.\nStrategy Audit: ${running.length} strategies running (${flat.length} idle/flat).\nRemediation: ${actionText}${tagText}`;
+      this.step(runId, 'analyst', 'OBSERVE', `Answer:\n${answer}`);
+    } catch (e: any) {
+      this.step(runId, 'critic', 'ERROR', `Diagnostic triage error: ${e.message}`);
     } finally {
       this.activeRunTriggers.delete(runId);
       eventBus.emit('system', { type: 'agent_run_complete', runId });

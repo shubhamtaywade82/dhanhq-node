@@ -116,7 +116,7 @@ function applyEnvelope(prev: AppState, env: Envelope): AppState {
     }
     case 'alert': {
       const p = env.payload || {};
-      const alert = { id: env.ts + prev.alertIdCounter, time: new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', msg: p.msg || p.message || '', read: false };
+      const alert = { id: env.ts + prev.alertIdCounter, time: new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', msg: p.msg || p.message || '', read: false, source: p.source || 'system' };
       const alerts = [...prev.alerts, alert];
       return { ...prev, alerts: alerts.length > 200 ? alerts.slice(-200) : alerts, alertIdCounter: prev.alertIdCounter + 1 };
     }

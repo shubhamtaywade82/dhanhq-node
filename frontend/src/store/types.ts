@@ -77,6 +77,7 @@ export interface Alert {
   level: 'INFO' | 'WARN' | 'ERROR';
   msg: string;
   read: boolean;
+  source?: string;
 }
 
 export interface SidekiqWorker {

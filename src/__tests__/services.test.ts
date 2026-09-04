@@ -921,6 +921,84 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
     risk.stop();
   });
 
+  it('routes alert diagnosis objectives to lockless diagnostic triage without trade execution', async () => {
+    const client = stubClient();
+    const market = stubMarket(100);
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const live = new LiveExecutionEngine(client, {} as any, market.monitor, market, risk);
+    const agent = new AgentOrchestrator(client, market, risk, paper, live);
+
+    const emittedEvents: any[] = [];
+    const unsubscribe = eventBus.on('telemetry', (ev) => emittedEvents.push(ev));
+
+    jest.spyOn((agent as any).tools, 'execute').mockResolvedValueOnce({
+      status: 'success',
+      data: { IDX_I: { '13': { last_price: 24000 } } }
+    });
+
+    try {
+      const res = await agent.run('Diagnose and remediate alert [ERROR] (marketData): Stale Market Tick: OK → ERROR');
+      expect(res.status).toBe('started');
+
+      await new Promise((r) => setTimeout(r, 120));
+      const steps = emittedEvents.map((e) => e.payload || e);
+      const actProbe = steps.find((e) => e.type === 'ACT' && e.tool === 'dhan_ltp');
+      expect(actProbe).toBeDefined();
+
+      const answer = steps.find((e) => e.summary?.includes('Answer:'));
+      expect(answer).toBeDefined();
+      expect(answer.summary).toMatch(/Diagnostic Findings|Exchange|Feed/i);
+    } finally {
+      unsubscribe();
+      risk.stop();
+    }
+  });
+
+  it('engages multi-agent personas and audits running strategies for concurrency alert remediation', async () => {
+    const client = stubClient();
+    const market = stubMarket(100);
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const live = new LiveExecutionEngine(client, {} as any, market.monitor, market, risk);
+    const agent = new AgentOrchestrator(client, market, risk, paper, live);
+
+    // Mock 5 running strategies: 3 active with open positions, 2 flat/idle
+    await createPaperStrategy({ id: 's1', name: 'NIFTY ORB', symbol: 'NIFTY', type: 'ORB_15M', lots: 1, legs: [{ instrument: 'NIFTY24050CE', qty: 50, side: 'BUY' }] });
+    await createPaperStrategy({ id: 's2', name: 'BANKNIFTY Straddle', symbol: 'BANKNIFTY', type: 'STRADDLE', lots: 1, legs: [{ instrument: 'BNF50000CE', qty: 30, side: 'SELL' }] });
+    await createPaperStrategy({ id: 's3', name: 'SENSEX Condor', symbol: 'SENSEX', type: 'IRON_CONDOR', lots: 1, legs: [{ instrument: 'SENSEX80000CE', qty: 20, side: 'BUY' }] });
+    await createPaperStrategy({ id: 's4', name: 'FINNIFTY Breakout', symbol: 'FINNIFTY', type: 'ORB_15M', lots: 1, legs: [] });
+    await createPaperStrategy({ id: 's5', name: 'MIDCPNIFTY VWAP', symbol: 'MIDCPNIFTY', type: 'VWAP_RSI', lots: 1, legs: [] });
+
+    const emittedEvents: any[] = [];
+    const unsubscribe = eventBus.on('telemetry', (ev) => emittedEvents.push(ev));
+
+    try {
+      const res = await agent.run('Diagnose and remediate alert [ERROR] (risk_engine): Concurrent Strategies: WARN → ERROR (current 5, threshold 5). Action: Block new strategy deploys — correlated pile-up across indices');
+      expect(res.status).toBe('started');
+
+      await new Promise((r) => setTimeout(r, 150));
+      const steps = emittedEvents.map((e) => e.payload || e);
+
+      expect(steps.some((e) => e.agent === 'planner' && e.type === 'THINK')).toBe(true);
+      expect(steps.some((e) => e.agent === 'risk' && e.type === 'ACT')).toBe(true);
+      expect(steps.some((e) => e.agent === 'strategy' && e.type === 'ACT')).toBe(true);
+      expect(steps.some((e) => e.agent === 'execution' && e.type === 'THINK')).toBe(true);
+      expect(steps.some((e) => e.agent === 'analyst' && e.type === 'OBSERVE')).toBe(true);
+
+      const answer = steps.find((e) => e.summary?.includes('Answer:'));
+      expect(answer).toBeDefined();
+      expect(answer.summary).toContain('REMEDIATION: STOP_STRATEGIES');
+      expect(answer.summary).toContain('FINNIFTY Breakout');
+      expect(answer.summary).toContain('MIDCPNIFTY VWAP');
+    } finally {
+      unsubscribe();
+      risk.stop();
+    }
+  });
+
   it('unwinds a multi-leg deploy when only some legs fill (EXEC-01)', async () => {
     jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
       .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST, Tuesday
