@@ -341,6 +341,33 @@ describe('RiskEngine — real-state circuit breakers', () => {
     risk.stop();
   });
 
+  it('Margin Utilization & Affordability: blocks orders exceeding available balance and trips at 70% threshold', async () => {
+    await saveRiskState({ killed: false, killedReason: null, killedDate: null, limits: { ...DEFAULT_RISK_LIMITS } });
+    const client = stubClient();
+    const market = stubMarket(100);
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    await resetPaperWallet(100000);
+
+    // 1. Attempting to place an order needing more margin than available throws Insufficient margin
+    await expect(
+      executePaperOrder({ symbol: 'OVERMARGIN', quantity: 2000, transactionType: 'BUY', price: 100 })
+    ).rejects.toThrow(/Insufficient margin/i);
+
+    // 2. Used margin exceeding 70% limit trips breaker to ERROR and blocks canTrade()
+    await executePaperOrder({ symbol: 'MARGIN75', quantity: 750, transactionType: 'BUY', price: 100 });
+    const rows = await risk.evaluate();
+    const marginRow = rows.find((r) => r.rule === 'Margin Utilization')!;
+    expect(marginRow.state).toBe('ERROR');
+    expect(risk.canTrade().allowed).toBe(false);
+    expect(risk.canTrade().reason).toMatch(/Margin Utilization breached/i);
+
+    // 3. Asymmetric close rule: position closure is allowed even during 70%+ utilization
+    await expect(closePaperPosition('MARGIN75', 100)).resolves.toBeDefined();
+
+    risk.stop();
+  });
+
   it('Stale Market Tick: uses tiered WARN vs ERROR and does not block canTrade on WARN', async () => {
     await saveRiskState({ killed: false, killedReason: null, killedDate: null, limits: { staleTickSec: 30 } });
     const client = stubClient();
