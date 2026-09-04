@@ -7,6 +7,7 @@ import { LiveExecutionEngine } from '../engines/live';
 import { eventBus } from '../services/eventBus';
 import { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { EventEmitter } from 'events';
+import * as marketHours from '../services/marketHours';
 import {
   initDatabase, dbMode, executePaperOrder, getPaperWallet,
   listPaperPositions, closeAllPaperPositions, markPositionsToMarket,
@@ -26,6 +27,7 @@ function stubClient(): DhanClient {
 
 function stubMarket(ltp: number | null = 100): MarketDataService {
   const svc = new MarketDataService(stubClient());
+  (svc as any).lastTickAt = Date.now();
   // Inject a live-ish quote without hitting the network.
   (svc as any).quotes.set('44000', {
     securityId: '44000', symbol: undefined, ltp: ltp ?? 100,
@@ -271,6 +273,7 @@ describe('RiskEngine — real-state circuit breakers', () => {
     // so the very first fill locked out every subsequent order.
     const client = stubClient();
     const market = stubMarket(100);
+    (market as any).lastTickAt = Date.now();
     (market as any).quotes.set('13', { // NIFTY index securityId
       securityId: '13', symbol: 'NIFTY', ltp: 24000, change: 0, pctChange: 0,
       high: 24100, low: 23900, open: 24000, prevClose: 24000, volume: 0, oi: 0, updatedAt: Date.now(),
@@ -423,12 +426,13 @@ describe('MarketDataService — WebSocket failover', () => {
     const originalToken = process.env.DHAN_ACCESS_TOKEN;
     process.env.DHAN_ACCESS_TOKEN = 'test-token';
 
-    // Current local test run is at 08:28 AM IST (before 09:10 IST open)
+    const spy = jest.spyOn(marketHours, 'isWsMarketWindowOpen').mockReturnValue(false);
     try {
       (service as any).tryStartWs(false);
       // When outside market hours, connect() must NOT be called
       expect(market.connect).not.toHaveBeenCalled();
     } finally {
+      spy.mockRestore();
       service.stop();
       if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
       else process.env.DHAN_ACCESS_TOKEN = originalToken;
