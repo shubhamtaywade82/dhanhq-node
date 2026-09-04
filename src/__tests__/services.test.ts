@@ -1,7 +1,7 @@
 import { RiskEngine, DEFAULT_RISK_LIMITS } from '../services/riskEngine';
 import { getSystemState, setSystemState } from '../services/systemState';
 import { MarketDataService } from '../services/marketData';
-import { AgentOrchestrator } from '../services/agent';
+import { AgentOrchestrator, readOllamaCloudKeys } from '../services/agent';
 import { PaperExecutionEngine } from '../engines/paper';
 import { LiveExecutionEngine } from '../engines/live';
 import { eventBus } from '../services/eventBus';
@@ -570,12 +570,35 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
       expect((localAgent as any).llmModel).toBe(process.env.OLLAMA_MODEL || 'qwen2.5:0.5b');
 
       process.env.OLLAMA_API_KEY_1 = 'test-cloud-key';
-      process.env.OLLAMA_CLOUD_MODEL = 'gemma4:cloud';
+      process.env.OLLAMA_CLOUD_MODEL = 'gemma4:31b';
       const cloudAgent = new AgentOrchestrator(stubClient(), stubMarket(100), new RiskEngine(stubClient(), stubMarket(100)), {} as any, {} as any);
-      expect((cloudAgent as any).llmModel).toBe('gemma4:cloud');
+      expect((cloudAgent as any).llmModel).toBe('gemma4:31b');
     } finally {
       if (priorKey === undefined) delete process.env.OLLAMA_API_KEY_1; else process.env.OLLAMA_API_KEY_1 = priorKey;
       if (priorCloudModel === undefined) delete process.env.OLLAMA_CLOUD_MODEL; else process.env.OLLAMA_CLOUD_MODEL = priorCloudModel;
+    }
+  });
+
+  it('readOllamaCloudKeys reads any number of OLLAMA_API_KEY_N, not just 3, stopping at the first gap', () => {
+    const keys = ['OLLAMA_API_KEY_1', 'OLLAMA_API_KEY_2', 'OLLAMA_API_KEY_3', 'OLLAMA_API_KEY_4', 'OLLAMA_API_KEY_5'];
+    const prior = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    try {
+      for (const k of keys) delete process.env[k];
+      expect(readOllamaCloudKeys()).toEqual([]);
+
+      process.env.OLLAMA_API_KEY_1 = 'k1';
+      process.env.OLLAMA_API_KEY_2 = 'k2';
+      process.env.OLLAMA_API_KEY_3 = 'k3';
+      process.env.OLLAMA_API_KEY_4 = 'k4';
+      process.env.OLLAMA_API_KEY_5 = 'k5';
+      expect(readOllamaCloudKeys()).toEqual(['k1', 'k2', 'k3', 'k4', 'k5']); // a 4th/5th key needs no code change
+
+      delete process.env.OLLAMA_API_KEY_3; // gap at 3 — stops before picking up 4/5
+      expect(readOllamaCloudKeys()).toEqual(['k1', 'k2']);
+    } finally {
+      for (const k of keys) {
+        if (prior[k] === undefined) delete process.env[k]; else process.env[k] = prior[k];
+      }
     }
   });
 

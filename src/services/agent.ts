@@ -1,5 +1,6 @@
 import { AgentToolRegistry, Policy, type DhanClient } from '@nemesis-oss/dhanhq-sdk';
-import { OllamaClient } from '@nemesis-oss/ollama-sdk';
+import { OllamaClient, type Logger as OllamaLogger } from '@nemesis-oss/ollama-sdk';
+import { moduleLogger } from '../lib/logger';
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
@@ -178,6 +179,35 @@ async function unwindLegs(engine: ExecutionEngine, stratId: string, filledLegs: 
   eventBus.log('ERROR', `Multi-leg deploy partially filled (${filledLegs.length}) — unwound`, 'agent');
 }
 
+/** Reads OLLAMA_API_KEY_1, _2, _3, ... — open-ended, not capped at 3 — so
+ * adding a 4th Ollama Cloud account is an env var, not a code change. Stops
+ * at the first gap (matches how numbered env vars are conventionally read
+ * elsewhere in this codebase, e.g. DHAN_SANDBOX_*): a key set at _1 and _3
+ * with _2 missing only picks up _1. */
+export function readOllamaCloudKeys(): string[] {
+  const keys: string[] = [];
+  for (let i = 1; ; i++) {
+    const key = process.env[`OLLAMA_API_KEY_${i}`];
+    if (!key) break;
+    keys.push(key);
+  }
+  return keys;
+}
+
+const ollamaCloudLog = moduleLogger('ollama_cloud');
+/** Adapts this app's structured logger to the SDK's Logger interface so its
+ * internal per-credential attempt/failure lines ("Executing on endpoint
+ * cloud-2", "Failed on cloud-1: rate_limited") reach real logs instead of
+ * being silently dropped (the SDK defaults to a no-op logger) — this is how
+ * an operator sees WHICH numbered key is rate-limited/dead, not just that
+ * the whole call eventually succeeded or failed. */
+const ollamaSdkLogger: OllamaLogger = {
+  debug: (msg, ctx) => ollamaCloudLog.debug(ctx || {}, msg),
+  info: (msg, ctx) => ollamaCloudLog.info(ctx || {}, msg),
+  warn: (msg, ctx) => ollamaCloudLog.warn(ctx || {}, msg),
+  error: (msg, ctx) => ollamaCloudLog.error(ctx || {}, msg),
+};
+
 export class AgentOrchestrator {
   private client: DhanClient;
   private market: MarketDataService;
@@ -203,18 +233,25 @@ export class AgentOrchestrator {
     this.tools = new AgentToolRegistry({ client, policy: Policy.fromEnv() });
 
     // Ollama Cloud, when API keys are configured (same env var names as the
-    // paper-broker app — OLLAMA_API_KEY_1/2/3 — so the same keys work here
-    // unchanged): several keys bound to one cloud model via the SDK's native
-    // credential/failover routing, so a rate-limited or dead key falls
-    // through to the next one automatically. No local baseUrl fallback in
-    // this mode — a local Ollama daemon almost certainly doesn't have the
-    // cloud-only model pulled, so a "fallback" request would just fail with
-    // a model-not-found error instead of a useful retry. Total cloud
-    // failure already degrades to deterministic mode via reason()'s catch,
-    // same as local-Ollama-unreachable does today.
-    const cloudKeys = [process.env.OLLAMA_API_KEY_1, process.env.OLLAMA_API_KEY_2, process.env.OLLAMA_API_KEY_3]
-      .filter((k): k is string => Boolean(k));
-    const cloudModel = process.env.OLLAMA_CLOUD_MODEL || 'gemma4:cloud';
+    // paper-broker app — OLLAMA_API_KEY_1, _2, _3, ... — so the same keys
+    // work here unchanged, and any further ones just need adding to .env,
+    // not this code): all keys bound to one cloud model via the SDK's
+    // native credential/failover routing (rate_limited is in its default
+    // failover code list), so a rate-limited or dead key falls through to
+    // the next one automatically — verified for real: one of three test
+    // keys hit its weekly quota (429) and the SDK moved on. No local
+    // baseUrl fallback in this mode — a local Ollama daemon almost
+    // certainly doesn't have the cloud-only model pulled, so a "fallback"
+    // request would just fail with a model-not-found error instead of a
+    // useful retry. Total cloud failure already degrades to deterministic
+    // mode via reason()'s catch, same as local-Ollama-unreachable does today.
+    const cloudKeys = readOllamaCloudKeys();
+    // gemma4:31b, not gemma4:cloud: verified against the account's own
+    // ollama.com/settings usage page — gemma4:31b is on the confirmed free
+    // model list (alongside gpt-oss:120b/20b, nemotron-3-*); gemma4:cloud
+    // also returns a real completion but isn't on that list, so it's not
+    // confirmed to draw from the same free quota.
+    const cloudModel = process.env.OLLAMA_CLOUD_MODEL || 'gemma4:31b';
     this.llmModel = cloudKeys.length > 0 ? cloudModel : (process.env.OLLAMA_MODEL || 'qwen2.5:0.5b');
 
     if (process.env.OLLAMA_ENABLED !== 'false') {
@@ -223,6 +260,7 @@ export class AgentOrchestrator {
             baseUrl: process.env.OLLAMA_CLOUD_BASE_URL || 'https://ollama.com',
             credentials: Object.fromEntries(cloudKeys.map((apiKey, i) => [`cloud-${i + 1}`, { apiKey }])),
             modelBindings: { [cloudModel]: cloudKeys.map((_, i) => `cloud-${i + 1}`) },
+            logger: ollamaSdkLogger,
             timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS) || 15000,
             retries: 0,
           })
