@@ -176,15 +176,17 @@ export class AutonomyEngine {
 
   private async evaluateAutonomousScan(clock: ReturnType<typeof marketClock>): Promise<void> {
     if (!this.scanEnabled || !this.agent || !clock.isMarketOpen || clock.squareOffWindow) return;
-    if (Date.now() - this.lastScanAt < 60_000) return; // 60s scan cooldown
+    const cooldown = Number(process.env.AUTONOMOUS_SCAN_INTERVAL_MS) || 180_000;
+    if (Date.now() - this.lastScanAt < cooldown) return;
 
     const gate = this.risk.canTrade();
     if (!gate.allowed) return;
 
-    // Portfolio-abstraction-aware — a direct listPaperPositions() call here
-    // would check the paper ledger even in broker mode (always near-empty,
-    // since real positions live at the broker), silently disabling this
-    // cap for live trading instead of enforcing it.
+    // Skip heavy multi-index option chain pulls if circuit breakers are in error state
+    const breakers = this.risk.snapshot().breakers || [];
+    if (breakers.some((b) => b.state === 'ERROR')) return;
+
+    // Portfolio-abstraction-aware — check real open position cap
     const positions = await this.portfolio.getPositions();
     if (positions.filter((p) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
 

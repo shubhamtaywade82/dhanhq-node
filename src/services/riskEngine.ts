@@ -57,7 +57,7 @@ export const DEFAULT_RISK_LIMITS: RiskLimits = {
   perStrategyLossLimit: 20000,
   maxConsecutiveLosses: 5,
   maxRejectionRatePct: 10,
-  staleTickSec: 10,
+  staleTickSec: Number(process.env.RISK_STALE_TICK_SEC) || 30,
   maxConcurrentStrategies: Number(process.env.RISK_MAX_CONCURRENT_STRATEGIES) || 5,
   maxPortfolioDeltaPct: Number(process.env.RISK_MAX_PORTFOLIO_DELTA_PCT) || 1000,
 };
@@ -81,6 +81,7 @@ export class RiskEngine {
   private killedDate: string | null = null; // IST date armed on — see start()
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastBreakers: CircuitBreakerRow[] = [];
+  private lastAlertTimes = new Map<string, number>();
   private lastEvalAt = 0;
   private tickEvalScheduled = false;
   private lastRiskEmitAt = 0;
@@ -363,7 +364,10 @@ export class RiskEngine {
     const deltaPct = (Math.abs(deltaNotional) / total) * 100;
     const tickAge = this.market.tickAgeSec();
     const clock = marketClock();
-    const stale = clock.isMarketOpen && tickAge > this.limits.staleTickSec;
+    const staleErrorLimit = this.limits.staleTickSec;
+    const staleWarnLimit = Math.max(10, Math.round(staleErrorLimit * 0.5));
+    const isStaleError = clock.isMarketOpen && tickAge > staleErrorLimit;
+    const isStaleWarn = clock.isMarketOpen && tickAge > staleWarnLimit;
 
     const rows: CircuitBreakerRow[] = [
       {
@@ -396,9 +400,9 @@ export class RiskEngine {
       },
       {
         rule: 'Stale Market Tick',
-        threshold: `>${this.limits.staleTickSec}s during market hours`,
+        threshold: `>${staleErrorLimit}s (warn >${staleWarnLimit}s)`,
         current: clock.isMarketOpen ? (tickAge === Infinity ? 'no ticks yet' : `${tickAge}s`) : 'market closed',
-        state: stale ? 'ERROR' : 'OK',
+        state: isStaleError ? 'ERROR' : isStaleWarn ? 'WARN' : 'OK',
         action: 'Pause strategies consuming stale data',
       },
       {
@@ -424,14 +428,19 @@ export class RiskEngine {
       },
     ];
 
-    // Alert on state transitions (avoid alert storms: only on change).
+    // Alert on state transitions (avoid alert storms: only on change, debounced 60s).
+    const now = Date.now();
     for (const row of rows) {
       const prev = this.lastBreakers.find((b) => b.rule === row.rule);
       if (prev && prev.state !== row.state && row.state !== 'OK') {
-        const level = row.state === 'ERROR' ? 'ERROR' : 'WARN';
-        await pushAlert(level, 'risk_engine', `${row.rule}: ${prev.state} → ${row.state} (current ${row.current}, threshold ${row.threshold}). Action: ${row.action}`);
-        eventBus.emit('alert', { level, source: 'risk_engine', msg: `${row.rule} tripped — ${row.current} vs ${row.threshold}` });
-        journal.append('risk_decision', { rule: row.rule, from: prev.state, to: row.state, current: row.current, threshold: row.threshold, action: row.action });
+        const lastAlert = this.lastAlertTimes.get(row.rule) || 0;
+        if (now - lastAlert >= 60_000 || prev.state === 'OK') {
+          this.lastAlertTimes.set(row.rule, now);
+          const level = row.state === 'ERROR' ? 'ERROR' : 'WARN';
+          await pushAlert(level, 'risk_engine', `${row.rule}: ${prev.state} → ${row.state} (current ${row.current}, threshold ${row.threshold}). Action: ${row.action}`);
+          eventBus.emit('alert', { level, source: 'risk_engine', msg: `${row.rule} tripped — ${row.current} vs ${row.threshold}` });
+          journal.append('risk_decision', { rule: row.rule, from: prev.state, to: row.state, current: row.current, threshold: row.threshold, action: row.action });
+        }
       }
     }
 
@@ -441,7 +450,7 @@ export class RiskEngine {
     if (!this.killed) {
       if (dayPnl <= -this.limits.dailyLossLimit) {
         await this.armKillSwitch(`Daily loss limit breached (₹${Math.round(dayPnl)} ≤ -₹${this.limits.dailyLossLimit})`);
-      } else if (stale) {
+      } else if (isStaleError) {
         // Stale ticks: don't kill positions, but block new entries via canTrade
         // (the autonomy engine checks this gate each cycle).
       }
@@ -451,7 +460,6 @@ export class RiskEngine {
     // the full snapshot at the same rate floods the eventBus/log bridge for
     // no UI benefit (numbers don't need to redraw faster than ~1/s). Throttle
     // the emit only — detection and kill-switch arming above are unaffected.
-    const now = Date.now();
     if (now - this.lastRiskEmitAt >= 1000) {
       this.lastRiskEmitAt = now;
       eventBus.emit('risk', this.snapshot());

@@ -797,6 +797,130 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
     risk.stop();
   });
 
+  it('resolves informational queries directly without running the trading pipeline or option chain pulls', async () => {
+    const client = stubClient();
+    const market = stubMarket(100);
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const live = new LiveExecutionEngine(client, {} as any, market.monitor, market, risk);
+    const agent = new AgentOrchestrator(client, market, risk, paper, live);
+
+    const emittedEvents: any[] = [];
+    const unsubscribe = eventBus.on('telemetry', (ev) => emittedEvents.push(ev));
+
+    try {
+      const res = await agent.run('What is the lot size of options for SENSEX currently');
+      expect(res.status).toBe('started');
+
+      // Wait a short tick for asynchronous executeRun to resolve query
+      await new Promise((r) => setTimeout(r, 100));
+      const answerStep = emittedEvents.map((e) => e.payload || e).find((e) => e.summary?.includes('Answer:'));
+      expect(answerStep).toBeDefined();
+      expect(answerStep.summary).toContain('20 units per lot');
+      expect(answerStep.summary).toContain('SENSEX');
+
+      // Assert that option chain and backtest were never triggered
+      const toolSteps = emittedEvents.map((e) => e.payload || e).filter((e) => e.tool);
+      expect(toolSteps.some((e) => e.tool === 'dhan_option_chain')).toBe(false);
+      expect(toolSteps.some((e) => e.tool === 'strategy.backtest')).toBe(false);
+    } finally {
+      unsubscribe();
+      risk.stop();
+    }
+  });
+
+  it('accurately resolves BANKNIFTY lot size without colliding with NIFTY', async () => {
+    const client = stubClient();
+    const market = stubMarket(100);
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const live = new LiveExecutionEngine(client, {} as any, market.monitor, market, risk);
+    const agent = new AgentOrchestrator(client, market, risk, paper, live);
+
+    const emittedEvents: any[] = [];
+    const unsubscribe = eventBus.on('telemetry', (ev) => emittedEvents.push(ev));
+
+    try {
+      const res = await agent.run('What is the lot size of options for BANKNIFTY currently');
+      expect(res.status).toBe('started');
+
+      await new Promise((r) => setTimeout(r, 100));
+      const answerStep = emittedEvents.map((e) => e.payload || e).find((e) => e.summary?.includes('Answer:'));
+      expect(answerStep).toBeDefined();
+      expect(answerStep.summary).toContain('30 units per lot');
+      expect(answerStep.summary).toContain('BANKNIFTY');
+      expect(answerStep.summary).not.toContain('65 units per lot');
+    } finally {
+      unsubscribe();
+      risk.stop();
+    }
+  });
+
+  it('dynamically executes DhanHQ SDK tools during queries when requested', async () => {
+    const client = stubClient();
+    const market = stubMarket(100);
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const live = new LiveExecutionEngine(client, {} as any, market.monitor, market, risk);
+    const agent = new AgentOrchestrator(client, market, risk, paper, live);
+
+    const emittedEvents: any[] = [];
+    const unsubscribe = eventBus.on('telemetry', (ev) => emittedEvents.push(ev));
+
+    // Hermetic spy on AgentToolRegistry so test executes in <10ms
+    jest.spyOn((agent as any).tools, 'execute').mockResolvedValueOnce([
+      { securityId: '2885', symbolName: 'RELIANCE', exchangeSegment: 'NSE_EQ' }
+    ]);
+
+    try {
+      const res = await agent.run('Search instrument RELIANCE');
+      expect(res.status).toBe('started');
+
+      await new Promise((r) => setTimeout(r, 100));
+      const actStep = emittedEvents.map((e) => e.payload || e).find((e) => e.type === 'ACT' && e.tool === 'dhan_search_instruments');
+      expect(actStep).toBeDefined();
+      expect(actStep.response).toContain('2885');
+
+      const answerStep = emittedEvents.map((e) => e.payload || e).find((e) => e.summary?.includes('Answer:'));
+      expect(answerStep).toBeDefined();
+      expect(answerStep.summary).toContain('RELIANCE');
+    } finally {
+      unsubscribe();
+      risk.stop();
+    }
+  });
+
+  it('allows informational queries to run concurrently even when a trade run is in progress (lockless queries)', async () => {
+    const client = stubClient();
+    const market = stubMarket(100);
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const live = new LiveExecutionEngine(client, {} as any, market.monitor, market, risk);
+    const agent = new AgentOrchestrator(client, market, risk, paper, live);
+
+    // Simulate a background autonomous trade run in progress
+    (agent as any).running = true;
+    (agent as any).currentRunTriggeredBy = 'autonomous_scanner';
+
+    // Trade run should be rejected or wait
+    await expect(agent.run('Buy 1 lot NIFTY call', 'autonomous_scanner')).rejects.toThrow(/in progress/i);
+
+    // But an informational query must succeed locklessly!
+    const queryRes = await agent.run('What is the lot size of options for SENSEX currently', 'control_plane');
+    expect(queryRes.status).toBe('started');
+    expect(queryRes.triggeredBy).toBe('control_plane');
+    expect(queryRes.runId).toBeDefined();
+
+    // Cleanup
+    (agent as any).running = false;
+    (agent as any).currentRunTriggeredBy = null;
+    risk.stop();
+  });
+
   it('unwinds a multi-leg deploy when only some legs fill (EXEC-01)', async () => {
     jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
       .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST, Tuesday

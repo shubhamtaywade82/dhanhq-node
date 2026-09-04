@@ -126,6 +126,8 @@ function applyEnvelope(prev: AppState, env: Envelope): AppState {
         ...prev,
         telemetryEvents: [...prev.telemetryEvents.slice(-399), {
           id: p.id || `ev_${env.ts}`,
+          runId: p.runId,
+          triggeredBy: p.triggeredBy,
           agent: p.agent || 'planner',
           type: p.type || 'ACT',
           time: p.time || new Date().toLocaleTimeString('en-GB', { hour12: false }),

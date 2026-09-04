@@ -6,6 +6,7 @@ import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
 import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules } from '../db';
 import { INDEX_INSTRUMENTS } from './marketData';
+import { marketClock } from './marketHours';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { LiveExecutionEngine } from '../engines/live';
 import { SandboxExecutionEngine } from '../engines/sandbox';
@@ -48,6 +49,7 @@ export interface AgentStep {
   response?: string;
   duration?: number;
   deterministic?: boolean;
+  triggeredBy?: string;
 }
 
 export interface AgentRunStatus {
@@ -59,6 +61,7 @@ export interface AgentRunStatus {
   toolCalls: number;
   llm: 'ollama' | 'deterministic';
   personas: Record<AgentKey, { status: 'idle' | 'active'; steps: number }>;
+  triggeredBy?: string | null;
 }
 
 const ALL_PERSONAS: AgentKey[] = ['planner', 'analyst', 'strategy', 'execution', 'risk', 'critic'];
@@ -102,6 +105,104 @@ export function classifyDispatchRegime(analyticsRegime: string | undefined, vix:
   if (analyticsRegime === 'LOW_IV_TREND' || vix >= 15.5) return 'BREAKOUT_MOMENTUM';
   if (analyticsRegime === 'EXPIRY_GAMMA') return 'EXPIRY_GAMMA';
   return 'TRENDING_DRIFT';
+}
+
+export type AgentObjectiveIntent = 'QUERY' | 'TRADE';
+
+/**
+ * Classifies an objective into an informational query vs a trade directive.
+ * Informational queries bypass option-chain pulling and strategy construction
+ * to avoid rate limits (429) and false risk alarms.
+ */
+export function classifyObjectiveIntent(objective: string): AgentObjectiveIntent {
+  const clean = objective.trim().toLowerCase();
+
+  // Explicit query prefixes or inquiry keywords
+  const isQuestion = /^(what|why|how|when|where|who|which|is|are|can|show|list|tell|check|explain|describe|search|find|lookup|fetch|get)\b/i.test(clean)
+    || clean.endsWith('?')
+    || /\b(lot\s*size|lotsize|contract\s*size|margin\s*balance|open\s*positions?)\b/i.test(clean);
+
+  // Imperative trade execution verbs
+  const hasTradeVerb = /\b(buy|sell|trade|deploy|execute|enter|place order|short|long|scalp|run scan|scan and trade|find highest probability trade)\b/i.test(clean);
+
+  // If it's an inquiry and lacks an imperative trade verb, it's a QUERY
+  if (isQuestion && !hasTradeVerb) return 'QUERY';
+  if (hasTradeVerb) return 'TRADE';
+
+  // Strategy names without question phrasing imply trade setup intent
+  const strategyNames = /\b(straddle|strangle|condor|butterfly|spread|orb|vwap)\b/i;
+  if (strategyNames.test(clean)) return 'TRADE';
+
+  return isQuestion ? 'QUERY' : 'TRADE';
+}
+
+export function matchIndexSymbol(text: string): string | null {
+  const upper = text.toUpperCase();
+  if (/BANK[\s\-_]?NIFTY|\bBNF\b/.test(upper)) return 'BANKNIFTY';
+  if (/FIN[\s\-_]?NIFTY/.test(upper)) return 'FINNIFTY';
+  if (/MIDC[AP]+[\s\-_]?NIFTY|\bMIDCPNIFTY\b|\bMIDCAP\b/.test(upper)) return 'MIDCPNIFTY';
+  if (/\bSENSEX\b/.test(upper)) return 'SENSEX';
+  if (/INDIA[\s\-_]?VIX|\bVIX\b/.test(upper)) return 'INDIAVIX';
+  if (/\bNIFTY\b|\bNIFTY[\s\-_]?50\b/.test(upper)) return 'NIFTY';
+  return null;
+}
+
+function resolveSpecFact(obj: string): { answer: string; symbol?: string } | null {
+  const upper = obj.toUpperCase();
+  const isLotSizeQuery = /LOT\s*SIZE|LOTSIZE|\bLOT\b|CONTRACT\s*SIZE/.test(upper);
+  if (!isLotSizeQuery) return null;
+
+  const matched = matchIndexSymbol(upper);
+  if (matched && matched !== 'INDIAVIX') {
+    const lotSize = getLotSize(matched);
+    const exchange = matched === 'SENSEX' ? 'BSE' : 'NSE';
+    const segment = matched === 'SENSEX' ? 'BSE_FNO' : 'NSE_FNO';
+    return {
+      symbol: matched,
+      answer: `The current lot size for ${exchange} ${matched} options contracts (${segment}) is ${lotSize} units per lot.`,
+    };
+  }
+
+  const symbols = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY'];
+  const allSizes = symbols.map((s) => `${s}: ${getLotSize(s)}`).join(', ');
+  return { answer: `Current index options lot sizes on Indian exchanges: ${allSizes}.` };
+}
+
+async function resolvePortfolioFact(risk: RiskEngine, obj: string): Promise<string | null> {
+  const lower = obj.toLowerCase();
+  if (/\b(margin|fund|balance|capital|cash)\b/.test(lower)) {
+    const wallet = await risk.getPortfolio().getWallet();
+    const avail = Number(wallet.availableMargin || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    const used = Number(wallet.usedMargin || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    const equity = Number(wallet.totalBalance || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    return `Portfolio Margin Status: Available Margin: ₹${avail}, Used Margin: ₹${used}, Total Equity: ₹${equity}.`;
+  }
+  if (/\b(positions?|holdings?)\b/.test(lower)) {
+    const positions = await risk.getPortfolio().getPositions();
+    const open = positions.filter((p: any) => Number(p.netQty ?? p.positionQty ?? 0) !== 0);
+    if (open.length === 0) return 'Portfolio Positions: You currently have 0 open positions.';
+    const details = open.map((p: any) => `${p.tradingSymbol || p.symbol}: Qty ${p.netQty || p.positionQty}, Unrealized PnL: ₹${Number(p.unrealizedPnl || 0).toFixed(2)}`).join('; ');
+    return `Open Positions (${open.length}): ${details}.`;
+  }
+  return null;
+}
+
+function resolveMarketFact(market: MarketDataService, obj: string): string | null {
+  const lower = obj.toLowerCase();
+  if (/\b(market status|is market open|trading hours|market open)\b/.test(lower)) {
+    const clock = marketClock();
+    const status = clock.isMarketOpen ? 'OPEN' : 'CLOSED';
+    return `Exchange Market Status: Regular trading session is currently ${status} (${clock.istTime} IST). Normal NSE/BSE equity & F&O hours are 09:15 to 15:30 IST.`;
+  }
+  const matched = matchIndexSymbol(obj);
+  if (matched && /\b(spot|price|ltp|quote|vix)\b/.test(lower)) {
+    const inst = INDEX_INSTRUMENTS[matched];
+    if (inst) {
+      const price = market.getLtp(inst.securityId);
+      if (price) return `Current spot price for ${inst.label} (${matched}) is ₹${price.toLocaleString('en-IN', { maximumFractionDigits: 2 })}.`;
+    }
+  }
+  return null;
 }
 
 type ExecutionEngine = PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine;
@@ -230,6 +331,8 @@ export class AgentOrchestrator {
   private llmAvailable = false;
   private running = false;
   private currentRun: AgentRunStatus | null = null;
+  private currentRunTriggeredBy: string | null = null;
+  private activeRunTriggers = new Map<string, string>();
   private llmProbed = false;
 
   constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, paper: PaperExecutionEngine, live: LiveExecutionEngine, sandbox?: SandboxExecutionEngine) {
@@ -296,9 +399,9 @@ export class AgentOrchestrator {
   }
 
   status(): AgentRunStatus {
-    return this.currentRun || {
+    return this.currentRun ? { ...this.currentRun, triggeredBy: this.currentRunTriggeredBy } : {
       running: false, runId: null, objective: null, startedAt: null, steps: 0, toolCalls: 0,
-      llm: this.llmAvailable ? 'ollama' : 'deterministic', personas: idlePersonas(),
+      llm: this.llmAvailable ? 'ollama' : 'deterministic', personas: idlePersonas(), triggeredBy: null,
     };
   }
 
@@ -334,32 +437,58 @@ export class AgentOrchestrator {
     }));
   }
 
-  async run(objective: string, triggeredBy = 'control_plane'): Promise<{ runId: string; status: string }> {
-    if (this.running) throw new Error('An agent run is already in progress');
+  async run(objective: string, triggeredBy = 'control_plane'): Promise<{ runId: string; status: string; triggeredBy: string }> {
     if (this.risk.isKilled()) throw new Error('Kill switch engaged — agent runs disabled');
     await this.probeLlm();
 
+    const intent = classifyObjectiveIntent(objective);
     const runId = `run_${Date.now().toString(36)}`;
+
+    // Read-only queries execute concurrently without exclusive trading mutex
+    if (intent === 'QUERY') {
+      void this.handleQueryObjective(runId, objective, triggeredBy);
+      return { runId, status: 'started', triggeredBy };
+    }
+
+    // Trade execution commands acquire exclusive trading lock
+    if (this.running) {
+      if (triggeredBy === 'control_plane' && this.currentRunTriggeredBy === 'autonomous_scanner') {
+        for (let i = 0; i < 35 && this.running; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      if (this.running) {
+        throw new Error('An agent trading run is currently in progress. Please retry in a moment.');
+      }
+    }
+
     this.running = true;
+    this.currentRunTriggeredBy = triggeredBy;
+    this.activeRunTriggers.set(runId, triggeredBy);
     this.currentRun = {
       running: true, runId, objective, startedAt: Date.now(), steps: 0, toolCalls: 0,
       llm: this.llmAvailable ? 'ollama' : 'deterministic', personas: idlePersonas(),
+      triggeredBy,
     };
 
     void this.executeRun(runId, objective, triggeredBy).finally(() => {
       this.running = false;
+      this.currentRunTriggeredBy = null;
+      this.activeRunTriggers.delete(runId);
       setTimeout(() => { if (this.currentRun?.runId === runId) this.currentRun = null; }, 30_000);
     });
 
-    return { runId, status: 'started' };
+    return { runId, status: 'started', triggeredBy };
   }
 
   private step(runId: string, agent: AgentKey, type: AgentStep['type'], summary: string, extra?: Partial<AgentStep>): void {
+    const triggeredBy = extra?.triggeredBy || this.activeRunTriggers.get(runId) || 'control_plane';
     const ev: AgentStep = {
       id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       runId, agent, type,
       time: new Date().toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Kolkata' }),
-      summary, duration: extra?.duration ?? 30 + Math.floor(Math.random() * 90), ...extra,
+      summary, duration: extra?.duration ?? 30 + Math.floor(Math.random() * 90),
+      triggeredBy, ...extra,
     };
     if (this.currentRun?.runId === runId) {
       this.currentRun.steps++;
@@ -403,132 +532,87 @@ export class AgentOrchestrator {
     return text;
   }
 
+  private async dispatchQueryTool(runId: string, objective: string): Promise<string | null> {
+    const lower = objective.toLowerCase();
+    const matched = matchIndexSymbol(objective);
+
+    if (/\b(expir(y|ies)|expiry\s*dates?)\b/i.test(lower) && matched) {
+      const inst = INDEX_INSTRUMENTS[matched];
+      if (inst) {
+        const res = await this.callTool(runId, 'analyst', 'dhan_option_expiries', {
+          underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I',
+        });
+        const dates: string[] = Array.isArray(res) ? res : res?.data || [];
+        if (dates.length > 0) {
+          return `DhanHQ SDK (dhan_option_expiries): Upcoming option expiries for ${matched}: ${dates.slice(0, 5).join(', ')}.`;
+        }
+      }
+    }
+
+    if (/\b(search|find|lookup|security\s*id)\b/i.test(lower)) {
+      const clean = objective.replace(/\b(what\s+is\s+the|can\s+you|search|for|instrument|stock|symbol|scrip|security\s*id|find|lookup|please)\b/gi, '').replace(/[?.,!]/g, '').trim();
+      if (clean.length >= 2) {
+        const res = await this.callTool(runId, 'analyst', 'dhan_search_instruments', { query: clean, limit: 5 });
+        const items = Array.isArray(res) ? res : res?.data || [];
+        if (items.length > 0) {
+          const desc = items.slice(0, 3).map((x: any) => `${x.symbolName || x.symbol || x.tradingSymbol} (ID: ${x.securityId}, Seg: ${x.segment || x.exchangeSegment})`).join('; ');
+          return `DhanHQ SDK (dhan_search_instruments): Found matching instruments: ${desc}.`;
+        }
+      }
+    }
+
+    if (/\b(kill\s*switch\s*status|is\s*kill\s*switch\s*active)\b/i.test(lower)) {
+      const res = await this.callTool(runId, 'risk', 'dhan_kill_switch_status', {});
+      return `DhanHQ SDK (dhan_kill_switch_status): Broker kill switch status is ${res?.status || res?.killSwitchStatus || 'INACTIVE'}.`;
+    }
+
+    if (/\b(holdings|demat|portfolio\s*holdings)\b/i.test(lower)) {
+      const res = await this.callTool(runId, 'analyst', 'dhan_holdings', {});
+      const items = Array.isArray(res) ? res : res?.data || [];
+      return `DhanHQ SDK (dhan_holdings): Current Demat holdings count is ${items.length}.`;
+    }
+
+    return null;
+  }
+
+  private async handleQueryObjective(runId: string, objective: string, triggeredBy = 'control_plane'): Promise<void> {
+    this.activeRunTriggers.set(runId, triggeredBy);
+    try {
+      this.step(runId, 'planner', 'THINK', `Query received: "${objective}". Direct resolution activated (bypassing trade execution pipeline).`);
+
+      const specFact = resolveSpecFact(objective);
+      const portFact = !specFact ? await resolvePortfolioFact(this.risk, objective) : null;
+      const marketFact = !specFact && !portFact ? resolveMarketFact(this.market, objective) : null;
+      const toolFact = !specFact && !portFact && !marketFact ? await this.dispatchQueryTool(runId, objective) : null;
+      const knownFact = specFact?.answer || portFact || marketFact || toolFact;
+
+      const systemPrompt = 'You are an institutional trading assistant for DhanHQ Axis Nexus. Answer the user question directly, accurately, and concisely based on the facts provided. Maximum 3 sentences.';
+      const promptContext = knownFact
+        ? `Objective: "${objective}"\nSystem Facts: ${knownFact}`
+        : `Objective: "${objective}"`;
+
+      const answer = await this.reason(
+        runId,
+        'analyst',
+        systemPrompt,
+        promptContext,
+        () => knownFact || `Analyst: Query processed for "${objective}". No active trading directive required.`
+      );
+
+      this.step(runId, 'analyst', 'OBSERVE', `Answer:\n${answer}`);
+    } catch (e: any) {
+      this.step(runId, 'critic', 'ERROR', `Query resolution error: ${e.message}`);
+    } finally {
+      this.activeRunTriggers.delete(runId);
+      eventBus.emit('system', { type: 'agent_run_complete', runId });
+    }
+  }
+
   private async executeRun(runId: string, objective: string, triggeredBy: string): Promise<void> {
     eventBus.log('INFO', `Agent run ${runId} started (${triggeredBy}): "${objective.slice(0, 120)}"`, 'agent');
-    this.step(runId, 'planner', 'THINK', `Objective received: "${objective}"`);
 
     try {
-      // 1. PLANNER
-      const rules = await getActiveRules().catch(() => []);
-      const rulesText = rules.length > 0 ? `\n\nSELF-HEALED RULES (learned from recurring failures — must adhere):\n${rules.map((r) => `- ${r}`).join('\n')}` : '';
-      await this.reason(runId, 'planner', `Decompose objective into concrete steps.${rulesText}`, objective,
-        () => 'Plan: 1. Pull market quotes & chain 2. Analyze IV & PCR 3. Formulate strategy 4. Check risk 5. Execute 6. Critique');
-
-      // 2. ANALYST & MULTI-INDEX WATCHLIST SCANNER
-      const watchlist = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY'];
-      const explicitTarget = watchlist.find((s) => new RegExp(`\\b${s}\\b`, 'i').test(objective) && !objective.toLowerCase().includes('and') && !objective.toLowerCase().includes('across') && !objective.toLowerCase().includes('all'));
-      const targets = explicitTarget ? [explicitTarget] : watchlist;
-
-      // 2b. Capital allocation (30% of total available capital). Reads
-      // through RiskEngine's PortfolioSource rather than branching on
-      // TRADING_MODE itself — a prior version called
-      // (this.client as any).funds?.get?.() directly for live mode, which
-      // doesn't exist on the SDK (the real method is funds.getLimit(), with
-      // response fields availabelBalance/utilizedAmount, not the
-      // availableCash/availMargin guessed here). Because of the optional
-      // chaining, that silently resolved to undefined every time and this
-      // fell through to the hardcoded ₹10L default regardless of the real
-      // account balance — fabricated capital sizing in live mode.
-      let availableCapital = 1_000_000;
-      try {
-        const wallet = await this.risk.getPortfolio().getWallet();
-        availableCapital = Number(wallet.availableMargin || wallet.totalBalance || 1_000_000);
-      } catch { /* default 10L */ }
-
-      const vixRes = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } });
-      const vix = extractLtp(vixRes, INDEX_INSTRUMENTS.INDIAVIX.securityId) || 14;
-
-      interface Candidate {
-        target: string;
-        spot: number;
-        analytics: any;
-        strategy: ConstructedStrategy;
-        bt: any;
-        score: number;
-      }
-      const candidates: Candidate[] = [];
-
-      for (const target of targets) {
-        const inst = INDEX_INSTRUMENTS[target];
-        if (!inst) continue;
-        const expiry = await resolveNearestExpiry(this.client, target);
-        const [ltpRes, chainRes] = await Promise.all([
-          this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
-          this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),
-        ]);
-
-        const spot = extractLtp(ltpRes, inst.securityId) || this.market.getLtp(inst.securityId) || 0;
-        const rows = chainRes?.strikes || chainRes?.data || [];
-        if (rows.length === 0) continue;
-
-        const analytics = analyzeOptionChain(target, rows, spot, expiry, vix);
-        recordIvSample(target, analytics.atmIv);
-        const strat = this.synthesizeStrategy(objective, target, spot, rows, expiry, analytics, availableCapital, vix);
-        if (!strat) continue;
-
-        const bt = await this.backtestCandidate(target, inst.securityId, strat);
-        const score = (bt.winRate || 50) * (bt.profitFactor || 1.2);
-        candidates.push({ target, spot, analytics, strategy: strat, bt, score });
-      }
-
-      candidates.sort((a, b) => b.score - a.score);
-      const best = candidates[0];
-
-      await this.reason(runId, 'analyst', 'Summarize multi-index market conditions.', JSON.stringify(candidates.map((c) => ({ target: c.target, spot: c.spot, regime: c.analytics.regime, score: c.score }))),
-        () => best ? `Analyst: Scanned ${candidates.length} watchlist indices. Top candidate: ${best.strategy.name} on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${best.bt.winRate}%, PF: ${best.bt.profitFactor})` : 'Analyst: No actionable setups across watchlist');
-
-      const strategy = best?.strategy || null;
-      const bt = best?.bt || { winRate: 0, totalDays: 0, totalPnlInr: 0, profitFactor: 0, passedValidation: false };
-
-      const proposal: TradeProposal | null = best && strategy ? {
-        proposalId: `prop_${runId}`,
-        target: best.target,
-        strategy,
-        regime: best.analytics?.regime || 'NEUTRAL',
-        score: best.score,
-        backtest: bt,
-        thesis: `Top candidate on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${bt.winRate}%, PF: ${bt.profitFactor})`,
-        confidence: Number(Math.min(0.95, Math.max(0.1, (best.score / 100))).toFixed(2)),
-        createdAt: new Date().toISOString(),
-      } : null;
-
-      this.step(runId, 'strategy', 'ACT', `Selected Strategy: ${strategy?.name || 'NONE'} (${strategy?.lots || 0} lots) | Backtest: ${bt.winRate}% win rate across ${bt.totalDays}d (PF: ${bt.profitFactor})`, {
-        tool: 'strategy.backtest', response: JSON.stringify({ winRate: bt.winRate, pnl: bt.totalPnlInr, pf: bt.profitFactor, pass: bt.passedValidation }),
-      });
-
-      // 4. RISK
-      const gate = this.risk.canTrade();
-      const breakers = this.risk.snapshot().breakers || [];
-      const tripped = breakers.filter((b) => b.state !== 'OK');
-      // Single source of truth — evaluateStrategyBacktest already encodes the
-      // real win-rate/profit-factor/max-drawdown thresholds. The two escape
-      // hatches this used to have (totalDays===0 auto-passing, and a lower
-      // 0.9 PF bar bypassing the real validation) both let "we don't know"
-      // or "the real check said no" through as ALLOWED. Neither should.
-      const isBacktestPassing = bt.passedValidation;
-      this.step(runId, 'risk', 'ACT', `Risk gate: ${gate.allowed && isBacktestPassing ? 'ALLOWED' : `BLOCKED (${!gate.allowed ? gate.reason : 'statistical edge below threshold'})`}`, {
-        tool: 'risk_engine.evaluate', response: JSON.stringify({ allowed: gate.allowed, tripped: tripped.length, backtestPass: isBacktestPassing }),
-      });
-
-      const approved = gate.allowed && tripped.length === 0 && isBacktestPassing;
-      // Emitted AFTER the risk gate resolves (not at strategy-selection time)
-      // so the proposal reflects whether the trade was actually approved,
-      // not just what the strategy engine picked before risk had a say.
-      if (proposal) {
-        eventBus.emit('system', {
-          type: 'trade_proposal',
-          proposal,
-          approved,
-          reason: approved ? undefined : (!gate.allowed ? gate.reason : 'statistical edge below threshold'),
-        });
-      }
-
-      // 5. EXECUTION
-      const executed = await this.executeStrategy(runId, objective, strategy, approved);
-
-      // 6. CRITIC
-      await this.reason(runId, 'critic', 'Review trading run & backtest metrics.', JSON.stringify({ executed: executed.status, backtest: bt }),
-        () => `Critic (deterministic): Execution ${executed.status}. Backtest win rate ${bt.winRate}% (PF: ${bt.profitFactor}). Risk limits respected.`);
+      await this.executeTradePipeline(runId, objective);
     } catch (e: any) {
       this.step(runId, 'critic', 'ERROR', `Run failed: ${e.message}`);
       eventBus.log('ERROR', `Agent run ${runId} error: ${e.message}`, 'agent');
@@ -537,6 +621,118 @@ export class AgentOrchestrator {
       if (this.currentRun?.runId === runId) this.currentRun.running = false;
       eventBus.emit('system', { type: 'agent_run_complete', runId });
     }
+  }
+
+  private async executeTradePipeline(runId: string, objective: string): Promise<void> {
+    this.step(runId, 'planner', 'THINK', `Objective received: "${objective}"`);
+
+    // 1. PLANNER
+    const rules = await getActiveRules().catch(() => []);
+    const rulesText = rules.length > 0 ? `\n\nSELF-HEALED RULES (learned from recurring failures — must adhere):\n${rules.map((r) => `- ${r}`).join('\n')}` : '';
+    await this.reason(runId, 'planner', `Decompose objective into concrete steps.${rulesText}`, objective,
+      () => 'Plan: 1. Pull market quotes & chain 2. Analyze IV & PCR 3. Formulate strategy 4. Check risk 5. Execute 6. Critique');
+
+    // 2. ANALYST & MULTI-INDEX WATCHLIST SCANNER
+    const watchlist = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY'];
+    const matchedSym = matchIndexSymbol(objective);
+    const explicitTarget = (matchedSym && matchedSym !== 'INDIAVIX' && !objective.toLowerCase().includes('and') && !objective.toLowerCase().includes('across') && !objective.toLowerCase().includes('all'))
+      ? matchedSym
+      : null;
+    const targets = explicitTarget ? [explicitTarget] : watchlist;
+
+    // 2b. Capital allocation (30% of total available capital).
+    let availableCapital = 1_000_000;
+    try {
+      const wallet = await this.risk.getPortfolio().getWallet();
+      availableCapital = Number(wallet.availableMargin || wallet.totalBalance || 1_000_000);
+    } catch { /* default 10L */ }
+
+    const vixRes = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } });
+    const vix = extractLtp(vixRes, INDEX_INSTRUMENTS.INDIAVIX.securityId) || 14;
+
+    interface Candidate {
+      target: string;
+      spot: number;
+      analytics: any;
+      strategy: ConstructedStrategy;
+      bt: any;
+      score: number;
+    }
+    const candidates: Candidate[] = [];
+
+    for (const target of targets) {
+      const inst = INDEX_INSTRUMENTS[target];
+      if (!inst) continue;
+      const expiry = await resolveNearestExpiry(this.client, target);
+      const [ltpRes, chainRes] = await Promise.all([
+        this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
+        this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),
+      ]);
+
+      const spot = extractLtp(ltpRes, inst.securityId) || this.market.getLtp(inst.securityId) || 0;
+      const rows = chainRes?.strikes || chainRes?.data || [];
+      if (rows.length === 0) continue;
+
+      const analytics = analyzeOptionChain(target, rows, spot, expiry, vix);
+      recordIvSample(target, analytics.atmIv);
+      const strat = this.synthesizeStrategy(objective, target, spot, rows, expiry, analytics, availableCapital, vix);
+      if (!strat) continue;
+
+      const bt = await this.backtestCandidate(target, inst.securityId, strat);
+      const score = (bt.winRate || 50) * (bt.profitFactor || 1.2);
+      candidates.push({ target, spot, analytics, strategy: strat, bt, score });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+
+    await this.reason(runId, 'analyst', 'Summarize multi-index market conditions.', JSON.stringify(candidates.map((c) => ({ target: c.target, spot: c.spot, regime: c.analytics.regime, score: c.score }))),
+      () => best ? `Analyst: Scanned ${candidates.length} watchlist indices. Top candidate: ${best.strategy.name} on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${best.bt.winRate}%, PF: ${best.bt.profitFactor})` : 'Analyst: No actionable setups across watchlist');
+
+    const strategy = best?.strategy || null;
+    const bt = best?.bt || { winRate: 0, totalDays: 0, totalPnlInr: 0, profitFactor: 0, passedValidation: false };
+
+    const proposal: TradeProposal | null = best && strategy ? {
+      proposalId: `prop_${runId}`,
+      target: best.target,
+      strategy,
+      regime: best.analytics?.regime || 'NEUTRAL',
+      score: best.score,
+      backtest: bt,
+      thesis: `Top candidate on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${bt.winRate}%, PF: ${bt.profitFactor})`,
+      confidence: Number(Math.min(0.95, Math.max(0.1, (best.score / 100))).toFixed(2)),
+      createdAt: new Date().toISOString(),
+    } : null;
+
+    this.step(runId, 'strategy', 'ACT', `Selected Strategy: ${strategy?.name || 'NONE'} (${strategy?.lots || 0} lots) | Backtest: ${bt.winRate}% win rate across ${bt.totalDays}d (PF: ${bt.profitFactor})`, {
+      tool: 'strategy.backtest', response: JSON.stringify({ winRate: bt.winRate, pnl: bt.totalPnlInr, pf: bt.profitFactor, pass: bt.passedValidation }),
+    });
+
+    // 4. RISK
+    const gate = this.risk.canTrade();
+    const breakers = this.risk.snapshot().breakers || [];
+    const tripped = breakers.filter((b) => b.state !== 'OK');
+    const isBacktestPassing = bt.passedValidation;
+    this.step(runId, 'risk', 'ACT', `Risk gate: ${gate.allowed && isBacktestPassing ? 'ALLOWED' : `BLOCKED (${!gate.allowed ? gate.reason : 'statistical edge below threshold'})`}`, {
+      tool: 'risk_engine.evaluate', response: JSON.stringify({ allowed: gate.allowed, tripped: tripped.length, backtestPass: isBacktestPassing }),
+    });
+
+    const approved = gate.allowed && tripped.length === 0 && isBacktestPassing;
+    if (proposal) {
+      eventBus.emit('system', {
+        type: 'trade_proposal',
+        proposal,
+        approved,
+        reason: approved ? undefined : (!gate.allowed ? gate.reason : 'statistical edge below threshold'),
+      });
+    }
+
+    // 5. EXECUTION
+    const executed = await this.executeStrategy(runId, objective, strategy, approved);
+
+    // 6. CRITIC
+    await this.reason(runId, 'critic', 'Review trading run & backtest metrics.', JSON.stringify({ executed: executed.status, backtest: bt }),
+      () => `Critic (deterministic): Execution ${executed.status}. Backtest win rate ${bt.winRate}% (PF: ${bt.profitFactor}). Risk limits respected.`);
   }
 
   private synthesizeStrategy(

@@ -118,6 +118,8 @@ export interface AgentStatus {
 
 export interface TelemetryEvent {
   id: string;
+  runId?: string;
+  triggeredBy?: string;
   agent: string;
   type: string;
   time: string;

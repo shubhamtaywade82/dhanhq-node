@@ -123,7 +123,7 @@ export function controlRoutes(
     if (patch.perStrategyLossLimit != null) clean.perStrategyLossLimit = Math.max(500, Number(patch.perStrategyLossLimit));
     if (patch.maxConsecutiveLosses != null) clean.maxConsecutiveLosses = Math.max(1, Number(patch.maxConsecutiveLosses));
     if (patch.maxRejectionRatePct != null) clean.maxRejectionRatePct = Math.max(1, Number(patch.maxRejectionRatePct));
-    if (patch.staleTickSec != null) clean.staleTickSec = Math.max(3, Number(patch.staleTickSec));
+    if (patch.staleTickSec != null) clean.staleTickSec = Math.max(5, Math.min(120, Number(patch.staleTickSec)));
     const updated = await risk.setLimits(clean);
     journal.append('control_command', { route: 'POST /risk-limits', patch: clean, updated });
     res.json(updated);
@@ -140,7 +140,7 @@ export function controlRoutes(
       journal.append('control_command', { route: 'POST /agent/run', objective: objective.trim(), result });
       res.json(result);
     } catch (e: any) {
-      res.status(e.message?.includes('already in progress') ? 409 : 500).json({ error: e.message });
+      res.status(e.message?.includes('in progress') ? 409 : 500).json({ error: e.message });
     }
   });
 
