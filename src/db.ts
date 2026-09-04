@@ -458,6 +458,51 @@ async function ensureWalletSessionRolled(): Promise<void> {
   }
 }
 
+/**
+ * True required margin RIGHT NOW, derived from ground truth rather than the
+ * incrementally-tracked wallet columns: SUM(margin_blocked) over open
+ * positions is provably correct (each position's own row is set directly
+ * from a real margin-resolver call on that fill, never touched by anything
+ * else) minus any hedge-margin credit still outstanding on a RUNNING
+ * multi-leg strategy (the combined SPAN requirement is less than the sum of
+ * each leg's standalone margin — see adjustWalletMargin/createPaperStrategy).
+ *
+ * The wallet's own used_margin/available_margin columns are still written
+ * incrementally on every fill (adjustWalletMargin, executePaperOrder's
+ * marginDelta) but are no longer READ for anything — found live, quantified
+ * via direct DB query: used_margin had drifted ₹134,062 negative vs. this
+ * derived value, because the credit given at multi-leg deploy time is only
+ * reliably reversed if updatePaperStrategyStatus('STOPPED') fires for that
+ * exact strategy — closeParentStrategyIfFlat's leg lookup is a plain string
+ * match (autonomy.ts) that can silently miss, permanently leaking the
+ * credit into the wallet total when it does. Deriving here instead of
+ * fixing every possible way that reversal can be missed makes the SERVED
+ * number correct regardless — self-healing, not one more special case.
+ *
+ * A strategy's `status` column can ALSO be stuck stale at 'RUNNING' (the
+ * exact same missed-reversal bug) even after every one of its legs is
+ * actually flat — trusting status alone would keep subtracting a credit for
+ * a structure that's fully closed. So a credit only counts when the
+ * strategy is RUNNING *and* at least one of its own legs still has a real
+ * open position — cross-checked against live position state, not the
+ * possibly-stale status flag.
+ */
+function computeDerivedMargin(): { usedMargin: number; availableMargin: number } {
+  let usedMargin = 0;
+  for (const pos of mem.positions.values()) {
+    if (Number(pos.net_qty) !== 0) usedMargin += Number(pos.margin_blocked || 0);
+  }
+  for (const strat of mem.strategies) {
+    if (strat.status !== 'RUNNING' || !Number(strat.margin_hedge_credit || 0)) continue;
+    const legs: any[] = strat.legs || [];
+    const stillOpen = legs.some((l) => Number(mem.positions.get(String(l.instrument).toUpperCase())?.net_qty || 0) !== 0);
+    if (stillOpen) usedMargin -= Number(strat.margin_hedge_credit || 0);
+  }
+  const w = mem.wallet as any;
+  const availableMargin = Number(w.initial_balance) + Number(w.realized_pnl) - usedMargin - Number(w.total_charges || 0);
+  return { usedMargin: Number(usedMargin.toFixed(2)), availableMargin: Number(availableMargin.toFixed(2)) };
+}
+
 // ── wallet ──────────────────────────────────────────────────────────────
 // Reads always come from `mem` (see header) — Postgres is written to on every
 // fill but never read back on the hot path.
@@ -467,8 +512,7 @@ export async function getPaperWallet() {
     return { availableMargin: 100000, usedMargin: 0, realizedPnl: 0, sessionRealizedPnl: 0, unrealizedPnl: 0, totalCharges: 0, netRealizedPnl: 0, totalBalance: 100000, equity: 100000, spanMargin: 0, exposureMargin: 0 };
   }
   await ensureWalletSessionRolled();
-  const availableMargin = Number(w.available_margin);
-  const usedMargin = Number(w.used_margin);
+  const { usedMargin, availableMargin } = computeDerivedMargin();
   const realizedPnl = Number(w.realized_pnl);
   const sessionRealizedPnl = realizedPnl - Number(w.session_realized_base || 0);
   const totalCharges = Number(w.total_charges || 0);
@@ -753,7 +797,7 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
   // reducing a position always goes through (even if the account is
   // already over-margined) so a position is never un-closeable.
   if (marginDelta > 0) {
-    const availableMargin = Number(mem.wallet.available_margin);
+    const availableMargin = computeDerivedMargin().availableMargin;
     const projectedAvailable = availableMargin + u.realized - marginDelta - charges;
     if (projectedAvailable < 0) {
       throw new Error(`Insufficient margin: need ₹${marginDelta.toFixed(2)} more, ₹${availableMargin.toFixed(2)} available`);

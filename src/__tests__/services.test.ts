@@ -12,7 +12,7 @@ import {
   initDatabase, dbMode, executePaperOrder, getPaperWallet,
   listPaperPositions, closeAllPaperPositions, markPositionsToMarket,
   resetPaperWallet, pool, saveRiskState, reconcileLedger, findMissingOrders,
-  closePaperPosition,
+  closePaperPosition, createPaperStrategy, adjustWalletMargin,
 } from '../db';
 
 /**
@@ -169,6 +169,49 @@ describe('Money-path math — fees, margin, sign flips', () => {
     expect(wShort.usedMargin).toBeCloseTo(10000, 2); // defaultMarginResolver's 10x fallback multiple
   });
 
+  it('usedMargin self-heals from position margin_blocked even when a hedge-credit reversal is missed — the exact ₹134K live drift', async () => {
+    // Regression, found live via a direct DB query: paper_wallet.used_margin
+    // had drifted ₹134,062 negative vs. SUM(margin_blocked) on real open
+    // positions. Root cause traced: a multi-leg deploy applies a hedge-
+    // margin credit via adjustWalletMargin() (combined SPAN needs less than
+    // the sum of each leg's standalone margin), which is supposed to be
+    // reversed exactly once when the strategy's LAST leg closes
+    // (updatePaperStrategyStatus('STOPPED') in db.ts) — but the trigger for
+    // that (autonomy.ts's closeParentStrategyIfFlat) is a plain string match
+    // on tradingSymbol that can silently miss. This test reproduces the
+    // missed-reversal case directly (deploy two legs, apply a credit,
+    // close both legs, never call updatePaperStrategyStatus) and asserts
+    // getPaperWallet() is still correct anyway — because it's now derived
+    // from position rows, not the incrementally-tracked wallet column.
+    await executePaperOrder({ symbol: 'HEDGELEG1', securityId: '44000', quantity: 10, transactionType: 'SELL', price: 100 });
+    await executePaperOrder({ symbol: 'HEDGELEG2', securityId: '44001', quantity: 10, transactionType: 'SELL', price: 100 });
+    const usedBeforeCredit = (await getPaperWallet()).usedMargin;
+    expect(usedBeforeCredit).toBeCloseTo(20000, 2); // 2 × 10x fallback margin, standalone
+
+    // Combined margin is less than the standalone sum — release the credit
+    // and register the strategy as RUNNING with it, same as a real multi-leg
+    // deploy does (routes/portfolio.ts: adjustWalletMargin then
+    // createPaperStrategy with marginHedgeCredit).
+    const hedgeCredit = 8000;
+    await adjustWalletMargin(hedgeCredit);
+    await createPaperStrategy({
+      id: 'hedge_test_strat', name: 'Hedge Test', symbol: 'HEDGE', type: 'STRANGLE', lots: 1,
+      legs: [{ instrument: 'HEDGELEG1' }, { instrument: 'HEDGELEG2' }], marginHedgeCredit: hedgeCredit,
+    });
+    expect((await getPaperWallet()).usedMargin).toBeCloseTo(12000, 2); // 20000 standalone - 8000 credit, while RUNNING
+
+    // Close BOTH legs — deliberately WITHOUT calling
+    // updatePaperStrategyStatus('STOPPED') to reverse the credit, simulating
+    // the missed-reversal bug exactly.
+    await closePaperPosition('HEDGELEG1', 100);
+    await closePaperPosition('HEDGELEG2', 100);
+
+    // Old behavior: usedMargin would read -8000 (permanently drifted) here.
+    const wallet = await getPaperWallet();
+    expect(wallet.usedMargin).toBe(0); // both positions flat — derived from margin_blocked, immune to the missed reversal
+    expect(wallet.availableMargin).toBeCloseTo(100000 + wallet.realizedPnl - wallet.totalCharges, 2);
+  });
+
   it('handles a same-fill sign flip (long to short) with correct realized PnL and resulting side', async () => {
     await executePaperOrder({ symbol: 'FLIPTEST', securityId: '44000', quantity: 50, transactionType: 'BUY', price: 100 });
     await executePaperOrder({ symbol: 'FLIPTEST', securityId: '44000', quantity: 80, transactionType: 'SELL', price: 110 });
@@ -295,6 +338,39 @@ describe('RiskEngine — real-state circuit breakers', () => {
     expect(piled.state).toBe('ERROR');
 
     await closePaperPosition('NIFTY24000CE');
+    risk.stop();
+  });
+
+  it('Stale Market Tick: uses tiered WARN vs ERROR and does not block canTrade on WARN', async () => {
+    await saveRiskState({ killed: false, killedReason: null, killedDate: null, limits: { staleTickSec: 30 } });
+    const client = stubClient();
+    const market = stubMarket(100);
+    const risk = new RiskEngine(client, market);
+    await risk.start();
+    await resetPaperWallet(100000);
+
+    // 1. Fresh tick (0s) -> OK
+    (market as any).lastTickAt = Date.now();
+    let rows = await risk.evaluate();
+    let staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
+    expect(staleRow.state).toBe('OK');
+    expect(risk.canTrade().allowed).toBe(true);
+
+    // 2. 20s tick age (> 15s warn, <= 30s error) -> WARN, canTrade remains allowed!
+    (market as any).lastTickAt = Date.now() - 20_000;
+    rows = await risk.evaluate();
+    staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
+    expect(staleRow.state).toBe('WARN');
+    expect(risk.canTrade().allowed).toBe(true);
+
+    // 3. 35s tick age (> 30s error) -> ERROR, canTrade blocks!
+    (market as any).lastTickAt = Date.now() - 35_000;
+    rows = await risk.evaluate();
+    staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
+    expect(staleRow.state).toBe('ERROR');
+    expect(risk.canTrade().allowed).toBe(false);
+    expect(risk.canTrade().reason).toContain('Stale Market Tick breached');
+
     risk.stop();
   });
 });
