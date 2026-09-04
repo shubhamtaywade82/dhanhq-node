@@ -369,36 +369,43 @@ describe('RiskEngine — real-state circuit breakers', () => {
   });
 
   it('Stale Market Tick: uses tiered WARN vs ERROR and does not block canTrade on WARN', async () => {
+    // The rule only fires while the market is open, so without a pinned clock
+    // this passes during trading hours and fails every evening.
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z')); // 10:00 IST, Tuesday
     await saveRiskState({ killed: false, killedReason: null, killedDate: null, limits: { staleTickSec: 30 } });
     const client = stubClient();
     const market = stubMarket(100);
     const risk = new RiskEngine(client, market);
-    await risk.start();
-    await resetPaperWallet(100000);
+    try {
+      await risk.start();
+      await resetPaperWallet(100000);
 
-    // 1. Fresh tick (0s) -> OK
-    (market as any).lastTickAt = Date.now();
-    let rows = await risk.evaluate();
-    let staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
-    expect(staleRow.state).toBe('OK');
-    expect(risk.canTrade().allowed).toBe(true);
+      // 1. Fresh tick (0s) -> OK
+      (market as any).lastTickAt = Date.now();
+      let rows = await risk.evaluate();
+      let staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
+      expect(staleRow.state).toBe('OK');
+      expect(risk.canTrade().allowed).toBe(true);
 
-    // 2. 20s tick age (> 15s warn, <= 30s error) -> WARN, canTrade remains allowed!
-    (market as any).lastTickAt = Date.now() - 20_000;
-    rows = await risk.evaluate();
-    staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
-    expect(staleRow.state).toBe('WARN');
-    expect(risk.canTrade().allowed).toBe(true);
+      // 2. 20s tick age (> 15s warn, <= 30s error) -> WARN, canTrade remains allowed!
+      (market as any).lastTickAt = Date.now() - 20_000;
+      rows = await risk.evaluate();
+      staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
+      expect(staleRow.state).toBe('WARN');
+      expect(risk.canTrade().allowed).toBe(true);
 
-    // 3. 35s tick age (> 30s error) -> ERROR, canTrade blocks!
-    (market as any).lastTickAt = Date.now() - 35_000;
-    rows = await risk.evaluate();
-    staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
-    expect(staleRow.state).toBe('ERROR');
-    expect(risk.canTrade().allowed).toBe(false);
-    expect(risk.canTrade().reason).toContain('Stale Market Tick breached');
-
-    risk.stop();
+      // 3. 35s tick age (> 30s error) -> ERROR, canTrade blocks!
+      (market as any).lastTickAt = Date.now() - 35_000;
+      rows = await risk.evaluate();
+      staleRow = rows.find((r) => r.rule === 'Stale Market Tick')!;
+      expect(staleRow.state).toBe('ERROR');
+      expect(risk.canTrade().allowed).toBe(false);
+      expect(risk.canTrade().reason).toContain('Stale Market Tick breached');
+    } finally {
+      risk.stop();
+      jest.useRealTimers();
+    }
   });
 });
 
