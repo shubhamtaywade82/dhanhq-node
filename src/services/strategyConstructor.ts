@@ -54,6 +54,9 @@ export interface ConstructedStrategy {
 // Last-resort fallback only — real lot size comes from the DhanHQ instrument
 // (scrip master) via warmLotSizeCache(). These values are not independently
 // verified and only apply if that lookup has never succeeded for a symbol.
+// Cross-checked against the live scrip master (all 5) on 2026-09-04 — all
+// matched exactly. That check is exactly what warmLotSizeCache() below is
+// supposed to do automatically going forward.
 const LOT_SIZES: Record<string, number> = {
   NIFTY: 65,
   BANKNIFTY: 30,
@@ -62,27 +65,49 @@ const LOT_SIZES: Record<string, number> = {
   MIDCPNIFTY: 120,
 };
 
+// SENSEX options trade on BSE, not NSE — same distinction toLeg() makes for
+// order placement (see its own exchangeSegment line below). Shared here so
+// the lot-size lookup queries the segment that actually lists the contract.
+function optionsExchangeSegment(symbol: string): string {
+  return symbol.toUpperCase() === 'SENSEX' ? 'BSE_FNO' : 'NSE_FNO';
+}
+
 const LOT_SIZE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // lot size doesn't change intraday
 const lotSizeCache = new Map<string, { value: number; expiresAt: number }>();
 
 /** Resolves and caches a symbol's real lot size from the DhanHQ instrument
  * (scrip master). Call once per symbol wherever the option chain is already
- * being fetched with a live client — cheap no-op once cached. */
-export async function warmLotSizeCache(client: any, symbol: string, exchangeSegment = 'NSE_FNO'): Promise<void> {
+ * being fetched with a live client — cheap no-op once cached.
+ *
+ * Previously used client.instruments.find(segment, symbol) with an exact
+ * match on the bare underlying name — that matches the synthetic INDEX
+ * reference row (lotSize: 1, instrument: 'INDEX'), not a real options
+ * contract, for every single symbol, every time. The guard against that
+ * row correctly rejected it, but the net effect — confirmed live — is that
+ * this had NEVER actually updated the cache from its hardcoded fallback,
+ * for any symbol, silently, since this mechanism was written. Now scans
+ * the full segment (already cached/deduped by the SDK) for a real
+ * (non-INDEX) contract row matching underlyingSymbol instead. */
+export async function warmLotSizeCache(client: any, symbol: string, exchangeSegment = optionsExchangeSegment(symbol)): Promise<void> {
   const sym = symbol.toUpperCase();
   const cached = lotSizeCache.get(sym);
   if (cached && cached.expiresAt > Date.now()) return;
   try {
-    const instrument = await client?.instruments?.find?.(exchangeSegment, sym);
-    // `find()` on a bare index symbol under NSE_FNO can match a synthetic
-    // index reference row (instrument: 'INDEX', lotSize: 1) instead of an
-    // actual options/futures contract — never trust that, it would silently
-    // undersize every order to 1 contract. Keep the hardcoded fallback then.
-    const lotSize = Number(instrument?.lotSize);
-    if (lotSize > 1 && instrument?.instrument !== 'INDEX') {
-      lotSizeCache.set(sym, { value: lotSize, expiresAt: Date.now() + LOT_SIZE_CACHE_TTL_MS });
+    const instruments = await client?.instruments?.bySegment?.(exchangeSegment);
+    const contract = (instruments || []).find((i: any) => i?.underlyingSymbol === sym && i?.instrument !== 'INDEX');
+    const lotSize = Number(contract?.lotSize);
+    if (!(lotSize > 1)) {
+      eventBus.log('WARN', `Lot-size verification failed for ${sym} (${exchangeSegment}) — no real contract found in the scrip master, keeping hardcoded fallback ${LOT_SIZES[sym] ?? 65}`, 'strategy_constructor');
+      return;
     }
-  } catch { /* keep the hardcoded fallback */ }
+    const fallback = LOT_SIZES[sym];
+    if (fallback != null && fallback !== lotSize) {
+      eventBus.log('ERROR', `Lot size mismatch for ${sym}: DhanHQ scrip master says ${lotSize}, hardcoded fallback is ${fallback} — update LOT_SIZES`, 'strategy_constructor');
+    }
+    lotSizeCache.set(sym, { value: lotSize, expiresAt: Date.now() + LOT_SIZE_CACHE_TTL_MS });
+  } catch (e: any) {
+    eventBus.log('WARN', `Lot-size verification errored for ${sym}: ${e.message} — keeping hardcoded fallback ${LOT_SIZES[sym] ?? 65}`, 'strategy_constructor');
+  }
 }
 
 export function getLotSize(symbol: string): number {
@@ -704,7 +729,7 @@ function toLeg(row: any, type: 'CALL' | 'PUT', side: 'BUY' | 'SELL', qty: number
     // SENSEX options trade on BSE, not NSE — a wrong segment here means
     // every quote lookup for the leg silently returns nothing and its LTP
     // (and therefore P&L) never updates past the entry fill price.
-    exchangeSegment: symbol.toUpperCase() === 'SENSEX' ? 'BSE_FNO' : 'NSE_FNO',
+    exchangeSegment: optionsExchangeSegment(symbol),
     stopLoss,
     target,
     trailingStop: trailDist && trailDist > 0 ? { distance: trailDist } : undefined,
