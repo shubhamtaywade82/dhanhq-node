@@ -12,7 +12,10 @@ import { buildAdaptiveSupertrendStrategy } from './strategyConstructor';
 import { CandleStore } from './adaptiveSupertrendCandles';
 import { extractMarketFeatures, formatRegimeKey, AdaptiveParameterAI, FuzzySignalAI, type AdaptiveSignal } from './adaptiveSupertrend';
 
-const WATCHLIST = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY'];
+// NIFTY/SENSEX scanned first — evaluateOne() below stops opening new
+// positions once MAX_CONCURRENT_POSITIONS is hit, so scan order is
+// priority order under a full slot table, not just cosmetic.
+const WATCHLIST = ['NIFTY', 'SENSEX', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'];
 const SCAN_INTERVAL_MS = 60_000;
 // A 2%-move directional return normalizes to a full-magnitude Q-learning
 // reward — matches the source strategy's reward scale exactly.
