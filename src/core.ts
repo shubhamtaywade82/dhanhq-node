@@ -19,6 +19,8 @@ import { OllamaClient } from '@nemesis-oss/ollama-sdk';
 import { PaperPortfolioSource, BrokerPortfolioSource, type PortfolioSource } from './services/portfolioSource';
 import { getSystemState, setSystemState } from './services/systemState';
 import { ResearchOrchestrator } from './services/research/researchOrchestrator';
+import { ResearchScheduler } from './services/research/researchScheduler';
+import { initResearchRepository } from './services/research/researchRepository';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -32,6 +34,7 @@ export interface Core {
   autonomy: AutonomyEngine;
   agent: AgentOrchestrator;
   research: ResearchOrchestrator;
+  researchScheduler?: ResearchScheduler;
   paper: PaperExecutionEngine;
   live: LiveExecutionEngine;
   sandbox?: SandboxExecutionEngine;
@@ -129,6 +132,10 @@ export async function startCore(): Promise<Core> {
   autonomy.setResearch(research);
   autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, paper, risk));
 
+  await initResearchRepository();
+  const researchScheduler = new ResearchScheduler(research);
+  await researchScheduler.start();
+
   // Bridge core events into Redis pub/sub (Rails sidecar compat) when up.
   if (await redisAvailable()) {
     eventBus.setRedisSink(async (channel, message) => {
@@ -178,7 +185,7 @@ export async function startCore(): Promise<Core> {
   eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
-  return { client, market, risk, autonomy, agent, research, paper, live, sandbox, tracker, selfHealing };
+  return { client, market, risk, autonomy, agent, research, researchScheduler, paper, live, sandbox, tracker, selfHealing };
 }
 
 /**

@@ -228,3 +228,40 @@ export interface ScreenerResult {
   screenedAt: number;
 }
 
+export interface WatchlistItem {
+  symbol: string;
+  name: string;
+  sector: string;
+  universe: string;
+  deterministicScore: number;
+  status: 'ACTIVE' | 'ARCHIVED';
+  metrics: {
+    rsi14: number;
+    supertrend: 'BULLISH' | 'BEARISH';
+    cfoVsPat: number;
+    roicPct: number;
+    debtToEquity: number;
+    dcfMarginOfSafetyPct: number;
+  };
+  addedAt: number;
+  expiresAt: number;
+  lastAnalyzedAt?: number;
+}
+
+export type MarketPhase = 'PRE_MARKET' | 'MARKET_HOURS' | 'POST_MARKET' | 'CLOSED';
+
+export interface SchedulerStatus {
+  enabled: boolean;
+  marketPhase: MarketPhase;
+  nextScheduledJob: string;
+  nextJobTimeIst: string;
+  telegramEnabled: boolean;
+  activeWatchlistCount: number;
+  lastRunTimes: {
+    monthlyScreen?: number;
+    preMarketBrief?: number;
+    marketHoursAlert?: number;
+    postMarketDossier?: number;
+  };
+}
+

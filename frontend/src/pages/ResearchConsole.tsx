@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
 import { api } from '../services/api';
-import { Search, Loader2, BookOpen, Filter } from 'lucide-react';
+import { Search, Loader2, BookOpen, Filter, Clock } from 'lucide-react';
 import { ResearchScreener } from './ResearchScreener';
+import { ResearchWatchlist } from './ResearchWatchlist';
 import {
   ResearchTabs,
   VerdictTab,
@@ -12,7 +13,7 @@ import {
 } from './ResearchDetailTabs';
 
 export function ResearchConsole() {
-  const [viewMode, setViewMode] = useState<'screener' | 'single'>('screener');
+  const [viewMode, setViewMode] = useState<'watchlist' | 'screener' | 'single'>('watchlist');
   const [symbol, setSymbol] = useState('RELIANCE');
   const [loading, setLoading] = useState(false);
   const [run, setRun] = useState<any>(null);
@@ -66,6 +67,13 @@ export function ResearchConsole() {
     <div className="space-y-4 max-w-[1400px] mx-auto pb-10">
       <div className="flex items-center gap-1 bg-surface-100 p-1 border border-border rounded-lg w-fit">
         <button
+          onClick={() => setViewMode('watchlist')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold cursor-pointer transition-all ${viewMode === 'watchlist' ? 'bg-accent text-black font-bold' : 'text-muted hover:text-white'}`}
+        >
+          <Clock size={13} />
+          <span>Active Watchlist & Schedule</span>
+        </button>
+        <button
           onClick={() => setViewMode('screener')}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold cursor-pointer transition-all ${viewMode === 'screener' ? 'bg-accent text-black font-bold' : 'text-muted hover:text-white'}`}
         >
@@ -81,7 +89,15 @@ export function ResearchConsole() {
         </button>
       </div>
 
-      {viewMode === 'screener' ? (
+      {viewMode === 'watchlist' ? (
+        <ResearchWatchlist
+          onSelectSymbol={(s) => {
+            setSymbol(s);
+            setViewMode('single');
+            runAnalysis(s);
+          }}
+        />
+      ) : viewMode === 'screener' ? (
         <ResearchScreener
           onSelectSymbol={(s) => {
             setSymbol(s);

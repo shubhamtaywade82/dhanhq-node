@@ -14,6 +14,7 @@ import { VerdictSkill } from './skills/verdictSkill';
 import { OptionsIntelligenceSkill } from './skills/optionsIntelligenceSkill';
 import { ResearchTradeBridge } from './tradeBridge';
 import { StockScreener } from './screener';
+import { saveScreenerRun, saveWatchlist } from './researchRepository';
 import type { ResearchOptions, ResearchRun, ResearchTradeSignal, ScreenerPresetName, ScreenerResult } from './types';
 import { saveResearchRun, getResearchRun, listResearchRuns, saveResearchEvidence, getResearchEvidenceByRun } from '../../db';
 
@@ -160,7 +161,13 @@ export class ResearchOrchestrator {
 
   async screen(universeId: string, preset: ScreenerPresetName = 'QUALITY_COMPOUNDERS'): Promise<ScreenerResult> {
     this.emitTelemetry('screen', 'SCREENER', `Screening ${universeId} with ${preset}`);
-    return this.screener.screen(universeId, preset, this.marketProvider, this.fundamentalProvider);
+    const res = await this.screener.screen(universeId, preset, this.marketProvider, this.fundamentalProvider);
+    await saveScreenerRun(res).catch(() => {});
+    const passing = res.candidates.filter((c) => c.passed);
+    if (passing.length > 0) {
+      await saveWatchlist(passing, universeId).catch(() => {});
+    }
+    return res;
   }
 
   async screenAndAnalyze(

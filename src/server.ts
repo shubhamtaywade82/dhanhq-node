@@ -95,7 +95,7 @@ async function main() {
   app.use('/api/infra', infraRoutes(streamManager, { market: core.market, risk: core.risk, autonomy: core.autonomy, agent: core.agent, stream: streamManager }));
   app.use('/api/control', controlRoutes(core.client, core.risk, core.autonomy, core.agent, core.market));
   app.use('/api/client-logs', clientLogsRoutes());
-  app.use('/api/research', researchRoutes(core.research));
+  app.use('/api/research', researchRoutes(core.research, core.researchScheduler));
 
   app.get('/api/health', (_req, res) => {
     res.json({

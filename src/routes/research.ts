@@ -1,13 +1,70 @@
 import { Router } from 'express';
 import type { ResearchOrchestrator } from '../services/research/researchOrchestrator';
+import type { ResearchScheduler } from '../services/research/researchScheduler';
 import { listUniverses } from '../services/research/universe';
+import { getActiveWatchlist } from '../services/research/researchRepository';
 
 /**
  * Express REST API router for the Institutional Equity Research Engine.
- * Exposes research initiation, runs query, and audit evidence trails.
+ * Exposes research initiation, runs query, screener, and autonomous scheduler.
  */
-export function researchRoutes(orchestrator: ResearchOrchestrator): Router {
+export function researchRoutes(orchestrator: ResearchOrchestrator, scheduler?: ResearchScheduler): Router {
   const router = Router();
+
+  // GET /api/research/watchlist - List active persistent research watchlist
+  router.get('/watchlist', async (_req, res) => {
+    try {
+      const items = await getActiveWatchlist();
+      return res.json({ count: items.length, watchlist: items });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // POST /api/research/watchlist/refresh - Manually trigger watchlist screening refresh
+  router.post('/watchlist/refresh', async (req, res) => {
+    const { universe = 'FNO_HEAVYWEIGHTS', preset = 'QUALITY_COMPOUNDERS' } = req.body || {};
+    try {
+      await orchestrator.screen(universe, preset);
+      const items = await getActiveWatchlist();
+      return res.json({ count: items.length, watchlist: items });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/research/scheduler/status - Autonomous market lifecycle status
+  router.get('/scheduler/status', async (_req, res) => {
+    const items = await getActiveWatchlist().catch(() => []);
+    if (scheduler) {
+      const status = scheduler.getStatus();
+      status.activeWatchlistCount = items.length;
+      return res.json(status);
+    }
+    return res.json({
+      enabled: false,
+      marketPhase: 'CLOSED',
+      nextScheduledJob: 'Autonomous scheduler armed',
+      nextJobTimeIst: '--',
+      telegramEnabled: false,
+      activeWatchlistCount: items.length,
+      lastRunTimes: {},
+    });
+  });
+
+  // POST /api/research/scheduler/trigger - Trigger a specific market lifecycle phase
+  router.post('/scheduler/trigger', async (req, res) => {
+    const { phase = 'pre_market' } = req.body || {};
+    if (!scheduler) {
+      return res.status(400).json({ error: 'Scheduler is not running' });
+    }
+    try {
+      const result = await scheduler.triggerPhase(phase);
+      return res.json(result);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
 
   // GET /api/research/universes - List predefined stock baskets
   router.get('/universes', (_req, res) => {

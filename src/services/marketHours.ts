@@ -138,3 +138,66 @@ function getLastTuesdayOfMonth(dateStr: string, passedExpiryHour: boolean): stri
   return expiryStr;
 }
 
+// ── WebSocket market hours gating ──────────────────────────────────────────
+// DhanHQ binary WS only delivers ticks and stays healthy during market hours.
+// NSE/BSE: 09:10–15:35 IST (5m pre-market buffer to 5m post-close buffer).
+// MCX: 08:55–23:35 IST (commodity evening session).
+export const NSE_WS_OPEN_MINUTES = 550;   // 09:10 IST
+export const NSE_WS_CLOSE_MINUTES = 935;  // 15:35 IST
+export const MCX_WS_OPEN_MINUTES = 535;   // 08:55 IST
+export const MCX_WS_CLOSE_MINUTES = 1415; // 23:35 IST
+
+export interface WsMarketWindow {
+  isOpen: boolean;
+  openMinutes: number;
+  closeMinutes: number;
+  hasMcx: boolean;
+  openTimeStr: string;
+  closeTimeStr: string;
+}
+
+export function isWsMarketWindowOpen(hasMcx = false, now = new Date()): boolean {
+  const clock = marketClock(now);
+  if (!clock.isTradingDay) return false;
+  const openMin = hasMcx ? MCX_WS_OPEN_MINUTES : NSE_WS_OPEN_MINUTES;
+  const closeMin = hasMcx ? MCX_WS_CLOSE_MINUTES : NSE_WS_CLOSE_MINUTES;
+  return clock.minutesOfDay >= openMin && clock.minutesOfDay <= closeMin;
+}
+
+export function getWsMarketWindow(hasMcx = false, now = new Date()): WsMarketWindow {
+  const openMin = hasMcx ? MCX_WS_OPEN_MINUTES : NSE_WS_OPEN_MINUTES;
+  const closeMin = hasMcx ? MCX_WS_CLOSE_MINUTES : NSE_WS_CLOSE_MINUTES;
+  return {
+    isOpen: isWsMarketWindowOpen(hasMcx, now),
+    openMinutes: openMin,
+    closeMinutes: closeMin,
+    hasMcx,
+    openTimeStr: hasMcx ? '08:55' : '09:10',
+    closeTimeStr: hasMcx ? '23:35' : '15:35',
+  };
+}
+
+export function msUntilNextWsWindow(hasMcx = false, now = new Date()): number {
+  const openMin = hasMcx ? MCX_WS_OPEN_MINUTES : NSE_WS_OPEN_MINUTES;
+  const parts = istParts(now);
+  const clock = marketClock(now);
+  const hh = String(Math.floor(openMin / 60)).padStart(2, '0');
+  const mm = String(openMin % 60).padStart(2, '0');
+
+  const todayOpen = new Date(`${parts.dateStr}T${hh}:${mm}:00+05:30`);
+  if (clock.isTradingDay && todayOpen.getTime() > now.getTime()) {
+    return Math.max(1000, todayOpen.getTime() - now.getTime());
+  }
+
+  for (let i = 1; i <= 10; i++) {
+    const candidate = new Date(now.getTime() + i * 24 * 60 * 60_000);
+    if (marketClock(candidate).isTradingDay) {
+      const candParts = istParts(candidate);
+      const nextOpen = new Date(`${candParts.dateStr}T${hh}:${mm}:00+05:30`);
+      return Math.max(1000, nextOpen.getTime() - now.getTime());
+    }
+  }
+  return 60_000;
+}
+
+

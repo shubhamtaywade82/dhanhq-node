@@ -1,7 +1,7 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { PositionMonitor, OrderUpdateWS, RateLimitError } from '@nemesis-oss/dhanhq-sdk';
 import { eventBus } from './eventBus';
-import { marketClock, istNow } from './marketHours';
+import { marketClock, istNow, isWsMarketWindowOpen, msUntilNextWsWindow } from './marketHours';
 
 /**
  * Always-on market data service.
@@ -142,7 +142,39 @@ export class MarketDataService {
     eventBus.log('SYSTEM', `Market data service started (ws=${this.wsStarted ? 'attempting' : 'unavailable'}, rest fallback armed)`, 'market_data');
   }
 
-  private tryStartWs(): void {
+  private hasMcxSubscription(): boolean {
+    if (process.env.MCX_ENABLED === 'true') return true;
+    for (const key of this.extraSubscriptions) {
+      if (key.startsWith('MCX_COMM:')) return true;
+    }
+    return false;
+  }
+
+  private disconnectWs(): void {
+    this.wsConnecting = false;
+    this.wsStarted = false;
+    if (this.wsRetryTimer) {
+      clearTimeout(this.wsRetryTimer);
+      this.wsRetryTimer = null;
+    }
+    if (this.wsSilenceWatch) {
+      clearInterval(this.wsSilenceWatch);
+      this.wsSilenceWatch = null;
+    }
+    const ws: any = (this.client as any).ws;
+    try { ws?.market?.disconnect?.(); } catch { /* noop */ }
+    try { ws?.orders?.disconnect?.(); } catch { /* noop */ }
+  }
+
+  private tryStartWs(force = false): void {
+    if (!force && !isWsMarketWindowOpen(this.hasMcxSubscription())) {
+      const nextMs = msUntilNextWsWindow(this.hasMcxSubscription());
+      const nextMin = Math.round(nextMs / 60_000);
+      eventBus.log('INFO', `Outside WebSocket market hours (window: 09:10–15:35 IST) — connection deferred (${nextMin}m until open)`, 'market_data');
+      if (this.wsStarted) this.disconnectWs();
+      return;
+    }
+
     // Only bring up the DhanHQ binary WS when a token is actually resolvable
     const tokenResolvable = !!(process.env.DHAN_ACCESS_TOKEN && process.env.DHAN_ACCESS_TOKEN !== 'your_access_token')
       || !!(process.env.DHAN_PIN && process.env.DHAN_TOTP_SECRET)
@@ -166,7 +198,7 @@ export class MarketDataService {
       this.wsConnecting = false;
     }
     if (Date.now() - this.lastWs429At < 60_000) {
-      this.scheduleWsRetry(60_000 - (Date.now() - this.lastWs429At));
+      this.scheduleWsRetry(60_000 - (Date.now() - this.lastWs429At), force);
       return;
     }
 
@@ -209,7 +241,7 @@ export class MarketDataService {
           this.wsStarted = false;
           eventBus.log('WARN', `Market WS closed (code=${code}) — reconnecting`, 'market_data');
           eventBus.emit('system', { type: 'feed_degraded', source: 'rest' });
-          this.scheduleWsRetry();
+          this.scheduleWsRetry(undefined, force);
         });
         ws.market?.on?.('error', (e: any) => {
           const msg = e?.message || String(e);
@@ -223,7 +255,7 @@ export class MarketDataService {
             this.wsStarted = false;
             try { ws.market?.disconnect?.(); } catch { /* noop */ }
             this.requestRestRefresh();
-            this.scheduleWsRetry(60_000);
+            this.scheduleWsRetry(60_000, force);
             return;
           }
           eventBus.log('WARN', `Market WS error: ${msg}`, 'market_data');
@@ -256,27 +288,18 @@ export class MarketDataService {
           if (msg.includes('429')) {
             this.lastWs429At = Date.now();
             this.requestRestRefresh();
-            this.scheduleWsRetry(60_000);
+            this.scheduleWsRetry(60_000, force);
           }
         });
       } else if (!this.wsStarted) {
-        // isConnected can lag reality: the SDK only flips it to false
-        // inside the underlying transport's own async 'close' event, not
-        // synchronously when we call disconnect() (armSilenceWatch, the
-        // 429 handler) — so a retry landing in that window sees a
-        // stale-true isConnected and skips connect() above entirely.
-        // Nothing else in this function schedules a retry for that case,
-        // so without this the reconnect loop would die permanently here:
-        // wsStarted stays false, isConnected stays stale-true, and nothing
-        // ever calls connect() again.
-        this.scheduleWsRetry();
+        this.scheduleWsRetry(undefined, force);
       }
       if (!ws.orders?.isConnected) {
         ws.orders?.connect?.().catch(() => {});
       }
     } catch (e: any) {
       eventBus.log('WARN', `DhanHQ WebSocket start failed (${e?.message || e}) — REST polling only`, 'market_data');
-      this.scheduleWsRetry();
+      this.scheduleWsRetry(undefined, force);
     }
   }
 
@@ -296,13 +319,14 @@ export class MarketDataService {
   }
 
   // Capped exponential backoff with custom override for 429 rate limits
-  private scheduleWsRetry(customDelay?: number): void {
+  private scheduleWsRetry(customDelay?: number, force = false): void {
     if (this.wsRetryTimer) return;
+    if (!force && !isWsMarketWindowOpen(this.hasMcxSubscription())) return;
     this.wsRetryAttempts++;
     const delay = customDelay || Math.min(15_000 * 2 ** (this.wsRetryAttempts - 1), 5 * 60_000);
     this.wsRetryTimer = setTimeout(() => {
       this.wsRetryTimer = null;
-      this.tryStartWs();
+      this.tryStartWs(force);
     }, delay);
   }
 
@@ -313,6 +337,15 @@ export class MarketDataService {
   private schedulePolling(): void {
     const tick = async () => {
       const clock = marketClock();
+      const wsWindowOpen = isWsMarketWindowOpen(this.hasMcxSubscription());
+
+      if (wsWindowOpen && !this.wsStarted && !this.wsConnecting) {
+        this.tryStartWs();
+      } else if (!wsWindowOpen && (this.wsStarted || this.wsConnecting || (this.client as any).ws?.market?.isConnected)) {
+        eventBus.log('INFO', 'Market hours ended (15:35 IST) — cleanly disconnecting DhanHQ WebSocket feed', 'market_data');
+        this.disconnectWs();
+      }
+
       const wsFresh = this.wsTickCount > 0 && Date.now() - this.lastWsTickAt < 10_000;
       const backoffRemaining = this.rateLimitedUntil - Date.now();
       // wsFresh's own window is 10s — RiskEngine's stale-tick alarm trips at
@@ -601,10 +634,8 @@ export class MarketDataService {
 
   stop(): void {
     if (this.pollTimer) clearTimeout(this.pollTimer);
-    if (this.wsRetryTimer) clearTimeout(this.wsRetryTimer);
-    if (this.wsSilenceWatch) clearInterval(this.wsSilenceWatch);
     this.unsubEventBus?.();
-    try { (this.client as any).ws?.disconnect?.(); } catch { /* noop */ }
+    this.disconnectWs();
   }
 }
 
