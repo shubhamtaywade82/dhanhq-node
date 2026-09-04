@@ -284,6 +284,14 @@ function extractSwings(timeline: any[]) {
   return swings.slice(0, 5);
 }
 
+/** Dhan's ApiResponseError carries its own errorCode/errorType/errorMessage
+ * from the response body, separately from the generic top-level message
+ * ("Dhan API request failed with status 400" alone doesn't say WHY — rate
+ * limit vs bad params vs no data for the range; the body usually does). */
+function dhanErrorDetail(e: any): string {
+  return [e.errorCode, e.errorType, e.errorMessage].filter(Boolean).join(' | ');
+}
+
 async function fetchSpotHistoricalDays(client: DhanClient, params: AnalysisParams) {
   try {
     const toDate = new Date().toISOString().split('T')[0];
@@ -302,7 +310,8 @@ async function fetchSpotHistoricalDays(client: DhanClient, params: AnalysisParam
       return days.slice(-params.daysCount);
     }
   } catch (e: any) {
-    eventBus.log('WARN', `Historical spot fetch failed: ${e.message}`, 'market');
+    const detail = dhanErrorDetail(e);
+    eventBus.log('WARN', `Historical spot fetch failed: ${e.message}${detail ? ` (${detail})` : ''}`, 'market');
   }
   return [];
 }
@@ -352,7 +361,8 @@ async function fetchStrikeRollingCandles(client: DhanClient, params: AnalysisPar
       };
     }
   } catch (e: any) {
-    eventBus.log('WARN', `Rolling option candles failed for ${strike} ${dateStr}: ${e.message}`, 'market');
+    const detail = dhanErrorDetail(e);
+    eventBus.log('WARN', `Rolling option candles failed for ${strike} ${dateStr}: ${e.message}${detail ? ` (${detail})` : ''}`, 'market');
   }
   return null;
 }
