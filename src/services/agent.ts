@@ -168,11 +168,20 @@ async function unwindLegs(engine: ExecutionEngine, stratId: string, filledLegs: 
       ? await engine.closeLeg({ securityId: leg.securityId, exchangeSegment: leg.exchangeSegment, qty: leg.qty, side: leg.side, instrument: leg.instrument }, unwindPrice, `unwind_${stratId}_${leg.securityId}`).catch((e: any) => ({ status: 'REJECTED', reason: e.message }))
       : await portfolio.closePosition(leg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
 
-    if (result.status === 'TRADED') {
+    if (result.status === 'TRADED' || result.status === 'noop') {
+      // 'noop' ("no open position found") means something else — the
+      // long-option giveback policy, a stop-loss/target hit — already
+      // closed this leg before the unwind got here. That's the SAME end
+      // state a successful unwind reaches (flat, no exposure), just via a
+      // different path — not a failure. Untracking is safe either way:
+      // a no-op if PositionMonitor was never (re-)armed for it.
       market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
+      if (result.status === 'noop') {
+        eventBus.log('INFO', `Unwind for leg ${leg.instrument}: already flat (closed by another exit path first)`, 'agent');
+      }
     } else {
-      // Untracking on a failed unwind would leave an unhedged position
-      // without stop-loss protection.
+      // Untracking on a genuinely failed unwind would leave an unhedged
+      // position without stop-loss protection.
       eventBus.log('ERROR', `Unwind FAILED for leg ${leg.instrument}: ${result.status}${(result as any).reason ? ` (${(result as any).reason})` : ''}`, 'agent');
     }
   }

@@ -578,6 +578,33 @@ describe('Mark-to-market — autonomy loop feed', () => {
 describe('AgentOrchestrator — honest LLM fallback', () => {
   beforeAll(async () => { await initDatabase(); });
 
+  // auth.ts calls dotenv.config() at module-load time (transitively imported
+  // via PaperExecutionEngine/LiveExecutionEngine above), which fills in
+  // whatever real OLLAMA_API_KEY_N values are in .env — so every test in
+  // this block that constructs an AgentOrchestrator would otherwise
+  // silently enter real Ollama Cloud mode and fire an unawaited, unstubbed
+  // network call. Clear the whole numbered range to a blank slate for
+  // every test; a test that wants cloud-mode behavior sets its own fake
+  // key(s) explicitly, on top of this clean baseline.
+  let ollamaKeyEnvSnapshot: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    ollamaKeyEnvSnapshot = {};
+    for (const key of Object.keys(process.env)) {
+      if (/^OLLAMA_API_KEY_\d+$/.test(key)) {
+        ollamaKeyEnvSnapshot[key] = process.env[key];
+        delete process.env[key];
+      }
+    }
+  });
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (/^OLLAMA_API_KEY_\d+$/.test(key) && !(key in ollamaKeyEnvSnapshot)) delete process.env[key];
+    }
+    for (const [key, value] of Object.entries(ollamaKeyEnvSnapshot)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+
   it('reports deterministic mode when Ollama is unreachable', async () => {
     const { agent } = await stubEngines(100);
     const status = agent.status();
@@ -715,6 +742,54 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
       expect(result.reason).toBe('partial_fill_unwound');
       const pos = (await listPaperPositions()).find((p: any) => p.tradingSymbol === 'NIFTY24050CE');
       expect(Number(pos?.netQty || 0)).toBe(0); // the leg that filled was unwound back to flat
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not log an ERROR when unwind finds the leg already flat — closed by another exit path first (e.g. long-option giveback policy)', async () => {
+    // Regression, found live: a leg filled, the long-option giveback policy
+    // closed it independently within ~40ms, and THEN this leg's own unwind
+    // (triggered by a sibling leg failing) found nothing left to close —
+    // portfolio.closePosition() correctly returns 'noop', which used to be
+    // logged as ERROR (and fed a pointless self-healing "investigate root
+    // cause" promotion) even though flat-with-no-exposure is exactly the
+    // state a successful unwind was trying to reach anyway.
+    jest.useFakeTimers({ doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'nextTick'] })
+      .setSystemTime(new Date('2026-09-01T04:30:00.000Z'));
+    try {
+      const { agent, risk } = await stubEngines(100);
+      // Defensive: stubEngines()'s mocked canTrade() blocks on isKilled(),
+      // which reads persisted kill state shared across RiskEngine instances
+      // in this file (pre-existing cross-test leakage, unrelated to this
+      // fix) — don't let an earlier test's leftover armed kill switch
+      // reject this test's entry leg before it even reaches the unwind path.
+      if (risk.isKilled()) await risk.disarmKillSwitch();
+      const logSpy = jest.spyOn(eventBus, 'log');
+      jest.spyOn(risk.getPortfolio(), 'closePosition').mockResolvedValueOnce({ status: 'noop', reason: 'No open position found', symbol: 'NOOPTEST24050CE' } as any);
+
+      const strat = {
+        id: `exec01_noop_test_${Date.now()}`,
+        name: 'Test Bull Call Spread (already-flat unwind)',
+        symbol: 'NIFTY',
+        type: 'BULL_CALL_SPREAD' as any,
+        lots: 1,
+        estimatedNetPremium: 0,
+        lotSize: 50,
+        legs: [
+          // Distinct symbol (not NIFTY24050CE) so this test's margin/wallet
+          // state isn't polluted by EXEC-01 above, which fills the same
+          // security_id '44000' under that symbol without a wallet reset
+          // between AgentOrchestrator tests in this file.
+          { instrument: 'NOOPTEST24050CE', securityId: '44000', side: 'BUY' as const, qty: 50, strike: 24050, optionType: 'CE' as const, price: 100, exchangeSegment: 'NSE_FNO' },
+          { instrument: 'NOOPTEST24150CE', securityId: '99999', side: 'SELL' as const, qty: 50, strike: 24150, optionType: 'CE' as const, price: 0, exchangeSegment: 'NSE_FNO' },
+        ],
+      };
+      const result: any = await (agent as any).executeStrategy('run_noop', 'deploy this spread', strat, true);
+      expect(result.status).toBe('FAILED');
+      expect(result.reason).toBe('partial_fill_unwound');
+      expect(logSpy).not.toHaveBeenCalledWith('ERROR', expect.stringContaining('Unwind FAILED'), 'agent');
+      expect(logSpy).toHaveBeenCalledWith('INFO', expect.stringContaining('already flat'), 'agent');
     } finally {
       jest.useRealTimers();
     }
