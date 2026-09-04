@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { api } from '../services/api';
 import { Clock, Send, RefreshCw, Loader2, ArrowUpRight, CheckCircle2 } from 'lucide-react';
+import { LerpNumber } from '../components/ui/LerpNumber';
+import { FlashValue } from '../components/ui/FlashValue';
 
 interface Props {
   onSelectSymbol: (symbol: string) => void;
@@ -151,7 +153,9 @@ export function ResearchWatchlist({ onSelectSymbol }: Props) {
                   <tr key={w.symbol} className="hover:bg-surface-200/40 transition-colors">
                     <td className="py-2 px-2 font-mono font-bold text-white">{w.symbol}</td>
                     <td className="py-2 px-2 text-[11px] text-zinc-400">{w.sector}</td>
-                    <td className="py-2 px-2 font-mono font-bold text-accent">{w.deterministicScore}</td>
+                    <td className="py-2 px-2 font-mono font-bold text-accent">
+                      <LerpNumber value={w.deterministicScore} decimals={0} />
+                    </td>
                     <td className="py-2 px-2 font-mono text-emerald-400 text-[11px]">{w.metrics?.supertrend || 'BULLISH'}</td>
                     <td className="py-2 px-2 font-mono text-zinc-300">{w.metrics?.cfoVsPat}x</td>
                     <td className="py-2 px-2 font-mono text-zinc-300">{w.metrics?.roicPct}%</td>
@@ -184,8 +188,14 @@ function StatusCard({ label, val, badge, highlight }: any) {
     <div className={`p-3 rounded-lg border ${highlight ? 'bg-accent/10 border-accent/30' : 'bg-surface-100 border-border'}`}>
       <div className="text-[10px] font-mono uppercase text-muted">{label}</div>
       <div className="flex items-center gap-2 mt-1">
-        <span className={`text-xs font-bold font-mono ${highlight ? 'text-accent' : 'text-white'}`}>{val}</span>
-        {badge && <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded ${badge}`}>{val}</span>}
+        <span className={`text-xs font-bold font-mono ${highlight ? 'text-accent' : 'text-white'}`}>
+          <FlashValue value={val}>{val}</FlashValue>
+        </span>
+        {badge && (
+          <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded ${badge}`}>
+            <FlashValue value={val}>{val}</FlashValue>
+          </span>
+        )}
       </div>
     </div>
   );

@@ -1,10 +1,9 @@
 import { useState, useEffect } from "react";
 import { useApp } from "../../store/AppContext";
-import { fmt, fmtINR, pnlClass } from "../../utils/formatters";
+import { fmtINR, pnlClass } from "../../utils/formatters";
 import { Button } from "../ui/Button";
 import { StatusDot } from "../ui/StatusDot";
 import { Bolt, Power } from "lucide-react";
-import { useLerpNumber } from "../../hooks/useLerpNumber";
 import { LerpNumber } from "../ui/LerpNumber";
 
 interface HeaderProps {
@@ -20,18 +19,17 @@ interface TickerData {
 }
 
 function Ticker({ label, data, valueClass = "text-white" }: { label: string; data: TickerData | null; valueClass?: string }) {
-  const lerpLtp = useLerpNumber(data?.ltp ?? null, 0.18, 0.05);
-  const lerpPct = useLerpNumber(data?.pct ?? null, 0.18, 0.01);
-
   return (
     <div className="flex items-center gap-1.5 tabular-nums">
       <span className="text-muted text-[10px]">{label}</span>
       {data ? (
         <>
-          <span className={`${valueClass} font-semibold`}>{fmt(lerpLtp)}</span>
+          <span className={`${valueClass} font-semibold`}>
+            <LerpNumber value={data.ltp} decimals={2} />
+          </span>
           <span className={`text-[10px] ${data.change >= 0 ? "text-accent" : "text-danger"}`}>
             {data.change >= 0 ? "+" : ""}
-            {fmt(lerpPct)}%
+            <LerpNumber value={data.pct} decimals={2} suffix="%" />
           </span>
         </>
       ) : (

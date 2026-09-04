@@ -1,3 +1,5 @@
+import { useEffect, useRef } from 'react';
+
 const badgeMap: Record<string, string> = {
   TRADED: 'bg-accent/12 text-accent',
   FILLED: 'bg-accent/12 text-accent',
@@ -8,9 +10,29 @@ const badgeMap: Record<string, string> = {
   TRANSIT: 'bg-gold/12 text-gold',
 };
 
-export function Badge({ status, className = '' }: { status: string; className?: string }) {
+export function Badge({ status, className = '', flash = true }: { status: string; className?: string; flash?: boolean }) {
+  const spanRef = useRef<HTMLSpanElement>(null);
+  const prevRef = useRef<string>(status);
+
+  useEffect(() => {
+    if (!flash) return;
+    const prev = prevRef.current;
+    prevRef.current = status;
+    if (!prev || prev === status) return;
+    const el = spanRef.current;
+    if (!el) return;
+
+    const cls = status === 'FILLED' || status === 'TRADED' ? 'animate-flash-up' : status === 'REJECTED' ? 'animate-flash-down' : 'animate-flash-neutral';
+    el.classList.remove('animate-flash-up', 'animate-flash-down', 'animate-flash-neutral');
+    void el.offsetWidth;
+    el.classList.add(cls);
+  }, [status, flash]);
+
   return (
-    <span className={`inline-flex items-center px-1.75 py-0.5 rounded text-[9.5px] font-mono font-semibold whitespace-nowrap ${badgeMap[status] || 'bg-muted/12 text-muted'} ${className}`}>
+    <span
+      ref={spanRef}
+      className={`inline-flex items-center px-1.75 py-0.5 rounded text-[9.5px] font-mono font-semibold whitespace-nowrap transition-colors duration-150 ${badgeMap[status] || 'bg-muted/12 text-muted'} ${className}`}
+    >
       {status}
     </span>
   );

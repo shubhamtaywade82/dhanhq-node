@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
+import { FlashValue } from '../components/ui/FlashValue';
 import { api } from '../services/api';
 
 /**
@@ -75,7 +76,9 @@ export function GreeksAnalytics() {
         {greekCards.map((g) => (
           <Card key={g.label} className="p-3 text-center">
             <div className="text-[8.5px] font-mono text-muted uppercase tracking-wider mb-0.5 font-semibold">{g.label}</div>
-            <div className={`text-lg font-bold font-mono ${g.color}`}>{g.value}</div>
+            <div className={`text-lg font-bold font-mono ${g.color}`}>
+              <FlashValue value={g.value}>{g.value}</FlashValue>
+            </div>
             <div className="text-[9px] font-mono text-muted">{g.sub}</div>
           </Card>
         ))}
