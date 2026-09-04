@@ -1,6 +1,6 @@
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
-import { executePaperOrder, closePaperPosition, defaultMarginResolver, calculateOrderCharges, listPaperPositions } from '../db';
+import { executePaperOrder, closePaperPosition, defaultMarginResolver, calculateOrderCharges, listPaperPositions, closeParentStrategyIfFlat } from '../db';
 import {
   applyExitFill, createLongOptionState, decideLongOption, DEFAULT_LONG_OPTION_POLICY_CONFIG,
   type FeeEstimator, type LongOptionState,
@@ -147,6 +147,12 @@ export class LongOptionPositionManager {
       if (state.remainingQuantity <= 0) {
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         this.states.delete(pos.tradingSymbol);
+        // Found live: a single-leg strategy whose only exit is this policy
+        // (the adaptive-supertrend scanner deliberately sets no risk_limits
+        // and relies entirely on this ratchet) stayed stuck at status
+        // RUNNING forever once closed here — nothing told the parent
+        // strategy record. Same reconciliation every other exit path uses.
+        await closeParentStrategyIfFlat(pos.tradingSymbol, await listPaperPositions());
       }
     } catch (e: any) {
       eventBus.log('ERROR', `Long-option policy sell failed for ${pos.tradingSymbol}: ${e.message}`, 'long_option_policy');

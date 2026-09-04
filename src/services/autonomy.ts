@@ -11,7 +11,7 @@ import type { ResearchOrchestrator } from './research/researchOrchestrator';
 import { LongOptionPositionManager } from './longOptionPositionManager';
 import {
   listPaperStrategies, updatePaperStrategyStatus, pushAlert,
-  reconcileLedger, correctLedgerFromPostgres,
+  reconcileLedger, correctLedgerFromPostgres, closeParentStrategyIfFlat,
 } from '../db';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 
@@ -215,24 +215,11 @@ export class AutonomyEngine {
         const res = await this.portfolio.closePosition(pos.tradingSymbol, ltp, kind);
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         eventBus.log('TRADE', `Auto-exit ${pos.tradingSymbol}: ${res.status} @ ₹${ltp} (${p.reason})`, 'autonomy');
-        await this.closeParentStrategyIfFlat(pos.tradingSymbol);
+        await closeParentStrategyIfFlat(pos.tradingSymbol, await this.portfolio.getPositions());
       }
     } catch (e: any) {
       eventBus.log('ERROR', `Auto-exit failed: ${e.message}`, 'autonomy');
     }
-  }
-
-  /** A leg closing via SL/target/trailing (not the strategy-level loss-limit
-   * path below) never told the parent strategy — it stayed RUNNING forever
-   * with a stale PnL once all its legs were flat. */
-  private async closeParentStrategyIfFlat(tradingSymbol: string): Promise<void> {
-    const strategies = await listPaperStrategies();
-    const strat = strategies.find((s: any) => s.status === 'RUNNING' && (s.legs || []).some((l: any) => l.instrument === tradingSymbol));
-    if (!strat) return;
-    const positions = await this.portfolio.getPositions();
-    const posMap = new Map(positions.map((p) => [p.tradingSymbol, p]));
-    const stillOpen = (strat.legs || []).some((l: any) => Number(posMap.get(l.instrument)?.netQty || 0) !== 0);
-    if (!stillOpen) await updatePaperStrategyStatus(strat.id, 'STOPPED');
   }
 
   /**

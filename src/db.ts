@@ -428,6 +428,24 @@ export async function updatePaperStrategyStatus(id: string, status: string) {
   return { id, status };
 }
 
+/** A leg closing via ANY exit path (SL/target/trailing, the long-option
+ * giveback policy, a manual close) never tells the parent strategy on its
+ * own — it stays RUNNING forever, with stale PnL, once all its legs are
+ * flat. Shared so every exit path reconciles the same way instead of each
+ * needing to remember to (found live: LongOptionPositionManager.sell()
+ * didn't, leaving a fully-closed single-leg strategy stuck RUNNING).
+ * `openPositions` is caller-supplied (paper ledger or the live/broker
+ * PortfolioSource — whichever this exit path actually reads) rather than
+ * fetched here, so this stays agnostic to which one applies. */
+export async function closeParentStrategyIfFlat(tradingSymbol: string, openPositions: Array<{ tradingSymbol: string; netQty: number }>): Promise<void> {
+  const strategies = await listPaperStrategies();
+  const strat = strategies.find((s: any) => s.status === 'RUNNING' && (s.legs || []).some((l: any) => l.instrument === tradingSymbol));
+  if (!strat) return;
+  const posMap = new Map(openPositions.map((p) => [p.tradingSymbol, p]));
+  const stillOpen = (strat.legs || []).some((l: any) => Number(posMap.get(l.instrument)?.netQty || 0) !== 0);
+  if (!stillOpen) await updatePaperStrategyStatus(strat.id, 'STOPPED');
+}
+
 export async function deletePaperStrategy(id: string) {
   if (mode === 'postgres') {
     await pool.query('DELETE FROM paper_strategies WHERE id = $1', [id]);
