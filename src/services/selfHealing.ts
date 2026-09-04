@@ -1,12 +1,32 @@
-import { OllamaClient } from '@nemesis-oss/ollama-sdk';
+import { OllamaClient, type Logger as OllamaLogger } from '@nemesis-oss/ollama-sdk';
 import { eventBus } from './eventBus';
+import { moduleLogger } from '../lib/logger';
 import { recordErrorPattern, listErrorPatterns, ruleExistsForPattern, promoteRule } from '../db';
+import { readOllamaCloudKeys } from './agent';
+
+const selfHealingOllamaLog = moduleLogger('self_healing_ollama');
+/** Same SDK Logger adapter as agent.ts's — see that file for why: without
+ * it the SDK's own per-credential attempt/failure lines are silently
+ * dropped (defaults to a no-op logger). */
+const selfHealingOllamaSdkLogger: OllamaLogger = {
+  debug: (msg, ctx) => selfHealingOllamaLog.debug(ctx || {}, msg),
+  info: (msg, ctx) => selfHealingOllamaLog.info(ctx || {}, msg),
+  warn: (msg, ctx) => selfHealingOllamaLog.warn(ctx || {}, msg),
+  error: (msg, ctx) => selfHealingOllamaLog.error(ctx || {}, msg),
+};
 
 /**
  * Self-healing loop: watches WARN/ERROR events on the bus, and when the
- * same message recurs (>= minOccurrences) with no rule yet, asks a local
- * Ollama model to turn it into a one-line imperative rule. Promoted rules
- * are injected into AgentOrchestrator's system prompt via db.getActiveRules().
+ * same message recurs (>= minOccurrences) with no rule yet, asks an Ollama
+ * model to turn it into a one-line imperative rule. Promoted rules are
+ * injected into AgentOrchestrator's system prompt via db.getActiveRules().
+ *
+ * Previously always dialed a LOCAL Ollama daemon regardless of whether
+ * agent.ts's own client had moved to Ollama Cloud — with no local daemon
+ * running, every synthesizeRule() call failed silently and fell through to
+ * the hardcoded fallback string below, every time. Uses the same
+ * OLLAMA_API_KEY_N / OLLAMA_CLOUD_MODEL config as agent.ts now, so the two
+ * clients agree on where the LLM actually lives.
  */
 export class SelfHealingService {
   private ollama: OllamaClient | null;
@@ -16,10 +36,21 @@ export class SelfHealingService {
   private running = false;
 
   constructor(private minOccurrences = 2, private cycleMs = 15 * 60_000) {
-    this.model = process.env.SELF_HEALING_MODEL || process.env.OLLAMA_MODEL || 'qwen2.5:0.5b';
-    this.ollama = process.env.OLLAMA_ENABLED !== 'false'
-      ? new OllamaClient({ baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434', timeoutMs: 10_000, retries: 0 })
-      : null;
+    const cloudKeys = readOllamaCloudKeys();
+    const cloudModel = process.env.OLLAMA_CLOUD_MODEL || 'gemma4:31b';
+    this.model = process.env.SELF_HEALING_MODEL || (cloudKeys.length > 0 ? cloudModel : (process.env.OLLAMA_MODEL || 'qwen2.5:0.5b'));
+    this.ollama = process.env.OLLAMA_ENABLED === 'false'
+      ? null
+      : cloudKeys.length > 0
+        ? new OllamaClient({
+            baseUrl: process.env.OLLAMA_CLOUD_BASE_URL || 'https://ollama.com',
+            credentials: Object.fromEntries(cloudKeys.map((apiKey, i) => [`cloud-${i + 1}`, { apiKey }])),
+            modelBindings: { [this.model]: cloudKeys.map((_, i) => `cloud-${i + 1}`) },
+            logger: selfHealingOllamaSdkLogger,
+            timeoutMs: 10_000,
+            retries: 0,
+          })
+        : new OllamaClient({ baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434', timeoutMs: 10_000, retries: 0 });
   }
 
   start(): void {
