@@ -12,18 +12,38 @@ describe('ResearchOrchestrator', () => {
     await initDatabase();
   });
 
+  // The screener needs a scrip master to resolve ids against and ~250
+  // sessions of history to judge a trend over; six bars is below its
+  // minimum and is reported as skipped rather than scored.
+  const uptrend = (n: number, start: number, dailyPct: number) => {
+    const close: number[] = [];
+    let price = start;
+    for (let i = 0; i < n; i++) { price *= 1 + dailyPct / 100; close.push(price); }
+    return {
+      close,
+      high: close.map((c) => c * 1.01),
+      low: close.map((c) => c * 0.99),
+      volume: close.map(() => 500000),
+    };
+  };
+
   beforeEach(() => {
     mockClient = {
       marketFeed: {
         quote: jest.fn().mockResolvedValue({ data: { NSE_EQ: { '2885': { ltp: 1350, volume: 500000, close: 1340 } } } }),
       },
       charts: {
-        historical: jest.fn().mockResolvedValue({
-          close: [1300, 1310, 1320, 1330, 1340, 1350],
-          high: [1310, 1320, 1330, 1340, 1350, 1360],
-          low: [1290, 1300, 1310, 1320, 1330, 1340],
-          volume: [10000, 12000, 11000, 15000, 14000, 16000],
-        }),
+        historical: jest.fn().mockResolvedValue(uptrend(300, 1000, 0.3)),
+      },
+      instruments: {
+        bySegment: jest.fn(async (seg: string) => (seg === 'NSE_FNO' ? [] : [
+          { securityId: '2885', underlyingSymbol: 'RELIANCE', displayName: 'Reliance Industries', series: 'EQ' },
+          { securityId: '11536', underlyingSymbol: 'TCS', displayName: 'Tata Consultancy Services', series: 'EQ' },
+          { securityId: '1594', underlyingSymbol: 'INFY', displayName: 'Infosys', series: 'EQ' },
+          { securityId: '7229', underlyingSymbol: 'HCLTECH', displayName: 'HCL Technologies', series: 'EQ' },
+          { securityId: '13538', underlyingSymbol: 'TECHM', displayName: 'Tech Mahindra', series: 'EQ' },
+          { securityId: '3787', underlyingSymbol: 'WIPRO', displayName: 'Wipro', series: 'EQ' },
+        ])),
       },
     };
 

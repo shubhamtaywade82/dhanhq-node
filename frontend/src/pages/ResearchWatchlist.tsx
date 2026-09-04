@@ -4,6 +4,12 @@ import { Clock, Send, RefreshCw, Loader2, ArrowUpRight, CheckCircle2 } from 'luc
 import { LerpNumber } from '../components/ui/LerpNumber';
 import { FlashValue } from '../components/ui/FlashValue';
 
+// null means "not enough price history to say", which must read differently from 0%.
+const fmtPct = (v: number | null | undefined) =>
+  v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
+const pnlTone = (v: number | null | undefined) =>
+  v == null ? 'text-zinc-500' : v > 0 ? 'text-emerald-400' : 'text-rose-400';
+
 interface Props {
   onSelectSymbol: (symbol: string) => void;
 }
@@ -140,10 +146,10 @@ export function ResearchWatchlist({ onSelectSymbol }: Props) {
                   <th className="py-2 px-2">Symbol</th>
                   <th className="py-2 px-2">Sector</th>
                   <th className="py-2 px-2">Score</th>
-                  <th className="py-2 px-2">Supertrend</th>
-                  <th className="py-2 px-2">CFO/PAT</th>
-                  <th className="py-2 px-2">ROIC</th>
-                  <th className="py-2 px-2">DCF MoS</th>
+                  <th className="py-2 px-2">Horizon</th>
+                  <th className="py-2 px-2">20d</th>
+                  <th className="py-2 px-2">60d vs NIFTY</th>
+                  <th className="py-2 px-2">From 52w High</th>
                   <th className="py-2 px-2">Last Analyzed</th>
                   <th className="py-2 px-2 text-right">Action</th>
                 </tr>
@@ -156,10 +162,20 @@ export function ResearchWatchlist({ onSelectSymbol }: Props) {
                     <td className="py-2 px-2 font-mono font-bold text-accent">
                       <LerpNumber value={w.deterministicScore} decimals={0} />
                     </td>
-                    <td className="py-2 px-2 font-mono text-emerald-400 text-[11px]">{w.metrics?.supertrend || 'BULLISH'}</td>
-                    <td className="py-2 px-2 font-mono text-zinc-300">{w.metrics?.cfoVsPat}x</td>
-                    <td className="py-2 px-2 font-mono text-zinc-300">{w.metrics?.roicPct}%</td>
-                    <td className="py-2 px-2 font-mono text-zinc-300">{w.metrics?.dcfMarginOfSafetyPct}%</td>
+                    <td className="py-2 px-2">
+                      <div className="flex flex-wrap gap-1">
+                        {(w.horizons || []).length === 0
+                          ? <span className="text-[10px] font-mono text-zinc-600">—</span>
+                          : (w.horizons || []).map((h: string) => (
+                            <span key={h} className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-accent/15 text-accent border border-accent/30">
+                              {h.replace('_TERM', '')}
+                            </span>
+                          ))}
+                      </div>
+                    </td>
+                    <td className={`py-2 px-2 font-mono ${pnlTone(w.metrics?.return20d)}`}>{fmtPct(w.metrics?.return20d)}</td>
+                    <td className={`py-2 px-2 font-mono ${pnlTone(w.metrics?.relativeStrength60d)}`}>{fmtPct(w.metrics?.relativeStrength60d)}</td>
+                    <td className="py-2 px-2 font-mono text-zinc-300">{fmtPct(w.metrics?.pctFrom52wHigh)}</td>
                     <td className="py-2 px-2 text-[10px] text-muted font-mono">
                       {w.lastAnalyzedAt ? new Date(w.lastAnalyzedAt).toLocaleTimeString() : 'Pending'}
                     </td>

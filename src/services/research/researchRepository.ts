@@ -32,10 +32,14 @@ export async function initResearchRepository(): Promise<void> {
       deterministic_score NUMERIC(5, 2) NOT NULL,
       status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
       metrics JSONB NOT NULL DEFAULT '{}',
+      horizons JSONB NOT NULL DEFAULT '[]',
       added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL,
       last_analyzed_at TIMESTAMPTZ
     );
+    -- CREATE TABLE IF NOT EXISTS leaves an already-created table alone, so
+    -- new columns need their own ALTER (same pattern as src/db.ts).
+    ALTER TABLE research_watchlist ADD COLUMN IF NOT EXISTS horizons JSONB NOT NULL DEFAULT '[]';
   `;
   try {
     await pool.query(sql);
@@ -87,6 +91,7 @@ export async function saveWatchlist(candidates: ScreenerCandidate[], universe: s
       deterministicScore: c.deterministicScore,
       status: 'ACTIVE',
       metrics: c.metrics,
+      horizons: c.horizons || [],
       addedAt: now,
       expiresAt,
     };
@@ -94,18 +99,20 @@ export async function saveWatchlist(candidates: ScreenerCandidate[], universe: s
 
     if (dbMode() === 'postgres') {
       const q = `
-        INSERT INTO research_watchlist (symbol, name, sector, universe, deterministic_score, status, metrics, added_at, expires_at)
-        VALUES ($1, $2, $3, $4, $5, 'ACTIVE', $6, $7, $8)
+        INSERT INTO research_watchlist (symbol, name, sector, universe, deterministic_score, status, metrics, horizons, added_at, expires_at)
+        VALUES ($1, $2, $3, $4, $5, 'ACTIVE', $6, $7, $8, $9)
         ON CONFLICT (symbol) DO UPDATE SET
           deterministic_score = EXCLUDED.deterministic_score,
           metrics = EXCLUDED.metrics,
+          horizons = EXCLUDED.horizons,
           expires_at = EXCLUDED.expires_at,
           status = 'ACTIVE';
       `;
       try {
         await pool.query(q, [
           item.symbol, item.name, item.sector, item.universe,
-          item.deterministicScore, JSON.stringify(item.metrics), new Date(item.addedAt), new Date(item.expiresAt),
+          item.deterministicScore, JSON.stringify(item.metrics), JSON.stringify(item.horizons || []),
+          new Date(item.addedAt), new Date(item.expiresAt),
         ]);
       } catch (e: any) {
         log.warn({ symbol: c.symbol, err: e.message }, 'Failed to upsert watchlist item');
@@ -122,7 +129,7 @@ export async function getActiveWatchlist(): Promise<WatchlistItem[]> {
     try {
       const q = `
         SELECT symbol, name, sector, universe, deterministic_score as "deterministicScore",
-               status, metrics,
+               status, metrics, horizons,
                EXTRACT(EPOCH FROM added_at)*1000 as "addedAt",
                EXTRACT(EPOCH FROM expires_at)*1000 as "expiresAt",
                EXTRACT(EPOCH FROM last_analyzed_at)*1000 as "lastAnalyzedAt"

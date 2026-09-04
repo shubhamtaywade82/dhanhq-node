@@ -1,6 +1,7 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import type { MarketDataService } from '../marketData';
 import { INDEX_INSTRUMENTS } from '../marketData';
+import { resolveSymbol, type ExchangePreference } from './universe';
 import type { InstrumentRef } from './types';
 
 export interface FinancialStatements {
@@ -34,39 +35,47 @@ export interface FundamentalDataProvider {
   getPeerMultiples(symbol: string): Promise<PeerMultiples>;
 }
 
-// Well-known NSE equity security IDs verified on Dhan instrument master
-const WELL_KNOWN_EQUITIES: Record<string, { securityId: string; name: string; sector: string }> = {
-  RELIANCE: { securityId: '2885', name: 'Reliance Industries Ltd', sector: 'Oil & Gas / Retail / Telecom' },
-  TCS: { securityId: '11536', name: 'Tata Consultancy Services', sector: 'Information Technology' },
-  INFY: { securityId: '1594', name: 'Infosys Ltd', sector: 'Information Technology' },
-  HDFCBANK: { securityId: '1333', name: 'HDFC Bank Ltd', sector: 'Banking & Financials' },
-  ICICIBANK: { securityId: '4963', name: 'ICICI Bank Ltd', sector: 'Banking & Financials' },
-  TATAMOTORS: { securityId: '3456', name: 'Tata Motors Ltd', sector: 'Automobile' },
-  ITC: { securityId: '1660', name: 'ITC Ltd', sector: 'FMCG' },
-};
-
 /**
- * Resolves instrument references for indices and NSE equities.
+ * Resolves an index or equity to a live instrument reference.
+ *
+ * Equities are looked up in the scrip master rather than a hardcoded table:
+ * the old table had BHARTIARTL pointing at 317 (Bajaj Finance's id) and
+ * TATAMOTORS at 3456 (now TMPV after the demerger), so those two symbols
+ * silently analysed the wrong company.
  */
-export function resolveInstrumentRef(symbol: string): InstrumentRef {
+export async function resolveInstrumentRef(
+  symbol: string,
+  client?: any,
+  exchange: ExchangePreference = 'NSE',
+): Promise<InstrumentRef> {
   const upper = symbol.toUpperCase().trim();
   const index = INDEX_INSTRUMENTS[upper];
   if (index) {
     return { symbol: upper, securityId: index.securityId, exchangeSegment: 'IDX_I', name: index.label, sector: 'Index' };
   }
-  const equity = WELL_KNOWN_EQUITIES[upper];
-  if (equity) {
-    return { symbol: upper, securityId: equity.securityId, exchangeSegment: 'NSE_EQ', name: equity.name, sector: equity.sector };
+  if (client) {
+    const resolved = await resolveSymbol(client, upper, exchange).catch(() => null);
+    if (resolved) return resolved;
   }
-  // Fallback for unlisted dynamic NSE symbols
-  return { symbol: upper, securityId: '0', exchangeSegment: 'NSE_EQ', name: `${upper} Ltd`, sector: 'General Industry' };
+  // Unresolvable: securityId '0' fetches nothing, which surfaces as missing
+  // data downstream instead of as a plausible-looking wrong company.
+  return { symbol: upper, securityId: '0', exchangeSegment: exchange === 'BSE' ? 'BSE_EQ' : 'NSE_EQ', name: upper, sector: 'Unclassified' };
 }
 
 /**
- * Default fundamental data provider with institutional model presets and deterministic fallbacks.
- * Enables zero-dependency local analysis and offline testing without requiring third-party API keys.
+ * SYNTHETIC fundamentals — not a data feed.
+ *
+ * There is no fundamentals provider wired to this system. This returns one
+ * hardcoded RELIANCE profile and an identical made-up profile for every other
+ * symbol, so any ranking built on it is meaningless (that is exactly how the
+ * old screener came to pass all ten symbols with the same score). The
+ * screener no longer consumes it; it survives only to keep the deep-dive
+ * analysis path running, and anything it produces must be presented as an
+ * illustrative model, never as reported financials.
  */
 export class DefaultFundamentalProvider implements FundamentalDataProvider {
+  readonly isSynthetic = true;
+
   async getStatements(symbol: string): Promise<FinancialStatements> {
     const s = symbol.toUpperCase();
     if (s === 'RELIANCE') {
@@ -127,9 +136,13 @@ export class DefaultFundamentalProvider implements FundamentalDataProvider {
  */
 export class MarketDataProvider {
   constructor(
-    private client: DhanClient,
+    private dhan: DhanClient,
     private market: MarketDataService,
   ) {}
+
+  /** Exposed so callers can resolve universes against the same scrip master
+   * this provider fetches prices from. */
+  get client(): DhanClient { return this.dhan; }
 
   async getQuote(ref: InstrumentRef): Promise<{ ltp: number; volume: number; prevClose: number }> {
     const cached = this.market.getLtp(ref.securityId) ?? 0;
@@ -139,8 +152,11 @@ export class MarketDataProvider {
 
     // Direct REST quote lookup
     try {
-      const seg = ref.exchangeSegment === 'IDX_I' ? 'IDX_I' : 'NSE_EQ';
-      const res = await this.client.marketFeed.quote({ [seg]: [Number(ref.securityId)] });
+      // Honours the instrument's real segment. This used to force NSE_EQ for
+      // anything non-index, so a BSE instrument was queried against NSE with
+      // a BSE security id — wrong instrument or no data, silently.
+      const seg = ref.exchangeSegment;
+      const res = await this.dhan.marketFeed.quote({ [seg]: [Number(ref.securityId)] });
       const item = (res.data as any)?.[seg]?.[ref.securityId];
       const ltp = Number(item?.last_price || item?.ltp || 0);
       const volume = Number(item?.volume || 0);
@@ -151,11 +167,22 @@ export class MarketDataProvider {
     }
   }
 
+  /** NIFTY 50 daily closes — the benchmark every relative-strength number in
+   * the screener is measured against. */
+  async getBenchmarkCandles(days = 400): Promise<Array<{ close: number; high: number; low: number; volume: number }>> {
+    const nifty = INDEX_INSTRUMENTS.NIFTY;
+    if (!nifty) return [];
+    return this.getHistoricalCandles(
+      { symbol: 'NIFTY', securityId: nifty.securityId, exchangeSegment: 'IDX_I' },
+      days,
+    );
+  }
+
   async getHistoricalCandles(ref: InstrumentRef, days = 200): Promise<Array<{ close: number; high: number; low: number; volume: number }>> {
     const toDate = new Date().toISOString().split('T')[0];
     const fromDate = new Date(Date.now() - days * 86400000).toISOString().split('T')[0];
     try {
-      const res: any = await this.client.charts.historical({
+      const res: any = await this.dhan.charts.historical({
         securityId: ref.securityId,
         exchangeSegment: ref.exchangeSegment as any,
         instrument: ref.exchangeSegment === 'IDX_I' ? 'INDEX' as any : 'EQUITY' as any,
@@ -173,8 +200,14 @@ export class MarketDataProvider {
         low: Number(lows[idx] ?? c),
         volume: Number(vols[idx] ?? 0),
       }));
-    } catch {
-      return [];
+    } catch (e: any) {
+      // Deliberately propagates. Swallowing this and returning [] made a
+      // dropped request indistinguishable from a stock with no price
+      // history: TECHM was reported as "insufficient history" on every
+      // screen while returning 271 clean candles when fetched on its own.
+      // Callers retry and classify the failure; they cannot do either if the
+      // error never reaches them.
+      throw new Error(`Historical fetch failed for ${ref.symbol} (${ref.exchangeSegment}/${ref.securityId}): ${e.message}`);
     }
   }
 }

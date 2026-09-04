@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { api } from '../services/api';
-import { Search, Loader2, BookOpen, Filter, Clock } from 'lucide-react';
+import { Search, Loader2, BookOpen, Filter, Clock, LayoutDashboard } from 'lucide-react';
 import { ResearchScreener } from './ResearchScreener';
 import { ResearchWatchlist } from './ResearchWatchlist';
+import { ResearchDashboard } from './ResearchDashboard';
 import {
   ResearchTabs,
   VerdictTab,
@@ -13,7 +14,7 @@ import {
 } from './ResearchDetailTabs';
 
 export function ResearchConsole() {
-  const [viewMode, setViewMode] = useState<'watchlist' | 'screener' | 'single'>('watchlist');
+  const [viewMode, setViewMode] = useState<'dashboard' | 'watchlist' | 'screener' | 'single'>('dashboard');
   const [symbol, setSymbol] = useState('RELIANCE');
   const [loading, setLoading] = useState(false);
   const [run, setRun] = useState<any>(null);
@@ -67,6 +68,13 @@ export function ResearchConsole() {
     <div className="space-y-4 max-w-[1400px] mx-auto pb-10">
       <div className="flex items-center gap-1 bg-surface-100 p-1 border border-border rounded-lg w-fit">
         <button
+          onClick={() => setViewMode('dashboard')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold cursor-pointer transition-all ${viewMode === 'dashboard' ? 'bg-accent text-black font-bold' : 'text-muted hover:text-white'}`}
+        >
+          <LayoutDashboard size={13} />
+          <span>Dashboard</span>
+        </button>
+        <button
           onClick={() => setViewMode('watchlist')}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold cursor-pointer transition-all ${viewMode === 'watchlist' ? 'bg-accent text-black font-bold' : 'text-muted hover:text-white'}`}
         >
@@ -89,7 +97,16 @@ export function ResearchConsole() {
         </button>
       </div>
 
-      {viewMode === 'watchlist' ? (
+      {viewMode === 'dashboard' ? (
+        <ResearchDashboard
+          onSelectSymbol={(s) => {
+            setSymbol(s);
+            setViewMode('single');
+            runAnalysis(s);
+          }}
+          onOpenScreener={() => setViewMode('screener')}
+        />
+      ) : viewMode === 'watchlist' ? (
         <ResearchWatchlist
           onSelectSymbol={(s) => {
             setSymbol(s);

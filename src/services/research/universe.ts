@@ -1,57 +1,40 @@
 import { type InstrumentRef } from './types';
 
 /**
- * Predefined Indian equity stock universes with DhanHQ security IDs and sectors.
- * Enables deterministic multi-symbol screener scans across NSE segments.
+ * Stock universes resolved from the live DhanHQ scrip master.
+ *
+ * Security IDs and exchange segments are looked up at runtime, never
+ * hardcoded. The previous hand-typed table had drifted from reality:
+ * BHARTIARTL carried 317 (which is Bajaj Finance, so every Airtel screen
+ * silently priced Bajaj Finance) and TATAMOTORS carried 3456 (now TMPV
+ * post-demerger). Only symbol *groupings* stay curated here — those are
+ * editorial, the identifiers are not.
  */
 
-export const UNIVERSE_STOCKS: Record<string, { securityId: string; name: string; sector: string }> = {
-  RELIANCE: { securityId: '2885', name: 'Reliance Industries Ltd', sector: 'Energy & Retail' },
-  TCS: { securityId: '11536', name: 'Tata Consultancy Services', sector: 'Information Technology' },
-  INFY: { securityId: '1594', name: 'Infosys Ltd', sector: 'Information Technology' },
-  HDFCBANK: { securityId: '1333', name: 'HDFC Bank Ltd', sector: 'Banking & Financials' },
-  ICICIBANK: { securityId: '4963', name: 'ICICI Bank Ltd', sector: 'Banking & Financials' },
-  KOTAKBANK: { securityId: '1922', name: 'Kotak Mahindra Bank Ltd', sector: 'Banking & Financials' },
-  AXISBANK: { securityId: '5900', name: 'Axis Bank Ltd', sector: 'Banking & Financials' },
-  SBIN: { securityId: '3045', name: 'State Bank of India', sector: 'Banking & Financials' },
-  BHARTIARTL: { securityId: '317', name: 'Bharti Airtel Ltd', sector: 'Telecommunications' },
-  LT: { securityId: '11483', name: 'Larsen & Toubro Ltd', sector: 'Infrastructure' },
-  TATAMOTORS: { securityId: '3456', name: 'Tata Motors Ltd', sector: 'Automobile' },
-  MARUTI: { securityId: '10999', name: 'Maruti Suzuki India Ltd', sector: 'Automobile' },
-  ITC: { securityId: '1660', name: 'ITC Ltd', sector: 'FMCG' },
-  HINDUNILVR: { securityId: '1394', name: 'Hindustan Unilever Ltd', sector: 'FMCG' },
-  TITAN: { securityId: '3506', name: 'Titan Company Ltd', sector: 'Consumer Discretionary' },
-  ASIANPAINT: { securityId: '236', name: 'Asian Paints Ltd', sector: 'Consumer Goods' },
-  BAJFINANCE: { securityId: '317', name: 'Bajaj Finance Ltd', sector: 'Financial Services' },
-  BAJAJFINSV: { securityId: '16675', name: 'Bajaj Finserv Ltd', sector: 'Financial Services' },
-  SUNPHARMA: { securityId: '3351', name: 'Sun Pharmaceutical Ltd', sector: 'Pharmaceuticals' },
-  DRREDDY: { securityId: '881', name: 'Dr. Reddys Laboratories Ltd', sector: 'Pharmaceuticals' },
-  WIPRO: { securityId: '3787', name: 'Wipro Ltd', sector: 'Information Technology' },
-  HCLTECH: { securityId: '7229', name: 'HCL Technologies Ltd', sector: 'Information Technology' },
-  TECHM: { securityId: '13538', name: 'Tech Mahindra Ltd', sector: 'Information Technology' },
-  ULTRACEMCO: { securityId: '11532', name: 'UltraTech Cement Ltd', sector: 'Materials' },
-  TATASTEEL: { securityId: '3499', name: 'Tata Steel Ltd', sector: 'Metals & Mining' },
-  JSWSTEEL: { securityId: '11723', name: 'JSW Steel Ltd', sector: 'Metals & Mining' },
-  NTPC: { securityId: '11630', name: 'NTPC Ltd', sector: 'Utilities' },
-  POWERGRID: { securityId: '14977', name: 'Power Grid Corp Ltd', sector: 'Utilities' },
-  ONGC: { securityId: '2475', name: 'Oil & Natural Gas Corp Ltd', sector: 'Energy' },
-  COALINDIA: { securityId: '20374', name: 'Coal India Ltd', sector: 'Energy & Mining' },
+export type ExchangePreference = 'NSE' | 'BSE';
+
+/** The scrip master carries no sector field, so this is display-only
+ * metadata for well-known names; it never feeds screening or scoring. */
+const SECTOR_HINTS: Record<string, string> = {
+  RELIANCE: 'Energy & Retail', TCS: 'Information Technology', INFY: 'Information Technology',
+  HDFCBANK: 'Banking & Financials', ICICIBANK: 'Banking & Financials', KOTAKBANK: 'Banking & Financials',
+  AXISBANK: 'Banking & Financials', SBIN: 'Banking & Financials', BHARTIARTL: 'Telecommunications',
+  LT: 'Infrastructure', MARUTI: 'Automobile', ITC: 'FMCG', HINDUNILVR: 'FMCG',
+  TITAN: 'Consumer Discretionary', ASIANPAINT: 'Consumer Goods', BAJFINANCE: 'Financial Services',
+  BAJAJFINSV: 'Financial Services', SUNPHARMA: 'Pharmaceuticals', DRREDDY: 'Pharmaceuticals',
+  WIPRO: 'Information Technology', HCLTECH: 'Information Technology', TECHM: 'Information Technology',
+  ULTRACEMCO: 'Materials', TATASTEEL: 'Metals & Mining', JSWSTEEL: 'Metals & Mining',
+  NTPC: 'Utilities', POWERGRID: 'Utilities', ONGC: 'Energy', COALINDIA: 'Energy & Mining',
 };
 
-export interface UniverseDef {
-  id: string;
-  name: string;
-  description: string;
-  symbols: string[];
-}
+/** Dhan ships dummy contracts (011NSETEST … 181NSETEST) in the F&O master. */
+const TEST_SYMBOL = /NSETEST/i;
 
-export const UNIVERSES: Record<string, UniverseDef> = {
-  NIFTY_50: {
-    id: 'NIFTY_50',
-    name: 'NIFTY 50 Core Leaders',
-    description: 'Premier large-cap Indian enterprises across all market sectors',
-    symbols: Object.keys(UNIVERSE_STOCKS),
-  },
+export const FNO_UNIVERSE_ID = 'FNO_UNDERLYINGS';
+
+interface ThematicDef { id: string; name: string; description: string; symbols: string[] }
+
+const THEMATIC: Record<string, ThematicDef> = {
   FNO_HEAVYWEIGHTS: {
     id: 'FNO_HEAVYWEIGHTS',
     name: 'F&O High Liquidity Basket',
@@ -72,31 +55,107 @@ export const UNIVERSES: Record<string, UniverseDef> = {
   },
 };
 
-/**
- * Resolves instrument references for a specified universe ID.
- */
-export function getUniverseSymbols(universeId: string): InstrumentRef[] {
-  const def = UNIVERSES[universeId.toUpperCase()] || UNIVERSES.FNO_HEAVYWEIGHTS;
-  return def.symbols.map((sym) => {
-    const meta = UNIVERSE_STOCKS[sym] || { securityId: '0', name: `${sym} Ltd`, sector: 'Equity' };
-    return {
-      symbol: sym,
-      securityId: meta.securityId,
-      exchangeSegment: 'NSE_EQ',
-      name: meta.name,
-      sector: meta.sector,
-    };
-  });
+const equitySegment = (exchange: ExchangePreference) => (exchange === 'BSE' ? 'BSE_EQ' : 'NSE_EQ');
+
+/** symbol -> scrip-master row, for the cash segment of one exchange. The SDK
+ * caches bySegment(), so repeated calls cost nothing after the first. */
+/** The two exchanges label series differently — NSE uses 'EQ', BSE uses group
+ * codes ('A', 'B', …). Filtering both on 'EQ' silently emptied the entire BSE
+ * universe, so each gets its own rule. */
+function isNormalEquity(row: any, exchange: ExchangePreference): boolean {
+  if (row?.instrument && row.instrument !== 'EQUITY') return false;
+  const series = String(row?.series || '').toUpperCase();
+  if (!series) return true;
+  // BSE 'T' is trade-to-trade and 'Z' is the penalty group; neither belongs in
+  // a screener that implies you can take a position normally.
+  return exchange === 'BSE' ? !['T', 'Z'].includes(series) : series === 'EQ';
+}
+
+async function equityRows(client: any, exchange: ExchangePreference): Promise<Map<string, any>> {
+  const rows: any[] = (await client?.instruments?.bySegment?.(equitySegment(exchange))) || [];
+  const bySymbol = new Map<string, any>();
+  for (const row of rows) {
+    const symbol = String(row?.underlyingSymbol || '').toUpperCase();
+    if (!symbol || TEST_SYMBOL.test(symbol) || !isNormalEquity(row, exchange)) continue;
+    if (!bySymbol.has(symbol)) bySymbol.set(symbol, row);
+  }
+  return bySymbol;
+}
+
+/** Every underlying with listed F&O contracts — the genuinely liquid, and for
+ * this bot genuinely tradable, universe. Derived, so it tracks exchange
+ * additions and removals on its own. */
+async function fnoUnderlyingSymbols(client: any): Promise<string[]> {
+  const rows: any[] = (await client?.instruments?.bySegment?.('NSE_FNO')) || [];
+  const symbols = new Set<string>();
+  for (const row of rows) {
+    const symbol = String(row?.underlyingSymbol || '').toUpperCase();
+    if (symbol && row?.instrument !== 'INDEX' && !TEST_SYMBOL.test(symbol)) symbols.add(symbol);
+  }
+  return [...symbols].sort();
+}
+
+function toRef(symbol: string, row: any, exchange: ExchangePreference): InstrumentRef {
+  return {
+    symbol,
+    securityId: String(row.securityId),
+    exchangeSegment: equitySegment(exchange) as InstrumentRef['exchangeSegment'],
+    name: row.displayName || row.symbolName || symbol,
+    sector: SECTOR_HINTS[symbol] || 'Unclassified',
+  };
 }
 
 /**
- * Returns summary of all available stock universes.
+ * Resolves a universe to live instrument references. Symbols with no cash
+ * listing on the requested exchange are dropped rather than guessed at.
  */
-export function listUniverses() {
-  return Object.values(UNIVERSES).map((u) => ({
-    id: u.id,
-    name: u.name,
-    description: u.description,
-    count: u.symbols.length,
-  }));
+export async function resolveUniverse(
+  client: any,
+  universeId: string,
+  exchange: ExchangePreference = 'NSE',
+): Promise<InstrumentRef[]> {
+  const id = universeId.toUpperCase();
+  const equities = await equityRows(client, exchange);
+  const symbols = id === FNO_UNIVERSE_ID
+    ? await fnoUnderlyingSymbols(client)
+    : (THEMATIC[id] || THEMATIC.FNO_HEAVYWEIGHTS).symbols;
+
+  const refs: InstrumentRef[] = [];
+  for (const symbol of symbols) {
+    const row = equities.get(symbol);
+    if (row) refs.push(toRef(symbol, row, exchange));
+  }
+  return refs;
+}
+
+/** Resolves a single symbol against the scrip master, either exchange. */
+export async function resolveSymbol(
+  client: any,
+  symbol: string,
+  exchange: ExchangePreference = 'NSE',
+): Promise<InstrumentRef | null> {
+  const upper = symbol.toUpperCase().trim();
+  const row = (await equityRows(client, exchange)).get(upper);
+  return row ? toRef(upper, row, exchange) : null;
+}
+
+export async function listUniverses(client: any, exchange: ExchangePreference = 'NSE') {
+  // Counts are what would actually be screened on this exchange, not raw
+  // symbol-list lengths — some F&O underlyings have no cash listing to fetch
+  // candles for, and a thematic name may not be listed on both exchanges.
+  const equities = await equityRows(client, exchange).catch(() => new Map<string, any>());
+  const countResolvable = (symbols: string[]) => symbols.filter((s) => equities.has(s)).length;
+  const fnoSymbols = await fnoUnderlyingSymbols(client).catch(() => [] as string[]);
+
+  return [
+    {
+      id: FNO_UNIVERSE_ID,
+      name: 'F&O Underlyings (live)',
+      description: `Every stock with listed derivatives, resolved from the ${exchange} scrip master`,
+      count: countResolvable(fnoSymbols),
+    },
+    ...Object.values(THEMATIC).map((u) => ({
+      id: u.id, name: u.name, description: u.description, count: countResolvable(u.symbols),
+    })),
+  ];
 }

@@ -125,6 +125,8 @@ export interface TelemetryEvent {
   type: string;
   time: string;
   summary?: string;
+  /** Whether the backend step was deterministic or LLM-driven. */
+  engine?: 'DETERMINISTIC' | 'AI' | 'AI_FALLBACK';
   tool?: string;
   response?: string;
   duration?: number;

@@ -23,9 +23,9 @@ export function researchRoutes(orchestrator: ResearchOrchestrator, scheduler?: R
 
   // POST /api/research/watchlist/refresh - Manually trigger watchlist screening refresh
   router.post('/watchlist/refresh', async (req, res) => {
-    const { universe = 'FNO_HEAVYWEIGHTS', preset = 'QUALITY_COMPOUNDERS' } = req.body || {};
+    const { universe = 'FNO_HEAVYWEIGHTS', preset = 'QUALITY_COMPOUNDERS', exchange = 'NSE' } = req.body || {};
     try {
-      await orchestrator.screen(universe, preset);
+      await orchestrator.screen(universe, preset, exchange);
       const items = await getActiveWatchlist();
       return res.json({ count: items.length, watchlist: items });
     } catch (e: any) {
@@ -67,15 +67,20 @@ export function researchRoutes(orchestrator: ResearchOrchestrator, scheduler?: R
   });
 
   // GET /api/research/universes - List predefined stock baskets
-  router.get('/universes', (_req, res) => {
-    return res.json({ universes: listUniverses() });
+  router.get('/universes', async (req, res) => {
+    const exchange = (req.query.exchange as any) === 'BSE' ? 'BSE' : 'NSE';
+    try {
+      return res.json({ exchange, universes: await listUniverses(orchestrator.client, exchange) });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
   });
 
   // POST /api/research/screen - Fast deterministic quantitative screening
   router.post('/screen', async (req, res) => {
-    const { universe = 'FNO_HEAVYWEIGHTS', preset = 'QUALITY_COMPOUNDERS' } = req.body || {};
+    const { universe = 'FNO_HEAVYWEIGHTS', preset = 'QUALITY_COMPOUNDERS', exchange = 'NSE' } = req.body || {};
     try {
-      const result = await orchestrator.screen(universe, preset);
+      const result = await orchestrator.screen(universe, preset, exchange);
       return res.status(200).json(result);
     } catch (e: any) {
       return res.status(500).json({ error: `Screening failed: ${e.message}` });
@@ -84,7 +89,7 @@ export function researchRoutes(orchestrator: ResearchOrchestrator, scheduler?: R
 
   // POST /api/research/screen-and-analyze - Stage 1 filter + Stage 2 Agentic AI deep dive
   router.post('/screen-and-analyze', async (req, res) => {
-    const { universe = 'FNO_HEAVYWEIGHTS', preset = 'QUALITY_COMPOUNDERS', topN = 3 } = req.body || {};
+    const { universe = 'FNO_HEAVYWEIGHTS', preset = 'QUALITY_COMPOUNDERS', topN = 3, exchange = 'NSE' } = req.body || {};
     try {
       const result = await orchestrator.screenAndAnalyze(universe, preset, Number(topN) || 3);
       return res.status(200).json(result);

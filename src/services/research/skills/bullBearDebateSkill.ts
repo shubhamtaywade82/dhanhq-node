@@ -1,6 +1,6 @@
 import type { OllamaClient } from '@nemesis-oss/ollama-sdk';
 import type { EvidenceLedger } from '../evidenceLedger';
-import type { BullBearDebate, BusinessMoatResult, FinancialValuationResult, GrowthManagementResult } from '../types';
+import type { BullBearDebate, BusinessMoatResult, FinancialValuationResult, GrowthManagementResult, ResearchEngine } from '../types';
 
 /**
  * Adversarial Bull vs Bear debate engine with independent Debate Judge evaluation.
@@ -20,11 +20,14 @@ export class BullBearDebateSkill {
     const bearThesis = this.formulateBearCase(symbol, financials, growth);
     const thesisBreakers = this.identifyThesisBreakers(financials, growth);
 
-    let judgeVerdict = this.deterministicJudge(bullThesis, bearThesis, financials.dcf.marginOfSafetyPct);
+    const deterministic = this.deterministicJudge(bullThesis, bearThesis, financials.dcf.marginOfSafetyPct);
+    let judgeVerdict = deterministic;
+    let judgedBy: ResearchEngine = 'DETERMINISTIC';
 
     // If Ollama is available, enhance the debate evaluation
     if (this.ollama) {
-      judgeVerdict = await this.evaluateWithLlm(symbol, bullThesis, bearThesis, judgeVerdict);
+      judgeVerdict = await this.evaluateWithLlm(symbol, bullThesis, bearThesis, deterministic);
+      judgedBy = judgeVerdict === deterministic ? 'AI_FALLBACK' : 'AI';
     }
 
     ledger.record({
@@ -42,6 +45,8 @@ export class BullBearDebateSkill {
       bearRedFlags: growth.redFlags.length > 0 ? growth.redFlags : ['Valuation premium limits multiple expansion'],
       judgeVerdict,
       thesisBreakers,
+      judgedBy,
+      judgeModel: judgedBy === 'AI' ? this.model : undefined,
     };
   }
 

@@ -29,7 +29,14 @@ export const pool = new Pool({
   idleTimeoutMillis: 30000,
 });
 
-let mode: 'postgres' | 'memory' = 'postgres';
+// Defaults to memory under test, NOT postgres: initDatabase() applies the
+// same rule, but a test that writes without calling it first would otherwise
+// hit the real dev database. Found live — research_watchlist/screener_runs in
+// the dev DB were entirely jest fixtures from researchScheduler.test.ts and
+// researchRepository.test.ts, rewritten on every `npx jest` run, because
+// neither calls initDatabase().
+let mode: 'postgres' | 'memory' =
+  process.env.NODE_ENV === 'test' && !process.env.TEST_DATABASE_URL ? 'memory' : 'postgres';
 export function dbMode(): 'postgres' | 'memory' {
   return mode;
 }

@@ -39,7 +39,15 @@ describe('ResearchScheduler — Autonomous Market Lifecycle Intelligence', () =>
       passed: true,
       passedRules: [],
       failedRules: [],
-      metrics: { rsi14: 50, supertrend: 'BULLISH', cfoVsPat: 1.1, roicPct: 15, debtToEquity: 0.4, dcfMarginOfSafetyPct: 12 },
+      exchangeSegment: 'NSE_EQ',
+      horizons: ['LONG_TERM'],
+      metrics: {
+      close: 2300, return20d: 4.2, return60d: 11.5, return250d: 32.0,
+      sma20: 2250, sma50: 2180, sma200: 2000, sma200Rising: true,
+      high52w: 2400, low52w: 1700, pctFrom52wHigh: -4.2, volatilityPct: 1.3,
+      avgTradedValue: 8_00_00_000, relativeStrength60d: 6.4, relativeStrength250d: 14.2,
+      candleCount: 300,
+    },
     }], 'FNO_HEAVYWEIGHTS');
 
     scheduler = new ResearchScheduler(mockOrchestrator);

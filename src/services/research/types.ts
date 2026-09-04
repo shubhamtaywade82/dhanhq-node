@@ -112,7 +112,16 @@ export interface BullBearDebate {
   bearRedFlags: string[];
   judgeVerdict: string;
   thesisBreakers: string[];
+  /** Which engine actually produced judgeVerdict. The LLM path falls back to
+   * the deterministic judge silently on any error, so without this the UI
+   * cannot tell an AI verdict from a canned one. */
+  judgedBy: ResearchEngine;
+  judgeModel?: string;
 }
+
+/** AI_FALLBACK = the LLM was configured but did not answer, so a
+ * deterministic result was used instead. */
+export type ResearchEngine = 'DETERMINISTIC' | 'AI' | 'AI_FALLBACK';
 
 export type VerdictStance = 'BUY' | 'HOLD' | 'AVOID';
 
@@ -197,32 +206,63 @@ export type ScreenerPresetName =
   | 'MOMENTUM_BREAKOUT'
   | 'OPTIONS_BULLISH';
 
+/** How long a candidate's current setup is good for. A stock can qualify for
+ * more than one at a time (a yearly uptrend that is also breaking out). */
+export type TradeHorizon = 'SWING' | 'SHORT_TERM' | 'LONG_TERM';
+
+export interface Candle {
+  close: number;
+  high: number;
+  low: number;
+  volume: number;
+}
+
+/** All derived from real daily OHLCV. `null` means "not enough history to
+ * say" and is never silently treated as zero. */
+export interface PerformanceMetrics {
+  close: number;
+  return20d: number | null;
+  return60d: number | null;
+  return250d: number | null;
+  sma20: number | null;
+  sma50: number | null;
+  sma200: number | null;
+  sma200Rising: boolean | null;
+  high52w: number;
+  low52w: number;
+  pctFrom52wHigh: number | null;
+  volatilityPct: number | null;
+  avgTradedValue: number;
+  relativeStrength60d: number | null;
+  relativeStrength250d: number | null;
+  candleCount: number;
+}
+
 export interface ScreenerCandidate {
   symbol: string;
   name: string;
   sector: string;
   securityId: string;
+  exchangeSegment: string;
   cmp: number;
   deterministicScore: number;
   passed: boolean;
   passedRules: string[];
   failedRules: string[];
-  metrics: {
-    rsi14: number;
-    supertrend: 'BULLISH' | 'BEARISH';
-    cfoVsPat: number;
-    roicPct: number;
-    debtToEquity: number;
-    dcfMarginOfSafetyPct: number;
-    pcrOi?: number;
-  };
+  horizons: TradeHorizon[];
+  metrics: PerformanceMetrics | null;
 }
 
 export interface ScreenerResult {
   universe: string;
+  exchange: 'NSE' | 'BSE';
   preset: ScreenerPresetName;
   totalScreened: number;
   totalPassed: number;
+  skipped: number;
+  /** Split so a transient fetch error is never read as "too new to judge". */
+  skippedNoHistory?: string[];
+  skippedFetchFailed?: string[];
   candidates: ScreenerCandidate[];
   topPicks: string[];
   screenedAt: number;
@@ -235,14 +275,8 @@ export interface WatchlistItem {
   universe: string;
   deterministicScore: number;
   status: 'ACTIVE' | 'ARCHIVED';
-  metrics: {
-    rsi14: number;
-    supertrend: 'BULLISH' | 'BEARISH';
-    cfoVsPat: number;
-    roicPct: number;
-    debtToEquity: number;
-    dcfMarginOfSafetyPct: number;
-  };
+  horizons?: TradeHorizon[];
+  metrics: PerformanceMetrics | null;
   addedAt: number;
   expiresAt: number;
   lastAnalyzedAt?: number;

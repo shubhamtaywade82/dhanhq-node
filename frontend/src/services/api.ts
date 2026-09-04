@@ -172,14 +172,15 @@ export const api = {
   researchRun: (runId: string) => request<any>(`/api/research/${runId}`),
   researchEvidence: (runId: string) => request<{ runId: string; count: number; evidence: any[] }>(`/api/research/${runId}/evidence`),
   researchSignal: (symbol: string) => request<any>(`/api/research/signal/${symbol}`),
-  researchUniverses: () => request<{ universes: any[] }>('/api/research/universes'),
-  researchScreen: (universe: string, preset: string) =>
-    request<any>('/api/research/screen', { method: 'POST', body: JSON.stringify({ universe, preset }) }),
-  researchScreenAndAnalyze: (universe: string, preset: string, topN = 3) =>
-    request<any>('/api/research/screen-and-analyze', { method: 'POST', body: JSON.stringify({ universe, preset, topN }) }),
+  researchUniverses: (exchange = 'NSE') =>
+    request<{ exchange: string; universes: any[] }>(`/api/research/universes?exchange=${exchange}`),
+  researchScreen: (universe: string, preset: string, exchange = 'NSE') =>
+    request<any>('/api/research/screen', { method: 'POST', body: JSON.stringify({ universe, preset, exchange }) }),
+  researchScreenAndAnalyze: (universe: string, preset: string, topN = 3, exchange = 'NSE') =>
+    request<any>('/api/research/screen-and-analyze', { method: 'POST', body: JSON.stringify({ universe, preset, topN, exchange }) }),
   researchWatchlist: () => request<{ count: number; watchlist: any[] }>('/api/research/watchlist'),
-  researchWatchlistRefresh: (universe?: string, preset?: string) =>
-    request<{ count: number; watchlist: any[] }>('/api/research/watchlist/refresh', { method: 'POST', body: JSON.stringify({ universe, preset }) }),
+  researchWatchlistRefresh: (universe?: string, preset?: string, exchange = 'NSE') =>
+    request<{ count: number; watchlist: any[] }>('/api/research/watchlist/refresh', { method: 'POST', body: JSON.stringify({ universe, preset, exchange }) }),
   researchSchedulerStatus: () => request<any>('/api/research/scheduler/status'),
   researchSchedulerTrigger: (phase: string) =>
     request<any>('/api/research/scheduler/trigger', { method: 'POST', body: JSON.stringify({ phase }) }),

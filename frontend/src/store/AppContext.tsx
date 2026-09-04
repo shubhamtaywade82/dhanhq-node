@@ -130,6 +130,7 @@ function applyEnvelope(prev: AppState, env: Envelope): AppState {
           triggeredBy: p.triggeredBy,
           agent: p.agent || 'planner',
           type: p.type || 'ACT',
+          engine: p.engine,
           time: p.time || new Date().toLocaleTimeString('en-GB', { hour12: false }),
           summary: p.summary,
           tool: p.tool,

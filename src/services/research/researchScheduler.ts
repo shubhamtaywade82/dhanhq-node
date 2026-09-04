@@ -99,7 +99,10 @@ export class ResearchScheduler {
 
     for (const w of watchlist.slice(0, 5)) {
       lines.push(`• *${w.symbol}* (${w.sector})`);
-      lines.push(`  Score: ${w.deterministicScore}/100 | Supertrend: ${w.metrics.supertrend} | RSI: ${w.metrics.rsi14}`);
+      const horizons = w.horizons?.length ? w.horizons.join('/') : 'none';
+      const rs60 = w.metrics?.relativeStrength60d;
+      const vsIndex = rs60 == null ? 'n/a' : `${rs60 > 0 ? '+' : ''}${rs60.toFixed(1)}%`;
+      lines.push(`  Score: ${w.deterministicScore}/100 | Horizon: ${horizons} | 60d vs NIFTY: ${vsIndex}`);
     }
 
     lines.push('\n_Autonomous surveillance armed for market open._');
