@@ -149,6 +149,13 @@ export function controlRoutes(
     res.json({ ...agent.status(), llmOnline });
   });
 
+  // Per-Ollama-Cloud-key health (which numbered OLLAMA_API_KEY_N is
+  // currently cooling down after a failure, e.g. a rate limit) — read-only,
+  // reports the SDK's own circuit-breaker state, makes no new LLM calls.
+  router.get('/agent/ollama-keys', (_req, res) => {
+    res.json(agent.ollamaKeyStatus());
+  });
+
   router.get('/agent/events', async (req, res) => {
     const limit = Math.min(500, Number(req.query.limit) || 100);
     res.json(await agent.events(limit));

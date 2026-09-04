@@ -311,13 +311,13 @@ describe('MarketDataService — WebSocket failover', () => {
     process.env.DHAN_ACCESS_TOKEN = 'test-token';
 
     try {
-      (service as any).tryStartWs();
-      (service as any).tryStartWs();
+      (service as any).tryStartWs(true);
+      (service as any).tryStartWs(true);
       expect(market.connect).toHaveBeenCalledTimes(1);
 
       market.emit('error', new Error('Unexpected server response: 429'));
       await new Promise((resolve) => setImmediate(resolve));
-      (service as any).tryStartWs();
+      (service as any).tryStartWs(true);
 
       expect(market.disconnect).toHaveBeenCalledTimes(1);
       expect(market.connect).toHaveBeenCalledTimes(1);
@@ -349,18 +349,18 @@ describe('MarketDataService — WebSocket failover', () => {
     process.env.DHAN_ACCESS_TOKEN = 'test-token';
 
     try {
-      (service as any).tryStartWs();
+      (service as any).tryStartWs(true);
       expect(market.connect).toHaveBeenCalledTimes(1);
 
       // A retry landing while the attempt is still "fresh" must not
       // double-connect.
-      (service as any).tryStartWs();
+      (service as any).tryStartWs(true);
       expect(market.connect).toHaveBeenCalledTimes(1);
 
       // Once the stuck attempt is stale, the next retry must try again
       // rather than staying stuck behind the early guard forever.
       (service as any).wsConnectingAt = Date.now() - 31_000;
-      (service as any).tryStartWs();
+      (service as any).tryStartWs(true);
       expect(market.connect).toHaveBeenCalledTimes(2);
     } finally {
       service.stop();
@@ -390,7 +390,7 @@ describe('MarketDataService — WebSocket failover', () => {
     process.env.DHAN_ACCESS_TOKEN = 'test-token';
 
     try {
-      (service as any).tryStartWs();
+      (service as any).tryStartWs(true);
       market.isConnected = true;
       market.emit('open');
       expect((service as any).wsStarted).toBe(true);
@@ -402,8 +402,32 @@ describe('MarketDataService — WebSocket failover', () => {
       expect(market.isConnected).toBe(true);
 
       expect((service as any).wsRetryTimer).toBeNull();
-      (service as any).tryStartWs();
+      (service as any).tryStartWs(true);
       expect((service as any).wsRetryTimer).not.toBeNull();
+    } finally {
+      service.stop();
+      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
+      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+    }
+  });
+
+  it('suppresses WebSocket connect attempts when market is closed (off-hours)', () => {
+    const market = Object.assign(new EventEmitter(), {
+      isConnected: false,
+      subscribe: jest.fn(),
+      connect: jest.fn(() => Promise.resolve()),
+      disconnect: jest.fn(),
+    });
+    const client = { ws: { market }, marketFeed: { quote: jest.fn() } } as any;
+    const service = new MarketDataService(client);
+    const originalToken = process.env.DHAN_ACCESS_TOKEN;
+    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+
+    // Current local test run is at 08:28 AM IST (before 09:10 IST open)
+    try {
+      (service as any).tryStartWs(false);
+      // When outside market hours, connect() must NOT be called
+      expect(market.connect).not.toHaveBeenCalled();
     } finally {
       service.stop();
       if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
@@ -599,6 +623,45 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
       for (const k of keys) {
         if (prior[k] === undefined) delete process.env[k]; else process.env[k] = prior[k];
       }
+    }
+  });
+
+  it('ollamaKeyStatus reports one row per configured cloud credential, none exposing the raw key', () => {
+    const priorKeys = [process.env.OLLAMA_API_KEY_1, process.env.OLLAMA_API_KEY_2];
+    // The constructor fires an unawaited probeLlm() -> ollama.version() real
+    // network call. Stub fetch so that fails instantly instead of dialing
+    // ollama.com for real in a unit test (slow, flaky offline, and a
+    // dangling promise that can bleed into whichever test runs next).
+    const fetchSpy = jest.spyOn(global, 'fetch').mockRejectedValue(new Error('test: no network'));
+    try {
+      process.env.OLLAMA_API_KEY_1 = 'super-secret-key-1';
+      process.env.OLLAMA_API_KEY_2 = 'super-secret-key-2';
+      const agent = new AgentOrchestrator(stubClient(), stubMarket(100), new RiskEngine(stubClient(), stubMarket(100)), {} as any, {} as any);
+
+      const rows = agent.ollamaKeyStatus();
+      expect(rows).toHaveLength(2);
+      expect(rows.map((r) => r.name).sort()).toEqual(['credential:cloud-1', 'credential:cloud-2']);
+      expect(rows.every((r) => r.isCoolingDown === false && r.failureCount === 0)).toBe(true);
+      expect(JSON.stringify(rows)).not.toContain('super-secret-key');
+    } finally {
+      fetchSpy.mockRestore();
+      if (priorKeys[0] === undefined) delete process.env.OLLAMA_API_KEY_1; else process.env.OLLAMA_API_KEY_1 = priorKeys[0];
+      if (priorKeys[1] === undefined) delete process.env.OLLAMA_API_KEY_2; else process.env.OLLAMA_API_KEY_2 = priorKeys[1];
+    }
+  });
+
+  it('ollamaKeyStatus returns empty when no cloud keys are configured (local mode still has one endpoint, but nothing to report per-key)', () => {
+    const priorKey = process.env.OLLAMA_API_KEY_1;
+    const fetchSpy = jest.spyOn(global, 'fetch').mockRejectedValue(new Error('test: no network'));
+    try {
+      delete process.env.OLLAMA_API_KEY_1;
+      const agent = new AgentOrchestrator(stubClient(), stubMarket(100), new RiskEngine(stubClient(), stubMarket(100)), {} as any, {} as any);
+      const rows = agent.ollamaKeyStatus();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ name: 'default', isCoolingDown: false, failureCount: 0, lastFailureAt: null });
+    } finally {
+      fetchSpy.mockRestore();
+      if (priorKey === undefined) delete process.env.OLLAMA_API_KEY_1; else process.env.OLLAMA_API_KEY_1 = priorKey;
     }
   });
 

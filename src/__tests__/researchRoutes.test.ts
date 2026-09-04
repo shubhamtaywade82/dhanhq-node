@@ -147,4 +147,29 @@ describe('Research Routes HTTP API', () => {
     expect(data.screener).toBeDefined();
     expect(data.analyzedRuns.length).toBe(1);
   });
+
+  it('GET /watchlist returns active watchlist items', async () => {
+    const res = await fetch(`${baseUrl}/watchlist`);
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.watchlist).toBeDefined();
+  });
+
+  it('POST /watchlist/refresh refreshes the persistent watchlist', async () => {
+    const res = await fetch(`${baseUrl}/watchlist/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ universe: 'FNO_HEAVYWEIGHTS', preset: 'QUALITY_COMPOUNDERS' }),
+    });
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.watchlist).toBeDefined();
+  });
+
+  it('GET /scheduler/status returns lifecycle status', async () => {
+    const res = await fetch(`${baseUrl}/scheduler/status`);
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.marketPhase).toBeDefined();
+  });
 });

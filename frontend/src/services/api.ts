@@ -141,6 +141,9 @@ export const api = {
 
   agentEvents: (limit = 100) => request<any[]>(`/api/control/agent/events?limit=${limit}`),
 
+  agentOllamaKeys: () =>
+    request<Array<{ name: string; isCoolingDown: boolean; failureCount: number; lastFailureAt: string | null; activeRequests: number }>>('/api/control/agent/ollama-keys'),
+
   agentTools: () => request<any[]>('/api/control/agent/tools'),
 
   alerts: (limit = 100) => request<any[]>(`/api/control/alerts?limit=${limit}`),
@@ -174,4 +177,10 @@ export const api = {
     request<any>('/api/research/screen', { method: 'POST', body: JSON.stringify({ universe, preset }) }),
   researchScreenAndAnalyze: (universe: string, preset: string, topN = 3) =>
     request<any>('/api/research/screen-and-analyze', { method: 'POST', body: JSON.stringify({ universe, preset, topN }) }),
+  researchWatchlist: () => request<{ count: number; watchlist: any[] }>('/api/research/watchlist'),
+  researchWatchlistRefresh: (universe?: string, preset?: string) =>
+    request<{ count: number; watchlist: any[] }>('/api/research/watchlist/refresh', { method: 'POST', body: JSON.stringify({ universe, preset }) }),
+  researchSchedulerStatus: () => request<any>('/api/research/scheduler/status'),
+  researchSchedulerTrigger: (phase: string) =>
+    request<any>('/api/research/scheduler/trigger', { method: 'POST', body: JSON.stringify({ phase }) }),
 };

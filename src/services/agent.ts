@@ -308,6 +308,23 @@ export class AgentOrchestrator {
     return this.llmAvailable;
   }
 
+  /** Per-Ollama-Cloud-credential health, straight from the SDK's own
+   * circuit breaker (EndpointRegistry) — not a new tracking mechanism.
+   * Never exposes the actual API key, only the synthesized credential
+   * name ("credential:cloud-2") — enough to tell WHICH numbered
+   * OLLAMA_API_KEY_N a row is, without leaking the secret. Empty array
+   * when Ollama is disabled or not yet constructed. */
+  ollamaKeyStatus(): Array<{ name: string; isCoolingDown: boolean; failureCount: number; lastFailureAt: string | null; activeRequests: number }> {
+    if (!this.ollama) return [];
+    return this.ollama.endpointStatus().map((h) => ({
+      name: h.endpoint.name,
+      isCoolingDown: h.isCoolingDown,
+      failureCount: h.failureCount,
+      lastFailureAt: h.lastFailureTimestamp ? new Date(h.lastFailureTimestamp).toISOString() : null,
+      activeRequests: h.activeRequests,
+    }));
+  }
+
   async run(objective: string, triggeredBy = 'control_plane'): Promise<{ runId: string; status: string }> {
     if (this.running) throw new Error('An agent run is already in progress');
     if (this.risk.isKilled()) throw new Error('Kill switch engaged — agent runs disabled');
