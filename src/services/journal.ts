@@ -197,16 +197,11 @@ export interface DayReplaySummary {
  */
 function matchesMode(e: JournalEntry, mode?: string): boolean {
   if (!mode) return true;
-  if (mode === 'paper') {
-    return e.payload?.is_paper !== false && e.payload?.mode !== 'live' && e.payload?.mode !== 'sandbox';
-  }
-  if (mode === 'sandbox') {
-    return e.payload?.is_paper !== true && e.payload?.mode !== 'paper' && e.payload?.mode !== 'live';
-  }
-  if (mode === 'live') {
-    return e.payload?.is_paper !== true && e.payload?.mode !== 'paper' && e.payload?.mode !== 'sandbox';
-  }
-  return true;
+  const entryMode = e.payload?.mode;
+  if (entryMode) return entryMode === mode;
+  // Legacy rows written before every engine stamped `mode` on results.
+  if (mode === 'paper') return e.payload?.is_paper !== false;
+  return e.payload?.is_paper === false;
 }
 
 export function summarizeDay(entries: JournalEntry[], mode?: string): DayReplaySummary {

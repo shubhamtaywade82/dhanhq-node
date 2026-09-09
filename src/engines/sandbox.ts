@@ -38,7 +38,7 @@ export class SandboxExecutionEngine {
     if (!gate.allowed) {
       eventBus.log('WARN', `Sandbox order REJECTED for ${correlation_id}: ${gate.reason}`, 'sandbox_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
-      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason, mode: 'sandbox' });
       return { status: 'REJECTED', reason: gate.reason };
     }
 
@@ -61,7 +61,8 @@ export class SandboxExecutionEngine {
     const fillPayload = {
       intent_id,
       correlation_id,
-      is_paper: true,
+      mode: 'sandbox' as const,
+      is_paper: false,
       fill_price: (settled as any).averagePrice ?? price,
       quantity: (settled as any).filledQty ?? quantity,
       security_id,

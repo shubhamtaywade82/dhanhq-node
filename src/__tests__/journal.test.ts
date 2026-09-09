@@ -224,4 +224,16 @@ describe('summarizeDay', () => {
     expect(liveSummary.tradedCorrelationIds).toEqual(['live_1']);
     expect(liveSummary.unresolvedIntents).toEqual(['unresolved_live']);
   });
+
+  it('filters sandbox journal rows by explicit mode tag', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'sbx_1', mode: 'sandbox' }),
+      entry(2, 'order_result', { correlation_id: 'sbx_1', status: 'TRADED', mode: 'sandbox', is_paper: false }),
+      entry(3, 'order_intent', { correlation_id: 'paper_1', mode: 'paper' }),
+      entry(4, 'order_result', { correlation_id: 'paper_1', status: 'TRADED', mode: 'paper', is_paper: true }),
+    ];
+    const sandboxSummary = summarizeDay(entries, 'sandbox');
+    expect(sandboxSummary.tradedCorrelationIds).toEqual(['sbx_1']);
+    expect(summarizeDay(entries, 'paper').tradedCorrelationIds).toEqual(['paper_1']);
+  });
 });

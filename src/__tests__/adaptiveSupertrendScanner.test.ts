@@ -2,8 +2,10 @@ import { DhanClient, type Candle } from '@nemesis-oss/dhanhq-sdk';
 import { MarketDataService } from '../services/marketData';
 import { RiskEngine } from '../services/riskEngine';
 import { PaperExecutionEngine } from '../engines/paper';
+import { SandboxExecutionEngine } from '../engines/sandbox';
 import { AdaptiveSupertrendScanner } from '../services/adaptiveSupertrendScanner';
 import { AdaptiveParameterAI } from '../services/adaptiveSupertrend';
+import * as db from '../db';
 import { initDatabase, resetPaperWallet, listPaperStrategies, listPaperPositions } from '../db';
 
 // Engineered so a bullish 1m Supertrend crossover fires on the very last
@@ -98,6 +100,30 @@ describe('AdaptiveSupertrendScanner (wired against real db.ts)', () => {
     const openLeg: Map<string, string> = (scanner as any).openLeg;
     expect(pendingLearns.has('NIFTY')).toBe(true);
     expect(openLeg.has('NIFTY')).toBe(true);
+  });
+
+  it('routes deploys through the sandbox engine when TRADING_MODE=sandbox', async () => {
+    const priorMode = process.env.TRADING_MODE;
+    process.env.TRADING_MODE = 'sandbox';
+    try {
+      const client = fakeClient();
+      const market = new MarketDataService(client);
+      const risk = new RiskEngine(client, market);
+      const sandbox = new SandboxExecutionEngine(client, market, risk);
+      const placeOrderSpy = jest.spyOn(sandbox, 'placeOrder').mockResolvedValue({
+        status: 'TRADED', fill_price: 100, order_id: 'sbx1',
+      });
+
+      const createStrategySpy = jest.spyOn(db, 'createPaperStrategy');
+      const scanner = new AdaptiveSupertrendScanner(client, market, sandbox, risk, new AdaptiveParameterAI({ epsilon: 0 }));
+      await scanner.evaluate({ isMarketOpen: true, squareOffWindow: false });
+
+      expect(placeOrderSpy).toHaveBeenCalledTimes(1);
+      expect(createStrategySpy).not.toHaveBeenCalled();
+    } finally {
+      if (priorMode === undefined) delete process.env.TRADING_MODE;
+      else process.env.TRADING_MODE = priorMode;
+    }
   });
 
   it('does nothing outside market hours', async () => {

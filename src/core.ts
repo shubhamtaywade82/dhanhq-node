@@ -42,19 +42,25 @@ export interface Core {
   selfHealing: SelfHealingService;
 }
 
-/**
- * The ONE place that maps TRADING_MODE to an execution engine — replaces
- * the `isLive ? core.live : core.paper` check that used to be duplicated
- * at every call site (agent.ts, index.ts), which had no room for a third
- * mode.
- */
-export function resolveExecutionEngine(core: Core, mode: string | undefined): PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine {
-  if (mode === 'live') return core.live;
+export type ExecutionEngine = PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine;
+
+/** Maps TRADING_MODE to the active execution engine (paper | sandbox | live). */
+export function pickExecutionEngine(
+  mode: string | undefined,
+  engines: Pick<Core, 'paper' | 'live' | 'sandbox'>,
+): ExecutionEngine {
+  if (mode === 'live') return engines.live;
   if (mode === 'sandbox') {
-    if (!core.sandbox) throw new Error('TRADING_MODE=sandbox but the sandbox engine was not initialized (missing DHAN_SANDBOX_CLIENT_ID/DHAN_SANDBOX_ACCESS_TOKEN?)');
-    return core.sandbox;
+    if (!engines.sandbox) {
+      throw new Error('TRADING_MODE=sandbox but the sandbox engine was not initialized (missing DHAN_SANDBOX_CLIENT_ID/DHAN_SANDBOX_ACCESS_TOKEN?)');
+    }
+    return engines.sandbox;
   }
-  return core.paper;
+  return engines.paper;
+}
+
+export function resolveExecutionEngine(core: Core, mode?: string): ExecutionEngine {
+  return pickExecutionEngine(mode ?? process.env.TRADING_MODE, core);
 }
 
 import { seedStandardStrategies } from './services/strategyConstructor';
@@ -130,7 +136,8 @@ export async function startCore(): Promise<Core> {
   const research = new ResearchOrchestrator(client, market, undefined, ollama);
   autonomy.setAgent(agent);
   autonomy.setResearch(research);
-  autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, paper, risk));
+  const executionEngine = pickExecutionEngine(process.env.TRADING_MODE, { paper, live, sandbox });
+  autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, executionEngine, risk));
 
   await initResearchRepository();
   const researchScheduler = new ResearchScheduler(research);

@@ -5,7 +5,9 @@ import { eventBus } from './eventBus';
 import { INDEX_INSTRUMENTS, type MarketDataService } from './marketData';
 import { nearestIndexExpiry } from './marketHours';
 import type { RiskEngine } from './riskEngine';
-import type { PaperExecutionEngine } from '../engines/paper';
+
+/** Shared by paper, sandbox, and live engines — kept local to avoid a core import cycle. */
+export type ScannerExecutionEngine = { placeOrder(intent: any): Promise<any> };
 import { MAX_CONCURRENT_POSITIONS } from './autonomy';
 import { listPaperPositions, createPaperStrategy } from '../db';
 import { buildAdaptiveSupertrendStrategy } from './strategyConstructor';
@@ -53,7 +55,7 @@ export class AdaptiveSupertrendScanner {
   constructor(
     private client: DhanClient,
     private market: MarketDataService,
-    private paper: PaperExecutionEngine,
+    private engine: ScannerExecutionEngine,
     private risk: RiskEngine,
     paramAI?: AdaptiveParameterAI, // test-only override — production epsilon-greedy exploration is inherently random
   ) {
@@ -70,7 +72,7 @@ export class AdaptiveSupertrendScanner {
     if (!this.risk.canTrade().allowed) return;
 
     const positions = await listPaperPositions();
-    if (positions.filter((p: any) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
+    if (this.openPositionCount(positions) >= MAX_CONCURRENT_POSITIONS) return;
 
     this.lastScanAt = Date.now();
     for (const symbol of WATCHLIST) {
@@ -139,8 +141,7 @@ export class AdaptiveSupertrendScanner {
   private async settlePendingLearn(symbol: string, positions: any[]): Promise<void> {
     const pending = this.pendingLearns.get(symbol);
     if (!pending) return;
-    const stillOpen = positions.some((p: any) => String(p.securityId) === pending.securityId && p.netQty > 0);
-    if (stillOpen) return;
+    if (this.isScannerLegOpen(pending, positions)) return;
 
     const oneMin = this.candles.getOneMinute(symbol);
     const currentSpot = oneMin.length > 0 ? oneMin[oneMin.length - 1]!.close : pending.entryPrice;
@@ -173,7 +174,7 @@ export class AdaptiveSupertrendScanner {
     // against (falls back to the leg's chain-snapshot price otherwise).
     this.market.addInstruments([{ securityId: leg.securityId, exchangeSegment: leg.exchangeSegment }]);
 
-    const result: any = await this.paper.placeOrder({
+    const result: any = await this.engine.placeOrder({
       correlation_id: `${strat.id}_${leg.optionType}_${leg.strike}`,
       intent_id: `adaptive_supertrend_${symbol}`,
       params: {
@@ -186,15 +187,31 @@ export class AdaptiveSupertrendScanner {
     });
     if (result.status !== 'TRADED') return;
 
-    await createPaperStrategy({
-      id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots,
-      legs: [{ ...leg, price: result.fill_price ?? leg.price }],
-    });
+    if ((process.env.TRADING_MODE || 'paper') === 'paper') {
+      await createPaperStrategy({
+        id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots,
+        legs: [{ ...leg, price: result.fill_price ?? leg.price }],
+      });
+    }
 
     this.openLeg.set(symbol, leg.securityId);
     this.pendingLearns.set(symbol, {
       state, actionIndex, entryPrice: spot, side: signal.action === 'OPEN_LONG' ? 'LONG' : 'SHORT', securityId: leg.securityId,
     });
     eventBus.log('TRADE', `Adaptive Supertrend: BUY ${symbol} ${leg.optionType} ${leg.strike} @ ₹${leg.price} (${signal.reasoning})`, 'adaptive_supertrend');
+  }
+
+  private openPositionCount(positions: any[]): number {
+    if ((process.env.TRADING_MODE || 'paper') === 'paper') {
+      return positions.filter((p: any) => p.netQty !== 0).length;
+    }
+    return this.openLeg.size;
+  }
+
+  private isScannerLegOpen(pending: PendingLearn, positions: any[]): boolean {
+    if ((process.env.TRADING_MODE || 'paper') === 'paper') {
+      return positions.some((p: any) => String(p.securityId) === pending.securityId && p.netQty > 0);
+    }
+    return [...this.openLeg.values()].includes(pending.securityId);
   }
 }

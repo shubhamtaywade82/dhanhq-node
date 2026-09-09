@@ -119,7 +119,7 @@ describe('crossCheckJournalOnBoot', () => {
       jest.spyOn(sandboxClient.orders, 'getByCorrelationId').mockResolvedValue({ orderId: 'sbx1', orderStatus: 'TRADED' } as any);
 
       const entries: JournalEntry[] = [
-        entry(1, 'order_intent', { correlation_id: 'died_mid_place' }),
+        entry(1, 'order_intent', { correlation_id: 'died_mid_place', mode: 'sandbox' }),
       ];
       await crossCheckJournalOnBoot(entries, risk, stubClient(), sandboxClient);
 
@@ -135,7 +135,7 @@ describe('crossCheckJournalOnBoot', () => {
       jest.spyOn(sandboxClient.orders, 'getByCorrelationId').mockResolvedValue({} as any);
 
       const entries: JournalEntry[] = [
-        entry(1, 'order_intent', { correlation_id: 'truly_lost' }),
+        entry(1, 'order_intent', { correlation_id: 'truly_lost', mode: 'sandbox' }),
       ];
       await crossCheckJournalOnBoot(entries, risk, stubClient(), sandboxClient);
 
@@ -148,7 +148,7 @@ describe('crossCheckJournalOnBoot', () => {
       const alertSpy = jest.spyOn(db, 'pushAlert');
 
       const entries: JournalEntry[] = [
-        entry(1, 'order_intent', { correlation_id: 'no_client' }),
+        entry(1, 'order_intent', { correlation_id: 'no_client', mode: 'sandbox' }),
       ];
       await crossCheckJournalOnBoot(entries, risk, stubClient(), undefined);
 
