@@ -44,4 +44,24 @@ describe('patchOrderWsSafety', () => {
     expect(() => (OrderUpdateWS.prototype as any).onMessage.call(ctx, 'PING')).not.toThrow();
     expect(() => (OrderUpdateWS.prototype as any).onMessage.call(ctx, Buffer.from('not json'))).not.toThrow();
   });
+
+  it('defers send while readyState is CONNECTING instead of throwing', () => {
+    patchOrderWsSafety();
+    const baseProto = Object.getPrototypeOf(OrderUpdateWS.prototype);
+    const sent: string[] = [];
+    const conn: any = {
+      readyState: 0,
+      send: (p: string) => { sent.push(p); },
+    };
+    const ctx: any = { connection: conn };
+    expect(() => baseProto.send.call(ctx, '{"login":true}')).not.toThrow();
+    expect(sent).toHaveLength(0);
+    conn.readyState = 1;
+    return new Promise<void>((resolve) => {
+      setImmediate(() => {
+        expect(sent).toEqual(['{"login":true}']);
+        resolve();
+      });
+    });
+  });
 });

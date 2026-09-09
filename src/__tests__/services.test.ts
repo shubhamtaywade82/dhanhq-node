@@ -420,8 +420,12 @@ describe('MarketDataService — WebSocket failover', () => {
     const quote = jest.fn().mockResolvedValue({ data: { IDX_I: {} } });
     const client = { ws: { market }, marketFeed: { quote } } as any;
     const service = new MarketDataService(client);
-    const originalToken = process.env.DHAN_ACCESS_TOKEN;
-    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+    const origPin = process.env.DHAN_PIN;
+    const origTotp = process.env.DHAN_TOTP_SECRET;
+    const origClientId = process.env.DHAN_CLIENT_ID;
+    process.env.DHAN_PIN = '1234';
+    process.env.DHAN_TOTP_SECRET = 'testsecret';
+    process.env.DHAN_CLIENT_ID = 'test-client';
 
     try {
       (service as any).tryStartWs(true);
@@ -437,8 +441,12 @@ describe('MarketDataService — WebSocket failover', () => {
       expect(quote).toHaveBeenCalledTimes(1);
     } finally {
       service.stop();
-      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
-      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+      if (origPin === undefined) delete process.env.DHAN_PIN;
+      else process.env.DHAN_PIN = origPin;
+      if (origTotp === undefined) delete process.env.DHAN_TOTP_SECRET;
+      else process.env.DHAN_TOTP_SECRET = origTotp;
+      if (origClientId === undefined) delete process.env.DHAN_CLIENT_ID;
+      else process.env.DHAN_CLIENT_ID = origClientId;
     }
   });
 
@@ -458,8 +466,12 @@ describe('MarketDataService — WebSocket failover', () => {
     });
     const client = { ws: { market }, marketFeed: { quote: jest.fn() } } as any;
     const service = new MarketDataService(client);
-    const originalToken = process.env.DHAN_ACCESS_TOKEN;
-    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+    const origPin = process.env.DHAN_PIN;
+    const origTotp = process.env.DHAN_TOTP_SECRET;
+    const origClientId = process.env.DHAN_CLIENT_ID;
+    process.env.DHAN_PIN = '1234';
+    process.env.DHAN_TOTP_SECRET = 'testsecret';
+    process.env.DHAN_CLIENT_ID = 'test-client';
 
     try {
       (service as any).tryStartWs(true);
@@ -477,8 +489,12 @@ describe('MarketDataService — WebSocket failover', () => {
       expect(market.connect).toHaveBeenCalledTimes(2);
     } finally {
       service.stop();
-      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
-      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+      if (origPin === undefined) delete process.env.DHAN_PIN;
+      else process.env.DHAN_PIN = origPin;
+      if (origTotp === undefined) delete process.env.DHAN_TOTP_SECRET;
+      else process.env.DHAN_TOTP_SECRET = origTotp;
+      if (origClientId === undefined) delete process.env.DHAN_CLIENT_ID;
+      else process.env.DHAN_CLIENT_ID = origClientId;
     }
   });
 
@@ -499,8 +515,12 @@ describe('MarketDataService — WebSocket failover', () => {
     });
     const client = { ws: { market }, marketFeed: { quote: jest.fn() } } as any;
     const service = new MarketDataService(client);
-    const originalToken = process.env.DHAN_ACCESS_TOKEN;
-    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+    const origPin = process.env.DHAN_PIN;
+    const origTotp = process.env.DHAN_TOTP_SECRET;
+    const origClientId = process.env.DHAN_CLIENT_ID;
+    process.env.DHAN_PIN = '1234';
+    process.env.DHAN_TOTP_SECRET = 'testsecret';
+    process.env.DHAN_CLIENT_ID = 'test-client';
 
     try {
       (service as any).tryStartWs(true);
@@ -519,8 +539,12 @@ describe('MarketDataService — WebSocket failover', () => {
       expect((service as any).wsRetryTimer).not.toBeNull();
     } finally {
       service.stop();
-      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
-      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+      if (origPin === undefined) delete process.env.DHAN_PIN;
+      else process.env.DHAN_PIN = origPin;
+      if (origTotp === undefined) delete process.env.DHAN_TOTP_SECRET;
+      else process.env.DHAN_TOTP_SECRET = origTotp;
+      if (origClientId === undefined) delete process.env.DHAN_CLIENT_ID;
+      else process.env.DHAN_CLIENT_ID = origClientId;
     }
   });
 
@@ -533,8 +557,12 @@ describe('MarketDataService — WebSocket failover', () => {
     });
     const client = { ws: { market }, marketFeed: { quote: jest.fn() } } as any;
     const service = new MarketDataService(client);
-    const originalToken = process.env.DHAN_ACCESS_TOKEN;
-    process.env.DHAN_ACCESS_TOKEN = 'test-token';
+    const origPin = process.env.DHAN_PIN;
+    const origTotp = process.env.DHAN_TOTP_SECRET;
+    const origClientId = process.env.DHAN_CLIENT_ID;
+    process.env.DHAN_PIN = '1234';
+    process.env.DHAN_TOTP_SECRET = 'testsecret';
+    process.env.DHAN_CLIENT_ID = 'test-client';
 
     const spy = jest.spyOn(marketHours, 'isWsMarketWindowOpen').mockReturnValue(false);
     try {
@@ -544,8 +572,12 @@ describe('MarketDataService — WebSocket failover', () => {
     } finally {
       spy.mockRestore();
       service.stop();
-      if (originalToken === undefined) delete process.env.DHAN_ACCESS_TOKEN;
-      else process.env.DHAN_ACCESS_TOKEN = originalToken;
+      if (origPin === undefined) delete process.env.DHAN_PIN;
+      else process.env.DHAN_PIN = origPin;
+      if (origTotp === undefined) delete process.env.DHAN_TOTP_SECRET;
+      else process.env.DHAN_TOTP_SECRET = origTotp;
+      if (origClientId === undefined) delete process.env.DHAN_CLIENT_ID;
+      else process.env.DHAN_CLIENT_ID = origClientId;
     }
   });
 });

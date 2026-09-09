@@ -1,5 +1,6 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { PositionMonitor, OrderUpdateWS, RateLimitError } from '@nemesis-oss/dhanhq-sdk';
+import { hasTotpCredentials, hasExternalAuthProvider } from '../auth';
 import { eventBus } from './eventBus';
 import { marketClock, istNow, isWsMarketWindowOpen, msUntilNextWsWindow } from './marketHours';
 
@@ -175,10 +176,8 @@ export class MarketDataService {
       return;
     }
 
-    // Only bring up the DhanHQ binary WS when a token is actually resolvable
-    const tokenResolvable = !!(process.env.DHAN_ACCESS_TOKEN && process.env.DHAN_ACCESS_TOKEN !== 'your_access_token')
-      || !!(process.env.DHAN_PIN && process.env.DHAN_TOTP_SECRET)
-      || !!(process.env.DHAN_AUTH_PROVIDER_URL && process.env.DHAN_AUTH_PROVIDER_TOKEN);
+    // Only bring up the DhanHQ binary WS when credentials can resolve a token
+    const tokenResolvable = hasTotpCredentials() || hasExternalAuthProvider();
     if (!tokenResolvable) {
       eventBus.log('WARN', 'No DhanHQ credentials configured — binary WS disabled, REST polling will serve market data when a token appears', 'market_data');
       return;
@@ -666,6 +665,30 @@ export function patchOrderWsSafety(): void {
     };
   }
 
+  // ws fires 'open' during setSocket while readyState is still CONNECTING;
+  // SDK onOpen (sync + async) calls send() immediately and throws, which
+  // kills the reconnect loop and blanks the UI control plane.
+  if (baseProto && !Object.prototype.hasOwnProperty.call(baseProto, '__sendSafetyPatched')) {
+    baseProto.__sendSafetyPatched = true;
+    const origSend = baseProto.send;
+    const WS_OPEN = 1;
+    const WS_CONNECTING = 0;
+    baseProto.send = function (this: any, payload: unknown) {
+      const conn = this.connection;
+      if (!conn) return;
+      if (conn.readyState === WS_OPEN) {
+        try { origSend.call(this, payload); } catch { /* socket died mid-send */ }
+        return;
+      }
+      if (conn.readyState !== WS_CONNECTING) return;
+      setImmediate(() => {
+        try {
+          if (this.connection?.readyState === WS_OPEN) origSend.call(this, payload);
+        } catch { /* closed before deferred send */ }
+      });
+    };
+  }
+
   const proto = (OrderUpdateWS as any)?.prototype;
   if (!proto || Object.prototype.hasOwnProperty.call(proto, '__onMessageSafetyPatched')) return;
   proto.__onMessageSafetyPatched = true;
@@ -704,3 +727,7 @@ export function patchOrderWsSafety(): void {
     }
   };
 }
+
+// Apply before any DhanHQ WS connect() — tryStartWs also calls this, but
+// module-load guarantees OrderUpdateWS.onOpen cannot race ahead on import.
+patchOrderWsSafety();
