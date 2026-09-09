@@ -4,8 +4,10 @@ import type { RiskEngine } from '../services/riskEngine';
 import type { AutonomyEngine } from '../services/autonomy';
 import type { AgentOrchestrator } from '../services/agent';
 import type { MarketDataService } from '../services/marketData';
+import { crossCheckJournalOnBoot } from '../core';
 import { eventBus } from '../services/eventBus';
 import { journal } from '../services/journal';
+import { getSystemState, setSystemState } from '../services/systemState';
 import { listAlerts, pushAlert } from '../db';
 import { evaluateStrategyBacktest } from '../services/strategyConstructor';
 import { analyzeOptionsBehavior } from './market';
@@ -25,6 +27,7 @@ export function controlRoutes(
   autonomy: AutonomyEngine,
   agent: AgentOrchestrator,
   market: MarketDataService,
+  sandboxClient?: DhanClient,
 ): Router {
   const router = Router();
 
@@ -33,6 +36,7 @@ export function controlRoutes(
     const [alerts, agentEvents] = await Promise.all([listAlerts(50), agent.events(50)]);
     res.json({
       mode: process.env.TRADING_MODE || 'paper',
+      systemState: getSystemState(),
       risk: risk.snapshot(),
       autonomy: autonomy.stats(),
       agent: agent.status(),
@@ -86,6 +90,25 @@ export function controlRoutes(
     autonomy.setScanEnabled(!!enabled);
     journal.append('control_command', { route: 'POST /scanner', enabled: !!enabled });
     res.json({ status: 'ok', stats: autonomy.stats() });
+  });
+
+  router.get('/adaptive-supertrend', async (_req, res) => {
+    const scanner = autonomy.getScanner();
+    if (!scanner) return res.status(503).json({ error: 'Adaptive Supertrend scanner not armed' });
+    res.json(await scanner.probe());
+  });
+
+  router.post('/reconcile-boot', async (_req, res) => {
+    try {
+      await crossCheckJournalOnBoot(journal.readTodayEntries(), risk, client, sandboxClient);
+      if (getSystemState() === 'DEGRADED') {
+        setSystemState('READY', 'Boot reconcile cleared — no remaining blockers');
+      }
+      journal.append('control_command', { route: 'POST /reconcile-boot', systemState: getSystemState() });
+      res.json({ status: 'ok', systemState: getSystemState() });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // ── long-option peak-profit policy ─────────────────────────────────

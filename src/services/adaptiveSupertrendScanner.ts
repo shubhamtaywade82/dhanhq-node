@@ -10,6 +10,7 @@ import type { RiskEngine } from './riskEngine';
 export type ScannerExecutionEngine = { placeOrder(intent: any): Promise<any> };
 import { MAX_CONCURRENT_POSITIONS } from './autonomy';
 import { listPaperPositions, createPaperStrategy } from '../db';
+import type { PortfolioSource } from './portfolioSource';
 import { buildAdaptiveSupertrendStrategy } from './strategyConstructor';
 import { CandleStore } from './adaptiveSupertrendCandles';
 import { extractMarketFeatures, formatRegimeKey, AdaptiveParameterAI, FuzzySignalAI, type AdaptiveSignal } from './adaptiveSupertrend';
@@ -18,7 +19,7 @@ import { extractMarketFeatures, formatRegimeKey, AdaptiveParameterAI, FuzzySigna
 // positions once MAX_CONCURRENT_POSITIONS is hit, so scan order is
 // priority order under a full slot table, not just cosmetic.
 const WATCHLIST = ['NIFTY', 'SENSEX', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'];
-const SCAN_INTERVAL_MS = 60_000;
+const SCAN_INTERVAL_MS = Number(process.env.ADAPTIVE_SUPERTREND_SCAN_INTERVAL_MS) || 60_000;
 // A 2%-move directional return normalizes to a full-magnitude Q-learning
 // reward — matches the source strategy's reward scale exactly.
 const REWARD_NORMALIZATION_RETURN = 0.02;
@@ -31,6 +32,19 @@ interface PendingLearn {
   side: 'LONG' | 'SHORT';
   securityId: string;
 }
+
+export type SymbolProbe = {
+  symbol: string;
+  stage: string;
+  candles1m: number;
+  candles5m: number;
+  dir1m: number | null;
+  dir5m: number | null;
+  freshCrossover: boolean;
+  fuzzyAction?: string;
+  fuzzyConfidence?: number;
+  openLeg: boolean;
+};
 
 /**
  * Naked ATM CE/PE scanner: Q-learning picks the 1m Supertrend's
@@ -58,6 +72,7 @@ export class AdaptiveSupertrendScanner {
     private engine: ScannerExecutionEngine,
     private risk: RiskEngine,
     paramAI?: AdaptiveParameterAI, // test-only override — production epsilon-greedy exploration is inherently random
+    private portfolio?: PortfolioSource,
   ) {
     this.candles = new CandleStore(client);
     this.paramAI = paramAI ?? new AdaptiveParameterAI({
@@ -69,9 +84,10 @@ export class AdaptiveSupertrendScanner {
   async evaluate(clock: { isMarketOpen: boolean; squareOffWindow: boolean }): Promise<void> {
     if (!clock.isMarketOpen || clock.squareOffWindow) return;
     if (Date.now() - this.lastScanAt < SCAN_INTERVAL_MS) return;
-    if (!this.risk.canTrade().allowed) return;
+    const gate = this.risk.canTrade();
+    if (!gate.allowed) return;
 
-    const positions = await listPaperPositions();
+    const positions = await this.loadPositions();
     if (this.openPositionCount(positions) >= MAX_CONCURRENT_POSITIONS) return;
 
     this.lastScanAt = Date.now();
@@ -82,6 +98,84 @@ export class AdaptiveSupertrendScanner {
         eventBus.log('WARN', `Adaptive Supertrend scan failed for ${symbol}: ${e.message}`, 'adaptive_supertrend');
       }
     }
+  }
+
+  /** On-demand read of why each watchlist symbol is or isn't firing — no orders placed. */
+  async probe(): Promise<{
+    lastScanAt: number;
+    nextScanInSec: number;
+    scanIntervalSec: number;
+    canTrade: boolean;
+    tradeBlockReason?: string;
+    openLegs: string[];
+    symbols: SymbolProbe[];
+  }> {
+    const gate = this.risk.canTrade();
+    const symbols: SymbolProbe[] = [];
+    for (const symbol of WATCHLIST) {
+      try {
+        symbols.push(await this.probeSymbol(symbol));
+      } catch (e: any) {
+        symbols.push({ symbol, stage: `error: ${e.message}`, candles1m: 0, candles5m: 0, dir1m: null, dir5m: null, freshCrossover: false, openLeg: this.openLeg.has(symbol) });
+      }
+    }
+    const nextMs = Math.max(0, SCAN_INTERVAL_MS - (Date.now() - this.lastScanAt));
+    return {
+      lastScanAt: this.lastScanAt,
+      nextScanInSec: Math.round(nextMs / 1000),
+      scanIntervalSec: Math.round(SCAN_INTERVAL_MS / 1000),
+      canTrade: gate.allowed,
+      tradeBlockReason: gate.reason,
+      openLegs: [...this.openLeg.keys()],
+      symbols,
+    };
+  }
+
+  private async loadPositions(): Promise<any[]> {
+    if (this.portfolio && this.portfolio.kind === 'broker') return this.portfolio.getPositions();
+    return listPaperPositions();
+  }
+
+  private async probeSymbol(symbol: string): Promise<SymbolProbe> {
+    const inst = INDEX_INSTRUMENTS[symbol];
+    if (!inst) {
+      return { symbol, stage: 'unknown_symbol', candles1m: 0, candles5m: 0, dir1m: null, dir5m: null, freshCrossover: false, openLeg: false };
+    }
+    await this.candles.refresh(symbol, inst.securityId);
+    const oneMin = this.candles.getOneMinute(symbol);
+    const fiveMin = this.candles.getFiveMinute(symbol);
+    const base = { symbol, candles1m: oneMin.length, candles5m: fiveMin.length, dir1m: null as number | null, dir5m: null as number | null, freshCrossover: false, openLeg: this.openLeg.has(symbol) };
+    if (this.openLeg.has(symbol)) return { ...base, stage: 'open_leg_pending_exit' };
+    if (oneMin.length < 35) return { ...base, stage: `warming_up (${oneMin.length}/35 candles)` };
+
+    const features = extractMarketFeatures(oneMin);
+    if (!features) return { ...base, stage: 'no_features' };
+
+    const { params } = this.paramAI.chooseAction(features);
+    const st1m = supertrend(oneMin, { period: params.atrPeriod, multiplier: params.multiplier });
+    const dir1m = st1m.direction[st1m.direction.length - 1] ?? null;
+    const prevDir1m = st1m.direction[st1m.direction.length - 2] ?? null;
+    const freshCrossover = dir1m != null && prevDir1m != null && dir1m !== prevDir1m;
+    base.dir1m = dir1m;
+    if (!freshCrossover) return { ...base, stage: 'no_1m_crossover' };
+
+    if (fiveMin.length < FIVE_MIN_SUPERTREND_PARAMS.period + 2) return { ...base, stage: '5m_warming_up' };
+    const st5m = supertrend(fiveMin, FIVE_MIN_SUPERTREND_PARAMS);
+    const dir5m = st5m.direction[st5m.direction.length - 1] ?? null;
+    base.dir5m = dir5m;
+    if (dir5m == null || dir1m !== dir5m) return { ...base, stage: '5m_disagree' };
+
+    const currentPrice = oneMin[oneMin.length - 1]!.close;
+    const supertrendValue = st1m.trend[st1m.trend.length - 1];
+    if (supertrendValue == null) return { ...base, stage: 'no_supertrend_value' };
+
+    const signal = this.signalAI.generateSignal({
+      stDirection: dir1m, isCrossover: true, features, params, currentPrice, supertrendValue,
+    });
+    if (signal.action === 'HOLD') {
+      return { ...base, freshCrossover, stage: `fuzzy_hold (${(signal.confidence * 100).toFixed(0)}% < 55%)`, fuzzyAction: signal.action, fuzzyConfidence: signal.confidence };
+    }
+    return { ...base, freshCrossover, stage: `ready_${signal.action}`, fuzzyAction: signal.action, fuzzyConfidence: signal.confidence };
   }
 
   private async evaluateSymbol(symbol: string, positions: any[]): Promise<void> {
@@ -209,9 +303,6 @@ export class AdaptiveSupertrendScanner {
   }
 
   private isScannerLegOpen(pending: PendingLearn, positions: any[]): boolean {
-    if ((process.env.TRADING_MODE || 'paper') === 'paper') {
-      return positions.some((p: any) => String(p.securityId) === pending.securityId && p.netQty > 0);
-    }
-    return [...this.openLeg.values()].includes(pending.securityId);
+    return positions.some((p: any) => String(p.securityId) === pending.securityId && p.netQty > 0);
   }
 }

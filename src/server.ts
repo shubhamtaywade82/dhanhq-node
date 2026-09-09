@@ -90,10 +90,10 @@ async function main() {
   streamManager.attach(); // bind hub to the central event bus
 
   app.use('/api/market', marketRoutes(core.client, core.market));
-  app.use('/api/portfolio', portfolioRoutes(core.client, core.market, core.risk, core.paper, core.agent));
+  app.use('/api/portfolio', portfolioRoutes(core.client, core.market, core.risk, core.paper, core.agent, core.portfolio, core.sandboxClient));
   app.use('/api/ollama', ollamaRoutes());
   app.use('/api/infra', infraRoutes(streamManager, { market: core.market, risk: core.risk, autonomy: core.autonomy, agent: core.agent, stream: streamManager }));
-  app.use('/api/control', controlRoutes(core.client, core.risk, core.autonomy, core.agent, core.market));
+  app.use('/api/control', controlRoutes(core.client, core.risk, core.autonomy, core.agent, core.market, core.sandboxClient));
   app.use('/api/client-logs', clientLogsRoutes());
   app.use('/api/research', researchRoutes(core.research, core.researchScheduler));
 

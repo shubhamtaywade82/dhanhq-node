@@ -5,7 +5,7 @@ import { MarketDataService } from '../services/marketData';
 import { eventBus } from '../services/eventBus';
 import { initDatabase, executePaperOrder } from '../db';
 import * as db from '../db';
-import type { JournalEntry } from '../services/journal';
+import { journal, type JournalEntry } from '../services/journal';
 
 function stubClient(): DhanClient {
   return new DhanClient({ clientId: 'test', token: 'test' });
@@ -55,16 +55,23 @@ describe('crossCheckJournalOnBoot', () => {
   });
 
   it('alerts ERROR when the journal recorded a trade with no matching durable order', async () => {
-    const { risk } = setup();
-    jest.spyOn(risk, 'isKilled').mockReturnValue(false);
-    const alertSpy = jest.spyOn(db, 'pushAlert');
+    const prior = process.env.TRADING_MODE;
+    process.env.TRADING_MODE = 'paper';
+    try {
+      const { risk } = setup();
+      jest.spyOn(risk, 'isKilled').mockReturnValue(false);
+      const alertSpy = jest.spyOn(db, 'pushAlert');
 
-    const entries: JournalEntry[] = [
-      entry(1, 'order_result', { correlation_id: 'ghost_trade_corr', status: 'TRADED' }),
-    ];
-    await crossCheckJournalOnBoot(entries, risk, stubClient());
+      const entries: JournalEntry[] = [
+        entry(1, 'order_result', { correlation_id: 'ghost_trade_corr', status: 'TRADED', mode: 'paper', is_paper: true }),
+      ];
+      await crossCheckJournalOnBoot(entries, risk, stubClient());
 
-    expect(alertSpy).toHaveBeenCalledWith('ERROR', 'core', expect.stringContaining('ghost_trade_corr'));
+      expect(alertSpy).toHaveBeenCalledWith('ERROR', 'core', expect.stringContaining('ghost_trade_corr'));
+    } finally {
+      if (prior === undefined) delete process.env.TRADING_MODE;
+      else process.env.TRADING_MODE = prior;
+    }
   });
 
   it('does not alert on live or sandbox trades when booted in paper mode', async () => {
@@ -127,10 +134,11 @@ describe('crossCheckJournalOnBoot', () => {
       expect(alertSpy).not.toHaveBeenCalledWith('ERROR', expect.anything(), expect.anything());
     }));
 
-    it('alerts ERROR when the broker has no record of an unresolved intent', () => withMode('sandbox', async () => {
+    it('closes orphan intents as REJECTED when the broker has no record — does not block the day', () => withMode('sandbox', async () => {
       const { risk } = setup();
       jest.spyOn(risk, 'isKilled').mockReturnValue(false);
       const alertSpy = jest.spyOn(db, 'pushAlert');
+      const appendSpy = jest.spyOn(journal, 'append');
       const sandboxClient = stubClient();
       jest.spyOn(sandboxClient.orders, 'getByCorrelationId').mockResolvedValue({} as any);
 
@@ -139,7 +147,11 @@ describe('crossCheckJournalOnBoot', () => {
       ];
       await crossCheckJournalOnBoot(entries, risk, stubClient(), sandboxClient);
 
-      expect(alertSpy).toHaveBeenCalledWith('ERROR', 'core', expect.stringContaining('truly_lost'));
+      expect(appendSpy).toHaveBeenCalledWith('order_result', expect.objectContaining({
+        correlation_id: 'truly_lost', status: 'REJECTED', mode: 'sandbox',
+      }));
+      expect(alertSpy).not.toHaveBeenCalledWith('ERROR', 'core', expect.stringContaining('truly_lost'));
+      appendSpy.mockRestore();
     }));
 
     it('alerts ERROR when there is an unresolved intent but no sandbox client to reconcile against', () => withMode('sandbox', async () => {

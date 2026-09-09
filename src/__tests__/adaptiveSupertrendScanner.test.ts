@@ -67,8 +67,17 @@ function fakeClient(): DhanClient {
 }
 
 describe('AdaptiveSupertrendScanner (wired against real db.ts)', () => {
+  const priorMode = process.env.TRADING_MODE;
+
   beforeAll(async () => { await initDatabase(); });
-  beforeEach(async () => { await resetPaperWallet(); });
+  beforeEach(async () => {
+    process.env.TRADING_MODE = 'paper';
+    await resetPaperWallet();
+  });
+  afterAll(() => {
+    if (priorMode === undefined) delete process.env.TRADING_MODE;
+    else process.env.TRADING_MODE = priorMode;
+  });
 
   it('deploys a BUY leg with no risk_limits, records the strategy, and tracks a pending reward', async () => {
     const client = fakeClient();

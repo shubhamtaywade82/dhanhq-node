@@ -1,5 +1,6 @@
 import { MarketDataService } from '../services/marketData';
 import { LongOptionPositionManager } from '../services/longOptionPositionManager';
+import { BrokerPortfolioSource } from '../services/portfolioSource';
 import { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import {
   initDatabase, executePaperOrder, listPaperPositions, resetPaperWallet, getPaperWallet,
@@ -82,6 +83,30 @@ describe('LongOptionPositionManager (wired against real db.ts paper positions)',
     const state = manager.getState(symbol)!;
     expect(state.remainingQuantity).toBe(posAfterAdd.netQty);
     expect(state.floorNet).toBe(floorBefore);
+  });
+
+  it('routes partial exits through BrokerPortfolioSource in sandbox/live mode', async () => {
+    const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord1' } }));
+    const client = {
+      positions: { list: jest.fn(async () => [{
+        tradingSymbol: 'NIFTY24950CE', securityId: SEC_ID, exchangeSegment: 'NSE_FNO', productType: 'INTRADAY',
+        buyQty: 75, buyAvg: 100, sellQty: 0, sellAvg: 0, netQty: 75, realizedProfit: 0, unrealizedProfit: 0, costPrice: 100,
+      }]) },
+      funds: { getLimit: jest.fn(async () => ({})) },
+      orders: {
+        place,
+        getById: jest.fn(async (id: string) => ({ orderId: id, orderStatus: 'TRADED', averagePrice: 150 })),
+      },
+    } as any;
+    const portfolio = new BrokerPortfolioSource(client, 60_000);
+    const market = stubMarket(150);
+    const manager = new LongOptionPositionManager(market, portfolio);
+
+    await manager.evaluate(false);
+
+    expect(place).toHaveBeenCalledWith(expect.objectContaining({
+      transactionType: 'SELL', quantity: expect.any(Number),
+    }));
   });
 
   it('does nothing while disabled', async () => {

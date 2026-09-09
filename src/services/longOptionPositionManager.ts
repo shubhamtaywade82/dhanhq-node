@@ -1,5 +1,6 @@
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
+import type { PortfolioSource } from './portfolioSource';
 import { executePaperOrder, closePaperPosition, defaultMarginResolver, calculateOrderCharges, listPaperPositions, closeParentStrategyIfFlat } from '../db';
 import {
   applyExitFill, createLongOptionState, decideLongOption, DEFAULT_LONG_OPTION_POLICY_CONFIG,
@@ -32,7 +33,7 @@ export class LongOptionPositionManager {
   private enabled = process.env.LONG_OPTION_POLICY_ENABLED !== 'false';
   private evaluating = false;
 
-  constructor(private market: MarketDataService) {}
+  constructor(private market: MarketDataService, private portfolio?: PortfolioSource) {}
 
   setEnabled(on: boolean): void {
     this.enabled = on;
@@ -72,7 +73,9 @@ export class LongOptionPositionManager {
     if (!this.enabled || this.evaluating) return;
     this.evaluating = true;
     try {
-      const positions = await listPaperPositions();
+      const positions = this.portfolio
+        ? await this.portfolio.getPositions()
+        : await listPaperPositions();
       const seen = new Set<string>();
 
       for (const pos of positions) {
@@ -129,14 +132,21 @@ export class LongOptionPositionManager {
 
   private async sell(pos: any, qty: number, bid: number, state: LongOptionState, reason: string, isFirstPartial: boolean): Promise<void> {
     try {
-      const result: any = qty >= pos.netQty
-        ? await closePaperPosition(pos.tradingSymbol, bid)
-        : await executePaperOrder({
-            symbol: pos.tradingSymbol, securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment,
-            transactionType: 'SELL', orderType: 'MARKET', productType: pos.productType, quantity: qty, price: bid,
-            correlationId: `long_policy_${pos.tradingSymbol}_${Date.now()}`,
-          }, defaultMarginResolver);
-      if (result.status !== 'TRADED') return;
+      let result: any;
+      if (this.portfolio?.kind === 'broker') {
+        result = await this.portfolio.closePosition(pos.tradingSymbol, bid, undefined, qty);
+        if (result.status !== 'TRADED') return;
+        result = { status: 'TRADED', fillPrice: result.fillPrice ?? bid };
+      } else {
+        result = qty >= pos.netQty
+          ? await closePaperPosition(pos.tradingSymbol, bid)
+          : await executePaperOrder({
+              symbol: pos.tradingSymbol, securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment,
+              transactionType: 'SELL', orderType: 'MARKET', productType: pos.productType, quantity: qty, price: bid,
+              correlationId: `long_policy_${pos.tradingSymbol}_${Date.now()}`,
+            }, defaultMarginResolver);
+        if (result.status !== 'TRADED') return;
+      }
 
       applyExitFill(state, qty, result.fillPrice, fees);
       // Only mark the breakeven-lock partial as taken once its fill actually
@@ -152,7 +162,9 @@ export class LongOptionPositionManager {
         // and relies entirely on this ratchet) stayed stuck at status
         // RUNNING forever once closed here — nothing told the parent
         // strategy record. Same reconciliation every other exit path uses.
-        await closeParentStrategyIfFlat(pos.tradingSymbol, await listPaperPositions());
+        if (!this.portfolio || this.portfolio.kind === 'paper') {
+          await closeParentStrategyIfFlat(pos.tradingSymbol, await listPaperPositions());
+        }
       }
     } catch (e: any) {
       eventBus.log('ERROR', `Long-option policy sell failed for ${pos.tradingSymbol}: ${e.message}`, 'long_option_policy');

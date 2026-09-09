@@ -56,7 +56,7 @@ export class AutonomyEngine {
     this.market = market;
     this.risk = risk;
     this.portfolio = portfolio;
-    this.longOptionManager = new LongOptionPositionManager(market);
+    this.longOptionManager = new LongOptionPositionManager(market, portfolio);
   }
 
   setAgent(agent: AgentOrchestrator): void {
@@ -65,6 +65,10 @@ export class AutonomyEngine {
 
   setResearch(research: ResearchOrchestrator): void {
     this.research = research;
+  }
+
+  getScanner(): AdaptiveSupertrendScanner | null {
+    return this.scanner;
   }
 
   setScanner(scanner: AdaptiveSupertrendScanner): void {

@@ -13,7 +13,10 @@ function stubClient(opts: {
   return {
     positions: { list: jest.fn(opts.positionsImpl ?? (async () => opts.positions ?? [])) },
     funds: { getLimit: jest.fn(async () => opts.funds ?? {}) },
-    orders: { place: opts.place ?? jest.fn(async () => ({ correlationId: 'corr', data: { orderId: 'ord1' } })) },
+    orders: {
+      place: opts.place ?? jest.fn(async () => ({ correlationId: 'corr', data: { orderId: 'ord1' } })),
+      getById: jest.fn(async (id: string) => ({ orderId: id, orderStatus: 'TRADED', averagePrice: 100 })),
+    },
   } as any;
 }
 
@@ -247,6 +250,34 @@ describe('BrokerPortfolioSource', () => {
     const results = await src.closeAll(() => null);
     expect(results).toHaveLength(2);
     expect(place).toHaveBeenCalledTimes(2);
+  });
+
+  it('closePosition supports partial quantity via the optional qty argument', async () => {
+    const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord50' } }));
+    const client = stubClient({ positions: [rawPosition({ netQty: 75 })], place });
+    const src = new BrokerPortfolioSource(client, 60_000);
+    const result = await src.closePosition('NIFTY25JAN24000CE', 120, undefined, 25);
+    expect(result.status).toBe('TRADED');
+    expect(place).toHaveBeenCalledWith(expect.objectContaining({ transactionType: 'SELL', quantity: 25 }));
+  });
+
+  it('tags sandbox journal rows when TRADING_MODE=sandbox', async () => {
+    const prior = process.env.TRADING_MODE;
+    process.env.TRADING_MODE = 'sandbox';
+    const { journal } = await import('../services/journal');
+    const appendSpy = jest.spyOn(journal, 'append');
+    try {
+      const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord_sbx' } }));
+      const client = stubClient({ positions: [rawPosition({ netQty: 50 })], place });
+      const src = new BrokerPortfolioSource(client, 60_000);
+      await src.closePosition('NIFTY25JAN24000CE');
+      const intent = appendSpy.mock.calls.find((c) => c[0] === 'order_intent');
+      expect(intent?.[1]).toMatchObject({ mode: 'sandbox' });
+    } finally {
+      appendSpy.mockRestore();
+      if (prior === undefined) delete process.env.TRADING_MODE;
+      else process.env.TRADING_MODE = prior;
+    }
   });
 
   it('reports REJECTED without throwing when the reversing order fails', async () => {

@@ -13,21 +13,35 @@ import { aggregatePortfolioGreeks } from '../services/optionsAnalytics';
 
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { AgentOrchestrator } from '../services/agent';
+import type { PortfolioSource } from '../services/portfolioSource';
 
 const log = moduleLogger('portfolio');
 
-export function portfolioRoutes(client: DhanClient, market: MarketDataService, risk?: RiskEngine, paper?: PaperExecutionEngine, agent?: AgentOrchestrator): Router {
+export function portfolioRoutes(
+  client: DhanClient,
+  market: MarketDataService,
+  risk?: RiskEngine,
+  paper?: PaperExecutionEngine,
+  agent?: AgentOrchestrator,
+  portfolio?: PortfolioSource,
+  sandboxClient?: DhanClient,
+): Router {
   const router = Router();
-  const isPaper = () => process.env.TRADING_MODE !== 'live';
+  const isLocalPaper = () => !portfolio || portfolio.kind === 'paper';
+  const brokerApiClient = () => (
+    (process.env.TRADING_MODE || 'paper') === 'sandbox' && sandboxClient ? sandboxClient : client
+  );
 
   router.get('/summary', async (req, res) => {
     try {
-      const [positions, wallet, strategies, orders] = await Promise.all([
-        listPaperPositions(),
-        getPaperWallet(),
-        listPaperStrategies(),
-        listPaperOrders(),
-      ]);
+      const [positions, wallet, strategies, orders] = isLocalPaper()
+        ? await Promise.all([listPaperPositions(), getPaperWallet(), listPaperStrategies(), listPaperOrders()])
+        : await Promise.all([
+          portfolio!.getPositions(),
+          portfolio!.getWallet(),
+          Promise.resolve([]),
+          brokerApiClient().orders.list().catch(() => []),
+        ]);
       const indices = market.getIndices();
       const spotMap: Record<string, number> = {};
       for (const [sym, data] of Object.entries(indices)) {
@@ -51,10 +65,10 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/positions', async (req, res) => {
     try {
-      if (isPaper() || req.query.mode === 'paper') {
+      if (isLocalPaper() || req.query.mode === 'paper') {
         return res.json(await listPaperPositions());
       }
-      res.json(await client.positions.list());
+      res.json(await portfolio!.getPositions());
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'positions' }, 'Positions fetch failed');
       res.json([]);
@@ -63,10 +77,10 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/orders', async (req, res) => {
     try {
-      if (isPaper() || req.query.mode === 'paper') {
+      if (isLocalPaper() || req.query.mode === 'paper') {
         return res.json(await listPaperOrders());
       }
-      res.json(await client.orders.list());
+      res.json(await brokerApiClient().orders.list());
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'orders' }, 'Orders fetch failed');
       res.json([]);
@@ -75,10 +89,10 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/funds', async (req, res) => {
     try {
-      if (isPaper() || req.query.mode === 'paper') {
+      if (isLocalPaper() || req.query.mode === 'paper') {
         return res.json(await getPaperWallet());
       }
-      res.json(await client.funds.getLimit());
+      res.json(await portfolio!.getWallet());
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'funds' }, 'Funds fetch failed');
       res.json({});
@@ -87,11 +101,11 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/trades', async (req, res) => {
     try {
-      if (isPaper() || req.query.mode === 'paper') {
+      if (isLocalPaper() || req.query.mode === 'paper') {
         const orders = await listPaperOrders();
         return res.json(orders.filter((o) => o.status === 'TRADED'));
       }
-      res.json(await client.orders.listTrades());
+      res.json(await brokerApiClient().orders.listTrades());
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'trades' }, 'Trades fetch failed');
       res.json([]);
@@ -100,7 +114,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/greeks', async (_req, res) => {
     try {
-      const positions = await listPaperPositions();
+      const positions = isLocalPaper() ? await listPaperPositions() : await portfolio!.getPositions();
       const indices = market.getIndices();
       const spotMap: Record<string, number> = {};
       for (const [sym, data] of Object.entries(indices)) {
@@ -450,7 +464,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/holdings', async (req, res) => {
     try {
-      const holdings = await client.positions.listHoldings();
+      const holdings = await brokerApiClient().positions.listHoldings();
       res.json(holdings);
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'holdings' }, 'Holdings fetch failed');
@@ -460,7 +474,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/profile', async (req, res) => {
     try {
-      const profile = await client.profile.get();
+      const profile = await brokerApiClient().profile.get();
       res.json(profile);
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'profile' }, 'Profile fetch failed');

@@ -123,7 +123,7 @@ export interface PortfolioSource {
    * own unrealizedProfit is already server-computed from real prices, so
    * this just forces a fresh poll rather than doing any local math. */
   markToMarket(ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }>;
-  closePosition(symbol: string, priceHint?: number, kind?: FillKind): Promise<CloseResult>;
+  closePosition(symbol: string, priceHint?: number, kind?: FillKind, quantity?: number): Promise<CloseResult>;
   closeAll(ltpResolver: LtpResolver): Promise<CloseResult[]>;
   /** Forces the next read to bypass any internal cache. Paper mode's mem
    * reads are always current, so this is a no-op there; BrokerPortfolioSource
@@ -161,7 +161,7 @@ export class PaperPortfolioSource implements PortfolioSource {
     return markPositionsToMarket(ltpResolver);
   }
 
-  async closePosition(symbol: string, priceHint?: number, kind?: FillKind): Promise<CloseResult> {
+  async closePosition(symbol: string, priceHint?: number, kind?: FillKind, _quantity?: number): Promise<CloseResult> {
     return closePaperPosition(symbol, priceHint, undefined, kind) as unknown as Promise<CloseResult>;
   }
 
@@ -418,51 +418,56 @@ export class BrokerPortfolioSource implements PortfolioSource {
    * order lets the broker fill at its own best price, which is more
    * correct for real capital than forcing a specific price the way the
    * paper fill model does. */
-  private async reversePosition(pos: NormalizedPosition, reason: string): Promise<CloseResult> {
+  private brokerMode(): 'sandbox' | 'live' {
+    return process.env.TRADING_MODE === 'sandbox' ? 'sandbox' : 'live';
+  }
+
+  private async reversePosition(pos: NormalizedPosition, reason: string, quantity?: number): Promise<CloseResult> {
     const transactionType = pos.netQty > 0 ? 'SELL' : 'BUY';
-    const quantity = Math.abs(pos.netQty);
+    const qty = Math.min(quantity ?? Math.abs(pos.netQty), Math.abs(pos.netQty));
     const correlationId = `close_${pos.tradingSymbol}_${Date.now()}`;
+    const mode = this.brokerMode();
 
     journal.append('order_intent', {
-      correlation_id: correlationId, mode: 'live',
-      params: { security_id: pos.securityId, quantity, transaction_type: transactionType, exchange_segment: pos.exchangeSegment, product_type: pos.productType },
+      correlation_id: correlationId, mode,
+      params: { security_id: pos.securityId, quantity: qty, transaction_type: transactionType, exchange_segment: pos.exchangeSegment, product_type: pos.productType },
     });
 
     try {
-      const result: any = await this.client.orders.place({
+      const placed: any = await this.client.orders.place({
         correlationId,
         securityId: pos.securityId,
         exchangeSegment: pos.exchangeSegment as any,
         transactionType: transactionType as any,
         orderType: 'MARKET' as any,
-        quantity,
+        quantity: qty,
         price: 0,
         productType: pos.productType as any,
       });
+      const orderId = placed?.data?.orderId ?? placed?.orderId;
+      const settled: any = orderId ? await this.client.orders.getById(orderId).catch(() => placed?.data ?? placed) : placed?.data ?? placed;
+      const fillPrice = Number(settled?.averagePrice ?? settled?.price ?? 0) || undefined;
 
       const fillPayload = {
-        correlation_id: correlationId, is_paper: false, symbol: pos.tradingSymbol,
-        security_id: pos.securityId, quantity, transaction_type: transactionType,
-        order_id: result?.data?.orderId ?? result?.orderId, filled_at: new Date().toISOString(), reason,
+        correlation_id: correlationId, mode, is_paper: false, symbol: pos.tradingSymbol,
+        security_id: pos.securityId, quantity: qty, transaction_type: transactionType,
+        order_id: orderId, fill_price: fillPrice, filled_at: new Date().toISOString(), reason,
       };
-      eventBus.log('TRADE', `Live close ${transactionType} ${quantity} ${pos.tradingSymbol} (${reason})`, 'portfolio_source');
+      eventBus.log('TRADE', `Broker close ${transactionType} ${qty} ${pos.tradingSymbol} (${reason})`, 'portfolio_source');
       eventBus.emit('order', { kind: 'fill', ...fillPayload });
       journal.append('order_result', { status: 'TRADED', ...fillPayload });
       redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
-      // The broker won't reflect this fill in positions.list() until its
-      // own books settle — force a re-poll on the NEXT read rather than
-      // serving a stale "still open" snapshot for a full pollIntervalMs.
       this.invalidate();
-      return { status: 'TRADED', symbol: pos.tradingSymbol, orderId: fillPayload.order_id };
+      return { status: 'TRADED', symbol: pos.tradingSymbol, orderId, fillPrice };
     } catch (e: any) {
-      eventBus.log('ERROR', `Live close FAILED for ${pos.tradingSymbol}: ${e.message}`, 'portfolio_source');
-      journal.append('order_result', { correlation_id: correlationId, status: 'REJECTED', reason: e.message });
+      eventBus.log('ERROR', `Broker close FAILED for ${pos.tradingSymbol}: ${e.message}`, 'portfolio_source');
+      journal.append('order_result', { correlation_id: correlationId, status: 'REJECTED', reason: e.message, mode });
       return { status: 'REJECTED', symbol: pos.tradingSymbol, reason: e.message };
     }
   }
 
-  async closePosition(symbol: string, _priceHint?: number, _kind?: FillKind): Promise<CloseResult> {
+  async closePosition(symbol: string, _priceHint?: number, _kind?: FillKind, quantity?: number): Promise<CloseResult> {
     // Forced, not cache-respecting: this is a deliberate, rare exit
     // decision, not a per-tick read. A cache-respecting read (ensureFresh())
     // would return 'noop' for a position opened within the last
@@ -472,7 +477,7 @@ export class BrokerPortfolioSource implements PortfolioSource {
     await this.ensureFresh(true);
     const pos = this.findOpenPosition(symbol);
     if (!pos) return { status: 'noop', reason: 'No open position found', symbol };
-    return this.reversePosition(pos, 'manual close');
+    return this.reversePosition(pos, 'manual close', quantity);
   }
 
   async closeAll(_ltpResolver: LtpResolver): Promise<CloseResult[]> {

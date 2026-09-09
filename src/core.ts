@@ -29,6 +29,8 @@ import { initResearchRepository } from './services/research/researchRepository';
  */
 export interface Core {
   client: DhanClient;
+  sandboxClient?: DhanClient;
+  portfolio: PortfolioSource;
   market: MarketDataService;
   risk: RiskEngine;
   autonomy: AutonomyEngine;
@@ -100,6 +102,7 @@ export async function startCore(): Promise<Core> {
 
   setSystemState('BOOTING', 'Initializing database and clients');
   await initDatabase();
+  const sandboxClient = createSandboxDhanClient();
   const client = await createDhanClient();
   setSystemState('SYNCING', 'Dhan client connected');
 
@@ -110,7 +113,9 @@ export async function startCore(): Promise<Core> {
   // idea of "the current positions" shared across them, not one each.
   const portfolio: PortfolioSource = process.env.TRADING_MODE === 'live'
     ? new BrokerPortfolioSource(client)
-    : new PaperPortfolioSource();
+    : process.env.TRADING_MODE === 'sandbox' && sandboxClient
+      ? new BrokerPortfolioSource(sandboxClient)
+      : new PaperPortfolioSource();
   const risk = new RiskEngine(client, market, portfolio);
   const autonomy = new AutonomyEngine(client, market, risk, portfolio);
 
@@ -127,7 +132,6 @@ export async function startCore(): Promise<Core> {
   const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk, portfolio);
   // Sandbox client always uses the Real client for market data/WS (Dhan's
   // sandbox has neither) — only order routing goes to the sandbox account.
-  const sandboxClient = createSandboxDhanClient();
   const sandbox = sandboxClient ? new SandboxExecutionEngine(sandboxClient, market, risk) : undefined;
   const agent = new AgentOrchestrator(client, market, risk, paper, live, sandbox);
   const ollama = process.env.OLLAMA_ENABLED !== 'false'
@@ -137,7 +141,7 @@ export async function startCore(): Promise<Core> {
   autonomy.setAgent(agent);
   autonomy.setResearch(research);
   const executionEngine = pickExecutionEngine(process.env.TRADING_MODE, { paper, live, sandbox });
-  autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, executionEngine, risk));
+  autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, executionEngine, risk, undefined, portfolio));
 
   await initResearchRepository();
   const researchScheduler = new ResearchScheduler(research);
@@ -192,7 +196,7 @@ export async function startCore(): Promise<Core> {
   eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
-  return { client, market, risk, autonomy, agent, research, researchScheduler, paper, live, sandbox, tracker, selfHealing };
+  return { client, sandboxClient, portfolio, market, risk, autonomy, agent, research, researchScheduler, paper, live, sandbox, tracker, selfHealing };
 }
 
 /**
@@ -237,7 +241,15 @@ export async function crossCheckJournalOnBoot(
       try {
         const order: any = await lookupClient.orders.getByCorrelationId(id);
         if (!order?.orderStatus) {
-          problems.push(`unresolved order ${id} — broker has no record of it`);
+          // Never reached the broker (crash mid-place) — close the journal
+          // loop so the day isn't stuck in DEGRADED blocking all new entries.
+          journal.append('order_result', {
+            correlation_id: id,
+            status: 'REJECTED',
+            reason: 'orphan_resolved_on_boot: broker has no record',
+            mode,
+          });
+          eventBus.log('WARN', `Boot reconciliation: orphan intent ${id} closed as REJECTED (broker has no record)`, 'core');
         } else {
           eventBus.log('SYSTEM', `Boot reconciliation: order ${id} resolved from broker as ${order.orderStatus}`, 'core');
         }

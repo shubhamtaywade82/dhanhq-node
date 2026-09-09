@@ -44,37 +44,43 @@ export class SandboxExecutionEngine {
 
     eventBus.log('TRADE', `Placing SANDBOX order ${transaction_type} ${quantity} × ${security_id} (${correlation_id})`, 'sandbox_engine');
 
-    const placed = await this.client.orders.place({
-      correlationId: correlation_id,
-      securityId: String(security_id),
-      exchangeSegment: exchange_segment,
-      transactionType: transaction_type,
-      orderType: order_type,
-      quantity,
-      price,
-      productType: params.product_type || 'INTRADAY',
-    });
+    try {
+      const placed = await this.client.orders.place({
+        correlationId: correlation_id,
+        securityId: String(security_id),
+        exchangeSegment: exchange_segment,
+        transactionType: transaction_type,
+        orderType: order_type,
+        quantity,
+        price,
+        productType: params.product_type || 'INTRADAY',
+      });
 
-    const orderId = placed.data.orderId;
-    const settled = await this.client.orders.getById(orderId).catch(() => placed.data);
+      const orderId = placed.data.orderId;
+      const settled = await this.client.orders.getById(orderId).catch(() => placed.data);
 
-    const fillPayload = {
-      intent_id,
-      correlation_id,
-      mode: 'sandbox' as const,
-      is_paper: false,
-      fill_price: (settled as any).averagePrice ?? price,
-      quantity: (settled as any).filledQty ?? quantity,
-      security_id,
-      order_id: orderId,
-      filled_at: new Date().toISOString(),
-    };
+      const fillPayload = {
+        intent_id,
+        correlation_id,
+        mode: 'sandbox' as const,
+        is_paper: false,
+        fill_price: (settled as any).averagePrice ?? price,
+        quantity: (settled as any).filledQty ?? quantity,
+        security_id,
+        order_id: orderId,
+        filled_at: new Date().toISOString(),
+      };
 
-    eventBus.emit('order', { kind: 'fill', ...fillPayload });
-    journal.append('order_result', { status: (settled as any).orderStatus || 'TRADED', ...fillPayload });
+      eventBus.emit('order', { kind: 'fill', ...fillPayload });
+      journal.append('order_result', { status: (settled as any).orderStatus || 'TRADED', ...fillPayload });
 
-    this.market.addInstruments([{ securityId: String(security_id), exchangeSegment: exchange_segment }]);
-    return { status: (settled as any).orderStatus || 'TRADED', orderId, ...fillPayload };
+      this.market.addInstruments([{ securityId: String(security_id), exchangeSegment: exchange_segment }]);
+      return { status: (settled as any).orderStatus || 'TRADED', orderId, ...fillPayload };
+    } catch (e: any) {
+      eventBus.log('ERROR', `Sandbox order FAILED for ${correlation_id}: ${e.message}`, 'sandbox_engine');
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: e.message, mode: 'sandbox' });
+      return { status: 'REJECTED', reason: e.message };
+    }
   }
 
   /**

@@ -13,6 +13,7 @@
     "dev:all": "npm run dev:server & npm run dev:frontend",
     "subscribe:indices": "ts-node scripts/subscribe-indices.ts",
     "backtest:long-option-policy": "ts-node scripts/backtest-long-option-policy.ts",
+    "watch:sandbox-supertrend": "ts-node scripts/sandbox-supertrend-watch.ts",
     "test": "jest --forceExit"
   },
   "dependencies": {

@@ -145,6 +145,21 @@ export class Journal {
     return this.sessionDate;
   }
 
+  /** Re-reads today's journal file from disk — used by boot reconcile
+   * without disturbing the open append stream. */
+  readTodayEntries(sessionDate: string = marketClock().istDate): JournalEntry[] {
+    const file = join(journalDir(), `${sessionDate}.ndjson`);
+    if (!existsSync(file)) return [];
+    const entries: JournalEntry[] = [];
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        entries.push(JSON.parse(line) as JournalEntry);
+      } catch { /* torn final line */ }
+    }
+    return entries;
+  }
+
   /** Resolves once the stream has actually finished flushing to disk —
    * WriteStream.end() only SCHEDULES the flush. A caller that exits the
    * process right after calling close() (server.ts's shutdown handler)

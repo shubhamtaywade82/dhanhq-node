@@ -234,11 +234,12 @@ export class MarketDataService {
           this.source = 'ws';
           this.ingestTick(tick);
         });
-        ws.market?.on?.('close', (code: number) => {
+        ws.market?.on?.('close', () => {
           this.wsConnecting = false;
           if (!this.wsStarted) return;
           this.wsStarted = false;
-          eventBus.log('WARN', `Market WS closed (code=${code}) — reconnecting`, 'market_data');
+          // SDK BaseWS emits "close" with no args — the underlying ws code/reason are not forwarded.
+          eventBus.log('WARN', 'Market WS closed — reconnecting', 'market_data');
           eventBus.emit('system', { type: 'feed_degraded', source: 'rest' });
           this.scheduleWsRetry(undefined, force);
         });
@@ -273,8 +274,8 @@ export class MarketDataService {
             eventBus.log('WARN', `Orders WS error: ${msg}`, 'market_data');
           }
         });
-        ws.orders?.on?.('close', (code: number) => {
-          eventBus.log('INFO', `Orders WS closed (code=${code})`, 'market_data');
+        ws.orders?.on?.('close', () => {
+          eventBus.log('INFO', 'Orders WS closed', 'market_data');
         });
       }
 
