@@ -295,6 +295,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
           killed: !!health.killed,
           live: !health.killed,
           uptimeSeconds: Math.floor(health.uptime || 0),
+          tradingMode: (health.mode as AppState['tradingMode']) || 'paper',
+          persistence: health.persistence || prev.persistence,
         }));
       } catch {
         if (mounted) setConnected(false);
@@ -325,8 +327,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const uptimeInterval = setInterval(async () => {
       if (!mounted) return;
       setState((prev) => {
+        const realized = Number(prev.funds.sessionRealizedPnl ?? prev.funds.realizedPnl ?? 0);
         const unrealized = prev.positions.reduce((acc, p) => acc + (p.unrealizedProfit || p.unrealizedPnl || 0), 0);
-        const totalPnl = (prev.funds.realizedPnl || 0) + unrealized;
+        const totalPnl = realized + unrealized;
         const pnlHistory = [...prev.pnlHistory, { t: Date.now(), v: Math.round(totalPnl) }];
         // 1 point/sec for a full NSE session (09:15-15:30) — chart shows the
         // actual intraday curve, not a rolling few-minute window.

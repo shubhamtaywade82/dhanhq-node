@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
@@ -12,6 +12,13 @@ import { api } from '../services/api';
 export function Orders() {
   const { state, showToast, openModal, closeModal, addSystemLog, refreshPortfolio } = useApp();
   const [filter, setFilter] = useState('ALL');
+  const [mode, setMode] = useState('paper');
+
+  useEffect(() => {
+    api.health().then((h) => setMode(h.mode || 'paper')).catch(() => {});
+  }, []);
+
+  const isPaper = mode === 'paper';
 
   const filtered = filter === 'ALL'
     ? state.orders
@@ -86,15 +93,21 @@ export function Orders() {
       <div className="flex items-center justify-between">
         <div>
           <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">Order Book & Audit Trail</div>
-          <div className="text-xs text-muted mt-0.5">PostgreSQL persisted audit log of paper trading executions</div>
+          <div className="text-xs text-muted mt-0.5">
+            {isPaper
+              ? 'PostgreSQL persisted audit log of paper trading executions'
+              : `${mode === 'sandbox' ? 'DhanHQ Sandbox' : 'Live broker'} order book — today\u2019s orders from the ${mode} account`}
+          </div>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="ghost" onClick={async () => { await refreshPortfolio(); showToast('Orders synced with database', 'success'); }}>
+          <Button variant="ghost" onClick={async () => { await refreshPortfolio(); showToast('Orders refreshed', 'success'); }}>
             <RotateCcw size={12} className="mr-1" /> Refresh
           </Button>
-          <Button onClick={openPlaceOrderModal}>
-            <Plus size={14} className="mr-1" /> Place Paper Order
-          </Button>
+          {isPaper && (
+            <Button onClick={openPlaceOrderModal}>
+              <Plus size={14} className="mr-1" /> Place Paper Order
+            </Button>
+          )}
           <Select value={filter} onChange={(e) => setFilter(e.target.value)} className="text-xs">
             <option value="ALL">All Statuses</option>
             <option value="TRADED">TRADED / FILLED</option>
@@ -117,7 +130,11 @@ export function Orders() {
           <tbody>
             {filtered.length === 0 ? (
               <tr>
-                <td colSpan={12} className="text-center py-8 text-muted text-xs">No orders recorded. Click &quot;Place Paper Order&quot; to execute your first paper trade!</td>
+                <td colSpan={12} className="text-center py-8 text-muted text-xs">
+                  {isPaper
+                    ? 'No orders recorded. Click "Place Paper Order" to execute your first paper trade!'
+                    : `No ${mode} orders today yet — bot trades will appear here once the scanner or agent places them.`}
+                </td>
               </tr>
             ) : (
               filtered.map((o, i) => (
@@ -132,7 +149,12 @@ export function Orders() {
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-white">{fmt(o.price)}</td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-white">{o.filled}/{o.qty}</td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-white">{o.avg ? fmt(o.avg) : '-'}</td>
-                  <td className="px-2.5 py-[7px] border-b border-border/60"><Badge status={o.status} /></td>
+                  <td className="px-2.5 py-[7px] border-b border-border/60">
+                    <Badge status={o.status} />
+                    {(o as any).reason && o.status === 'REJECTED' && (
+                      <div className="text-[9px] text-danger mt-0.5 max-w-[140px] truncate" title={(o as any).reason}>{(o as any).reason}</div>
+                    )}
+                  </td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-muted">{o.latency}</td>
                 </tr>
               ))

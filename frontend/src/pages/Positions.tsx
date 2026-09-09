@@ -8,15 +8,35 @@ import { RotateCcw, Power } from 'lucide-react';
 import { api } from '../services/api';
 
 type PolicyState = { peakNet: number; floorNet: number; captureRatioSoFar: number | null; partialTaken: boolean };
+type TradingMode = 'paper' | 'sandbox' | 'live';
+
+function modeLabel(mode: TradingMode): string {
+  if (mode === 'sandbox') return 'Sandbox';
+  if (mode === 'live') return 'Live';
+  return 'Paper Trading';
+}
+
+function modeSubtitle(mode: TradingMode, policyEnabled: boolean) {
+  const policy = policyEnabled ? <span className="text-accent"> · long-option peak-profit policy active</span> : null;
+  if (mode === 'sandbox') {
+    return <>DhanHQ Sandbox account positions — MTM polled from broker every few seconds{policy}</>;
+  }
+  if (mode === 'live') {
+    return <>Live DhanHQ account positions — MTM from broker{policy}</>;
+  }
+  return <>PostgreSQL persistent paper positions with automated SL/TP &amp; Trailing monitoring{policy}</>;
+}
 
 export function Positions() {
   const { state, showToast, openModal, closeModal, addSystemLog, refreshPortfolio } = useApp();
+  const [mode, setMode] = useState<TradingMode>('paper');
   const [policyEnabled, setPolicyEnabled] = useState(false);
   const [policyBySymbol, setPolicyBySymbol] = useState<Record<string, PolicyState>>({});
 
-  // Local poll (not global store — same pattern Config.tsx uses for its own
-  // control-plane reads). Peak/floor move every tick; this just needs to be
-  // fresh enough for a human glance, not push-perfect.
+  useEffect(() => {
+    api.health().then((h) => setMode((h.mode as TradingMode) || 'paper')).catch(() => {});
+  }, []);
+
   useEffect(() => {
     let mounted = true;
     const load = async () => {
@@ -32,6 +52,8 @@ export function Positions() {
     return () => { mounted = false; clearInterval(interval); };
   }, []);
 
+  const isPaper = mode === 'paper';
+
   const realPositions = state.positions
     .filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0)
     .map((p) => {
@@ -39,11 +61,11 @@ export function Positions() {
     const buyAvg = Number(p.buyAvg ?? p.buy_avg ?? 0);
     const sellAvg = Number(p.sellAvg ?? p.sell_avg ?? 0);
     const ltp = Number(p.ltp ?? p.costPrice ?? (net >= 0 ? buyAvg : sellAvg));
-    const pnl = Number(p.pnl ?? p.realizedProfit ?? 0);
+    const pnl = Number(p.unrealizedProfit ?? p.unrealizedPnl ?? p.pnl ?? p.realizedProfit ?? 0);
 
     return {
       id: p.id || p.tradingSymbol,
-      strategy: 'Paper Trading',
+      strategy: modeLabel(mode),
       instrument: p.tradingSymbol || p.symbol || p.id,
       side: net >= 0 ? ('BUY' as const) : ('SELL' as const),
       qty: Math.abs(net),
@@ -52,7 +74,7 @@ export function Positions() {
       ltp,
       pnl,
       stopLoss: p.stopLoss ?? p.stop_loss ?? null,
-      target: p.target ?? null,
+      target: p.target ?? p.target ?? null,
       trailingStop: p.trailingStop ?? p.trailing_stop ?? null,
       delta: '0.00',
       theta: '0',
@@ -60,11 +82,16 @@ export function Positions() {
     };
   });
 
+  const closeOne = async (instrument: string, ltp: number) => {
+    if (isPaper) return api.closePaperPosition(instrument, ltp);
+    return api.closePosition(instrument, ltp);
+  };
+
   const handleClose = async (instrument: string, ltp: number) => {
     try {
-      await api.closePaperPosition(instrument, ltp);
+      await closeOne(instrument, ltp);
       showToast(`Position ${instrument} closed successfully`, 'success');
-      addSystemLog('INFO', `Position closed for ${instrument} @ ${ltp}`, 'paper_execution');
+      addSystemLog('INFO', `Position closed for ${instrument} @ ${ltp}`, isPaper ? 'paper_execution' : 'portfolio_source');
       await refreshPortfolio();
     } catch (e: any) {
       showToast(`Failed to close ${instrument}: ${e.message}`, 'error');
@@ -78,17 +105,27 @@ export function Positions() {
           <Power size={20} />
         </div>
         <div className="text-base font-bold text-danger mb-1">Close All Positions</div>
-        <div className="text-xs text-muted mb-4">This will immediately send market orders to close ALL open paper positions.</div>
+        <div className="text-xs text-muted mb-4">
+          {isPaper
+            ? 'This will immediately close ALL open paper positions in PostgreSQL.'
+            : `This will send reversing orders to close ALL open ${mode === 'sandbox' ? 'sandbox' : 'live'} positions.`}
+        </div>
         <div className="flex gap-2 justify-center">
           <Button variant="ghost" onClick={closeModal}>Cancel</Button>
           <Button variant="danger" onClick={async () => {
             closeModal();
-            for (const p of realPositions) {
-              await api.closePaperPosition(p.instrument, p.ltp);
+            try {
+              if (isPaper) {
+                for (const p of realPositions) await api.closePaperPosition(p.instrument, p.ltp);
+              } else {
+                await api.closeAllPositions();
+              }
+              await refreshPortfolio();
+              addSystemLog('WARN', `All ${mode} positions closed`, 'risk_engine');
+              showToast('All open positions closed', 'success');
+            } catch (e: any) {
+              showToast(`Close all failed: ${e.message}`, 'error');
             }
-            await refreshPortfolio();
-            addSystemLog('WARN', 'All paper positions flushed and closed', 'risk_engine');
-            showToast('All open positions closed', 'success');
           }}>Close All Now</Button>
         </div>
       </div>
@@ -101,12 +138,11 @@ export function Positions() {
         <div>
           <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">Active Positions & MTM</div>
           <div className="text-xs text-muted mt-0.5">
-            PostgreSQL persistent paper positions with automated SL/TP & Trailing monitoring
-            {policyEnabled && <span className="text-accent"> · long-option peak-profit policy active</span>}
+            {modeSubtitle(mode, policyEnabled)}
           </div>
         </div>
         <div className="flex gap-2">
-          <Button variant="ghost" onClick={async () => { await refreshPortfolio(); showToast('Portfolio synced with database', 'success'); }}><RotateCcw size={12} className="mr-1" /> Refresh Positions</Button>
+          <Button variant="ghost" onClick={async () => { await refreshPortfolio(); showToast('Portfolio synced', 'success'); }}><RotateCcw size={12} className="mr-1" /> Refresh Positions</Button>
           <Button variant="danger" onClick={closeAll}><Power size={12} className="mr-1" /> Close All Positions</Button>
         </div>
       </div>
@@ -123,7 +159,11 @@ export function Positions() {
           <tbody>
             {realPositions.length === 0 ? (
               <tr>
-                <td colSpan={13} className="text-center py-8 text-muted text-xs">No open positions. Place a paper trade to start!</td>
+                <td colSpan={13} className="text-center py-8 text-muted text-xs">
+                  {isPaper
+                    ? 'No open positions. Place a paper trade to start!'
+                    : `No open ${mode} positions — fills appear here once sandbox/live orders trade.`}
+                </td>
               </tr>
             ) : (
               realPositions.map((p, i) => (
@@ -135,13 +175,13 @@ export function Positions() {
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-white font-mono">{p.bAvg ? fmt(p.bAvg) : (p.sAvg ? fmt(p.sAvg) : '-')}</td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-white font-semibold font-mono"><LerpNumber value={p.ltp} /></td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-danger font-semibold">
-                    {p.stopLoss ? `₹${fmt(p.stopLoss)}` : <span className="text-muted font-normal text-[10px]">Auto (Risk)</span>}
+                    {p.stopLoss ? `₹${fmt(p.stopLoss)}` : <span className="text-muted font-normal text-[10px]">{isPaper ? 'Auto (Risk)' : 'Broker'}</span>}
                   </td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-accent font-semibold">
-                    {p.target ? `₹${fmt(p.target)}` : <span className="text-muted font-normal text-[10px]">15:20 EOD</span>}
+                    {p.target ? `₹${fmt(p.target)}` : <span className="text-muted font-normal text-[10px]">{isPaper ? '15:20 EOD' : '—'}</span>}
                   </td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-sky text-[10px]">
-                    {p.trailingStop ? `±₹${p.trailingStop}` : <span className="text-muted font-normal">Active</span>}
+                    {p.trailingStop ? `±₹${p.trailingStop}` : <span className="text-muted font-normal">{isPaper ? 'Active' : '—'}</span>}
                   </td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-[10px]">
                     {(() => {

@@ -71,7 +71,8 @@ function formatJournal(entry: JournalEntry): string {
     return `${tag} ${p.mode || '?'} ${params.transaction_type || ''} ${params.security_id || ''} qty=${params.quantity ?? '?'}`;
   }
   if (entry.kind === 'order_result') {
-    return `${tag} ${p.status || '?'} ${p.mode || ''} ${p.symbol || ''} ${p.transaction_type || ''} qty=${p.quantity ?? '?'}${p.fill_price ? ` @ ${p.fill_price}` : ''}`;
+    const reason = p.reason ? ` — ${p.reason}` : '';
+    return `${tag} ${p.status || '?'} ${p.mode || ''} ${p.symbol || p.security_id || ''} qty=${p.quantity ?? '?'}${p.fill_price ? ` @ ${p.fill_price}` : ''}${reason}`;
   }
   if (entry.kind === 'eod') return `${tag} ${p.reason || 'square-off'}`;
   return `${tag} ${JSON.stringify(p)}`;
@@ -136,7 +137,34 @@ function printSection(title: string): void {
   console.log(`\n[${istTime()} IST] ── ${title} ──`);
 }
 
-async function printStatus(): Promise<boolean> {
+type StatusView = {
+  reachable: boolean;
+  mode?: string;
+  system?: string;
+  marketOpen?: boolean;
+  scanOn?: boolean;
+  longPolicyOn?: boolean;
+  killed?: boolean;
+  cycles?: number;
+  lastCycleAgoSec?: number | null;
+  equity?: number;
+  avail?: number;
+  dayPnl?: number;
+  open?: Array<{ symbol: string; side: string; qty: number; avg: number; pnl: number }>;
+  ratchet?: Array<{ symbol: string; qty: number; peak: number; floor: number; partial: boolean }>;
+  scannerBlocked?: string | null;
+  scannerSymbols?: Array<{ symbol: string; stage: string; dir1m: number | null; dir5m: number | null; candles1m?: number; candles5m?: number }>;
+  nextScanInSec?: number;
+  scanIntervalSec?: number;
+};
+
+/** Stable fields only — excludes cycle counters and scan countdowns. */
+function statusFingerprint(v: StatusView): string {
+  const { cycles: _c, lastCycleAgoSec: _l, nextScanInSec: _n, scanIntervalSec: _i, ...stable } = v;
+  return JSON.stringify(stable);
+}
+
+async function fetchStatus(): Promise<StatusView> {
   const [health, state, summary, policy, scanner] = await Promise.all([
     api<any>('/api/health'),
     api<any>('/api/control/state'),
@@ -144,47 +172,87 @@ async function printStatus(): Promise<boolean> {
     api<any>('/api/control/long-option-policy'),
     api<any>('/api/control/adaptive-supertrend'),
   ]);
-  if (!health || health.status !== 'ok') {
-    printSection('Waiting for sidecar');
-    console.log(`  ${BASE} not reachable — is dev:server running?`);
-    return false;
-  }
+  if (!health || health.status !== 'ok') return { reachable: false };
 
   const clock = state?.autonomy?.clock;
   const wallet = summary?.wallet || {};
   const open = (summary?.positions || []).filter((p: any) => p.netQty !== 0);
 
+  return {
+    reachable: true,
+    mode: health.mode,
+    system: state?.systemState || 'unknown',
+    marketOpen: !!clock?.isMarketOpen,
+    scanOn: !!state?.autonomy?.scanEnabled,
+    longPolicyOn: !!policy?.enabled,
+    killed: !!health.killed,
+    cycles: state?.autonomy?.cycles ?? 0,
+    lastCycleAgoSec: state?.autonomy?.lastCycleAgoSec ?? null,
+    equity: wallet.equity ?? 0,
+    avail: wallet.availableMargin ?? 0,
+    dayPnl: wallet.sessionRealizedPnl ?? 0,
+    open: open.map((p: any) => ({
+      symbol: p.tradingSymbol,
+      side: p.netQty > 0 ? 'LONG' : 'SHORT',
+      qty: Math.abs(p.netQty),
+      avg: p.buyAvg || p.sellAvg,
+      pnl: p.pnl ?? 0,
+    })),
+    ratchet: (policy?.positions || []).map((s: any) => ({
+      symbol: s.tradingSymbol, qty: s.remainingQuantity,
+      peak: s.peakNet, floor: s.floorNet, partial: s.partialTaken,
+    })),
+    scannerBlocked: scanner?.canTrade ? null : (scanner?.tradeBlockReason || 'risk gate'),
+    scannerSymbols: (scanner?.symbols || []).map((s: any) => ({
+      symbol: s.symbol, stage: s.stage, dir1m: s.dir1m ?? null, dir5m: s.dir5m ?? null,
+      candles1m: s.candles1m, candles5m: s.candles5m,
+    })),
+    nextScanInSec: scanner?.nextScanInSec,
+    scanIntervalSec: scanner?.scanIntervalSec,
+  };
+}
+
+function renderStatus(v: StatusView): void {
+  if (!v.reachable) {
+    printSection('Waiting for sidecar');
+    console.log(`  ${BASE} not reachable — is dev:server running?`);
+    return;
+  }
+
   printSection('Sandbox supertrend watch');
-  const sys = state?.systemState || 'unknown';
-  if (sys !== 'READY') {
-    console.log(`  *** SYSTEM ${sys} — new orders BLOCKED. Run: curl -X POST ${BASE}/api/control/reconcile-boot`);
+  if (v.system !== 'READY') {
+    console.log(`  *** SYSTEM ${v.system} — new orders BLOCKED. Run: curl -X POST ${BASE}/api/control/reconcile-boot`);
   }
-  console.log(`  mode=${health.mode}  system=${sys}  market=${clock?.isMarketOpen ? 'OPEN' : 'closed'}  scan=${state?.autonomy?.scanEnabled ? 'on' : 'off'}  long-policy=${policy?.enabled ? 'on' : 'off'}`);
-  console.log(`  autonomy cycles=${state?.autonomy?.cycles ?? 0}  last=${state?.autonomy?.lastCycleAgoSec ?? '?'}s ago  killed=${health.killed}`);
-  console.log(`  equity=${fmtInr(wallet.equity ?? 0)}  avail=${fmtInr(wallet.availableMargin ?? 0)}  dayPnl=${fmtInr(wallet.sessionRealizedPnl ?? 0)}  open=${open.length}`);
+  console.log(`  mode=${v.mode}  system=${v.system}  market=${v.marketOpen ? 'OPEN' : 'closed'}  scan=${v.scanOn ? 'on' : 'off'}  long-policy=${v.longPolicyOn ? 'on' : 'off'}`);
+  console.log(`  autonomy cycles=${v.cycles}  last=${v.lastCycleAgoSec ?? '?'}s ago  killed=${v.killed}`);
+  console.log(`  equity=${fmtInr(v.equity ?? 0)}  avail=${fmtInr(v.avail ?? 0)}  dayPnl=${fmtInr(v.dayPnl ?? 0)}  open=${v.open?.length ?? 0}`);
 
-  for (const p of open) {
-    const side = p.netQty > 0 ? 'LONG' : 'SHORT';
-    console.log(`  • ${p.tradingSymbol} ${side} x${Math.abs(p.netQty)} avg=${p.buyAvg || p.sellAvg} pnl=${fmtInr(p.pnl ?? 0)}`);
+  for (const p of v.open || []) {
+    console.log(`  • ${p.symbol} ${p.side} x${p.qty} avg=${p.avg} pnl=${fmtInr(p.pnl)}`);
   }
 
-  const tracked = policy?.positions || [];
-  if (tracked.length > 0) {
+  if ((v.ratchet || []).length > 0) {
     console.log('  long-option ratchet:');
-    for (const s of tracked) {
-      console.log(`    ${s.tradingSymbol} qty=${s.remainingQuantity} peak=${fmtInr(s.peakNet)} floor=${fmtInr(s.floorNet)} partial=${s.partialTaken}`);
+    for (const s of v.ratchet!) {
+      console.log(`    ${s.symbol} qty=${s.qty} peak=${fmtInr(s.peak)} floor=${fmtInr(s.floor)} partial=${s.partial}`);
     }
   }
 
-  if (scanner?.symbols) {
-    const block = scanner.canTrade ? '' : ` BLOCKED: ${scanner.tradeBlockReason || 'risk gate'}`;
-    console.log(`  scanner: next scan ${scanner.nextScanInSec}s  interval=${scanner.scanIntervalSec}s${block}`);
-    for (const s of scanner.symbols) {
-      const dirs = `1m=${s.dir1m ?? '-'} 5m=${s.dir5m ?? '-'}`;
-      console.log(`    ${s.symbol.padEnd(10)} ${s.stage.padEnd(28)} ${dirs}`);
+  if (v.scannerSymbols?.length) {
+    const block = v.scannerBlocked ? ` BLOCKED: ${v.scannerBlocked}` : '';
+    console.log(`  scanner: next scan ${v.nextScanInSec}s  interval=${v.scanIntervalSec}s${block}`);
+    for (const s of v.scannerSymbols) {
+      const bars = `${s.candles1m ?? '?'}/${s.candles5m ?? '?'} bars`;
+      console.log(`    ${s.symbol.padEnd(10)} ${s.stage.padEnd(32)} 1m=${s.dir1m ?? '-'} 5m=${s.dir5m ?? '-'}  (${bars})`);
     }
   }
-  return true;
+}
+
+async function pollStatus(lastFingerprint: string | null, force = false): Promise<{ alive: boolean; fingerprint: string | null }> {
+  const view = await fetchStatus();
+  const fp = statusFingerprint(view);
+  if (force || fp !== lastFingerprint) renderStatus(view);
+  return { alive: view.reachable, fingerprint: fp };
 }
 
 async function main(): Promise<void> {
@@ -193,16 +261,19 @@ async function main(): Promise<void> {
     console.warn(`WARN: TRADING_MODE=${mode} (expected sandbox). API reads may show paper data.`);
   }
 
-  console.log(`Watching ${BASE}  journal=${journalFile()}  poll=${POLL_MS}ms`);
+  console.log(`Watching ${BASE}  journal=${journalFile()}  poll=${POLL_MS}ms  (status logs on change only)`);
   const tail = new JournalTail((entry) => console.log(`  ${formatJournal(entry)}`));
 
-  let alive = await printStatus();
-  if (!alive) console.log('Retrying until the sidecar is up…');
+  let fingerprint: string | null = null;
+  const first = await pollStatus(null, true);
+  fingerprint = first.fingerprint;
+  if (!first.alive) console.log('Retrying until the sidecar is up…');
 
   setInterval(() => tail.poll(), 2000);
   setInterval(async () => {
     tail.rollIfNeeded();
-    await printStatus();
+    const result = await pollStatus(fingerprint);
+    fingerprint = result.fingerprint;
   }, POLL_MS);
 }
 

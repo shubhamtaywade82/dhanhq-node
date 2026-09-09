@@ -3,6 +3,11 @@ import { eventBus } from '../services/eventBus';
 import { journal } from '../services/journal';
 import type { MarketDataService } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
+import { buildSandboxPlaceRequest, resolveSandboxOptionLeg, roundToTick } from '../services/sandboxInstruments';
+
+function dhanErrorDetail(e: any): string {
+  return [e.errorCode, e.errorType, e.errorMessage].filter(Boolean).join(' | ');
+}
 
 /**
  * Sandbox execution engine — places orders through DhanHQ's real Sandbox
@@ -32,8 +37,6 @@ export class SandboxExecutionEngine {
     // PositionMonitor wired to this engine, since sandbox mode is for
     // verifying real order routing/rejections, not SL/target management.
     // Add a monitor param if sandbox trades need live stop management.
-    journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'sandbox' });
-
     const gate = this.risk.canTrade();
     if (!gate.allowed) {
       eventBus.log('WARN', `Sandbox order REJECTED for ${correlation_id}: ${gate.reason}`, 'sandbox_engine');
@@ -42,19 +45,67 @@ export class SandboxExecutionEngine {
       return { status: 'REJECTED', reason: gate.reason };
     }
 
-    eventBus.log('TRADE', `Placing SANDBOX order ${transaction_type} ${quantity} × ${security_id} (${correlation_id})`, 'sandbox_engine');
+    let secId = String(security_id);
+    let qty = quantity;
+    let seg = exchange_segment;
+    let limitPrice = price;
+    let sandboxContract: string | undefined;
+
+    if (!params.underlying || params.strike == null || !params.option_type) {
+      const reason = 'sandbox: missing underlying/strike/option_type — cannot map production securityId to sandbox scrip';
+      journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'sandbox' });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
+      return { status: 'REJECTED', reason };
+    }
+
+    const leg = await resolveSandboxOptionLeg(this.client, {
+      underlying: params.underlying,
+      strike: Number(params.strike),
+      optionType: params.option_type,
+      expiry: params.expiry,
+      exchangeSegment: exchange_segment,
+    });
+    if (!leg) {
+      const reason = `sandbox: no ${params.underlying} ${params.strike}${params.option_type} in sandbox scrip master`;
+      journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'sandbox' });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
+      return { status: 'REJECTED', reason };
+    }
+    if (params.underlying.toUpperCase() === 'SENSEX') {
+      const reason = 'sandbox: SENSEX BSE_FNO not supported by Dhan sandbox (DH-906)';
+      journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'sandbox' });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
+      return { status: 'REJECTED', reason };
+    }
+
+    if (leg.securityId !== secId) {
+      eventBus.log('INFO', `Sandbox remap ${secId}→${leg.securityId} (${leg.displayName || params.symbol})`, 'sandbox_engine');
+    }
+    secId = leg.securityId;
+    qty = leg.quantity;
+    seg = leg.exchangeSegment;
+    limitPrice = roundToTick(price, leg.tickSize);
+    sandboxContract = leg.displayName;
+
+    journal.append('order_intent', {
+      correlation_id, intent_id,
+      params: { ...params, security_id: secId, quantity: qty, exchange_segment: seg, price: limitPrice, sandbox_contract: sandboxContract },
+      risk_limits, mode: 'sandbox',
+    });
+
+    eventBus.log('TRADE', `Placing SANDBOX order ${transaction_type} ${qty} × ${secId} (${correlation_id})`, 'sandbox_engine');
 
     try {
-      const placed = await this.client.orders.place({
+      const placed = await this.client.orders.place(buildSandboxPlaceRequest({
         correlationId: correlation_id,
-        securityId: String(security_id),
-        exchangeSegment: exchange_segment,
+        securityId: secId,
+        exchangeSegment: seg,
         transactionType: transaction_type,
         orderType: order_type,
-        quantity,
-        price,
+        quantity: qty,
+        price: limitPrice,
         productType: params.product_type || 'INTRADAY',
-      });
+      }));
 
       const orderId = placed.data.orderId;
       const settled = await this.client.orders.getById(orderId).catch(() => placed.data);
@@ -64,9 +115,9 @@ export class SandboxExecutionEngine {
         correlation_id,
         mode: 'sandbox' as const,
         is_paper: false,
-        fill_price: (settled as any).averagePrice ?? price,
-        quantity: (settled as any).filledQty ?? quantity,
-        security_id,
+        fill_price: (settled as any).averagePrice ?? limitPrice,
+        quantity: (settled as any).filledQty ?? qty,
+        security_id: secId,
         order_id: orderId,
         filled_at: new Date().toISOString(),
       };
@@ -74,12 +125,14 @@ export class SandboxExecutionEngine {
       eventBus.emit('order', { kind: 'fill', ...fillPayload });
       journal.append('order_result', { status: (settled as any).orderStatus || 'TRADED', ...fillPayload });
 
-      this.market.addInstruments([{ securityId: String(security_id), exchangeSegment: exchange_segment }]);
+      this.market.addInstruments([{ securityId: secId, exchangeSegment: seg }]);
       return { status: (settled as any).orderStatus || 'TRADED', orderId, ...fillPayload };
     } catch (e: any) {
-      eventBus.log('ERROR', `Sandbox order FAILED for ${correlation_id}: ${e.message}`, 'sandbox_engine');
-      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: e.message, mode: 'sandbox' });
-      return { status: 'REJECTED', reason: e.message };
+      const detail = dhanErrorDetail(e);
+      const reason = detail ? `${e.message} (${detail})` : e.message;
+      eventBus.log('ERROR', `Sandbox order FAILED for ${correlation_id}: ${reason}`, 'sandbox_engine');
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
+      return { status: 'REJECTED', reason };
     }
   }
 
@@ -93,16 +146,16 @@ export class SandboxExecutionEngine {
    * cannot go through portfolio.closePosition() like the other two modes.
    */
   async closeLeg(leg: { securityId: string; exchangeSegment?: string; qty: number; side: 'BUY' | 'SELL'; instrument?: string }, price: number, correlationId: string = `unwind_${leg.securityId}_${Date.now()}`): Promise<{ status: string; orderId?: string }> {
-    const placed = await this.client.orders.place({
+    const placed = await this.client.orders.place(buildSandboxPlaceRequest({
       correlationId,
       securityId: String(leg.securityId),
-      exchangeSegment: (leg.exchangeSegment || 'NSE_FNO') as any,
+      exchangeSegment: leg.exchangeSegment || 'NSE_FNO',
       transactionType: leg.side === 'BUY' ? 'SELL' : 'BUY',
       orderType: 'MARKET',
       quantity: leg.qty,
       price,
       productType: 'INTRADAY',
-    }).catch(() => null);
+    })).catch(() => null);
     if (!placed) return { status: 'REJECTED' };
     const orderId = placed.data.orderId;
     const settled = await this.client.orders.getById(orderId).catch(() => placed.data);

@@ -154,6 +154,26 @@ describe('crossCheckJournalOnBoot', () => {
       appendSpy.mockRestore();
     }));
 
+    it('closes orphan intents when broker lookup throws in sandbox mode — does not block the day', () => withMode('sandbox', async () => {
+      const { risk } = setup();
+      jest.spyOn(risk, 'isKilled').mockReturnValue(false);
+      const alertSpy = jest.spyOn(db, 'pushAlert');
+      const appendSpy = jest.spyOn(journal, 'append');
+      const sandboxClient = stubClient();
+      jest.spyOn(sandboxClient.orders, 'getByCorrelationId').mockRejectedValue(new Error('404 not found'));
+
+      const entries: JournalEntry[] = [
+        entry(1, 'order_intent', { correlation_id: 'lookup_failed', mode: 'sandbox' }),
+      ];
+      await crossCheckJournalOnBoot(entries, risk, stubClient(), sandboxClient);
+
+      expect(appendSpy).toHaveBeenCalledWith('order_result', expect.objectContaining({
+        correlation_id: 'lookup_failed', status: 'REJECTED', mode: 'sandbox',
+      }));
+      expect(alertSpy).not.toHaveBeenCalledWith('ERROR', 'core', expect.stringContaining('lookup_failed'));
+      appendSpy.mockRestore();
+    }));
+
     it('alerts ERROR when there is an unresolved intent but no sandbox client to reconcile against', () => withMode('sandbox', async () => {
       const { risk } = setup();
       jest.spyOn(risk, 'isKilled').mockReturnValue(false);

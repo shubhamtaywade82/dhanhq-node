@@ -191,6 +191,7 @@ export interface AppState {
   marketTickAgeSec: number | null;
   llmMode: string;
   persistence: string;
+  tradingMode: 'paper' | 'sandbox' | 'live';
 }
 
 export type ToastType = 'success' | 'error' | 'warning';

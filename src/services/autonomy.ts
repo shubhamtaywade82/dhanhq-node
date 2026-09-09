@@ -74,6 +74,7 @@ export class AutonomyEngine {
   setScanner(scanner: AdaptiveSupertrendScanner): void {
     this.scanner = scanner;
     eventBus.log('SYSTEM', 'Adaptive Supertrend scanner armed (1m/5m, naked ATM CE/PE)', 'adaptive_supertrend');
+    void scanner.warmup();
   }
 
   setScanEnabled(on: boolean): void {

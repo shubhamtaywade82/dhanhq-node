@@ -254,7 +254,17 @@ export async function crossCheckJournalOnBoot(
           eventBus.log('SYSTEM', `Boot reconciliation: order ${id} resolved from broker as ${order.orderStatus}`, 'core');
         }
       } catch (e: any) {
-        problems.push(`unresolved order ${id} — broker lookup failed (${e.message})`);
+        if (mode === 'sandbox') {
+          journal.append('order_result', {
+            correlation_id: id,
+            status: 'REJECTED',
+            reason: `orphan_resolved_on_boot: broker lookup failed (${e.message})`,
+            mode,
+          });
+          eventBus.log('WARN', `Boot reconciliation: orphan intent ${id} closed as REJECTED (${e.message})`, 'core');
+        } else {
+          problems.push(`unresolved order ${id} — broker lookup failed (${e.message})`);
+        }
       }
     }
   }
@@ -276,8 +286,13 @@ export async function crossCheckJournalOnBoot(
     await pushAlert('WARN', 'core', msg);
   }
 
-  if (problems.length === 0 && (summary.lastKillAction === null || summary.lastKillAction === (risk.isKilled() ? 'arm' : 'disarm'))) {
-    eventBus.log('SYSTEM', `Boot cross-check: today's journal (${priorEntries.length} entries) agrees with current state`, 'core');
+  if (problems.length === 0) {
+    if (getSystemState() === 'DEGRADED') {
+      setSystemState('READY', 'Boot cross-check passed — no unresolved orders');
+    }
+    if (summary.lastKillAction === null || summary.lastKillAction === (risk.isKilled() ? 'arm' : 'disarm')) {
+      eventBus.log('SYSTEM', `Boot cross-check: today's journal (${priorEntries.length} entries) agrees with current state`, 'core');
+    }
   }
 }
 

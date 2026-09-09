@@ -101,6 +101,15 @@ export const api = {
       body: JSON.stringify({ symbol, ltp }),
     }),
 
+  closePosition: (symbol: string, ltp?: number) =>
+    request<any>('/api/portfolio/positions/close', {
+      method: 'POST',
+      body: JSON.stringify({ symbol, ltp }),
+    }),
+
+  closeAllPositions: () =>
+    request<any>('/api/portfolio/positions/close-all', { method: 'POST', body: JSON.stringify({}) }),
+
   resetPaperWallet: (initialBalance = 100000) =>
     request<any>('/api/portfolio/paper/wallet/reset', {
       method: 'POST',

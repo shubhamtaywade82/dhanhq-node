@@ -14,8 +14,122 @@ import { aggregatePortfolioGreeks } from '../services/optionsAnalytics';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { AgentOrchestrator } from '../services/agent';
 import type { PortfolioSource } from '../services/portfolioSource';
+import { marketClock } from '../services/marketHours';
+import { journal, type JournalEntry } from '../services/journal';
 
 const log = moduleLogger('portfolio');
+
+type OrderRow = ReturnType<typeof normalizeBrokerOrder>;
+
+function mapBrokerStatus(status: string): string {
+  if (status === 'TRANSIT') return 'PENDING';
+  return status;
+}
+
+/** Maps DhanHQ OrderResponse → the same row shape listPaperOrders()
+ * returns, so the frontend order book works in sandbox/live mode. */
+export function normalizeBrokerOrder(r: any) {
+  const timeRaw = r.createTime || r.updateTime;
+  let time = '—';
+  if (timeRaw) {
+    try {
+      const d = new Date(String(timeRaw).replace(' ', 'T') + '+05:30');
+      time = d.toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Kolkata' });
+    } catch {
+      time = String(timeRaw);
+    }
+  }
+  const qty = Number(r.quantity ?? 0);
+  const filled = Number(r.filledQty ?? 0);
+  const avg = Number(r.averageTradedPrice ?? 0);
+  return {
+    id: String(r.orderId ?? ''),
+    corr: String(r.correlationId ?? ''),
+    time,
+    instrument: String(r.tradingSymbol ?? ''),
+    type: String(r.orderType ?? 'MARKET'),
+    side: String(r.transactionType ?? ''),
+    qty,
+    price: Number(r.price ?? 0),
+    filled,
+    avg: avg > 0 ? avg : undefined,
+    charges: 0,
+    leg: String(r.legName || '—'),
+    status: mapBrokerStatus(String(r.orderStatus ?? 'UNKNOWN')),
+    jid: String(r.correlationId || r.orderId || ''),
+    latency: '—',
+    createdAt: timeRaw,
+    exchangeSegment: r.exchangeSegment,
+    reason: String(r.omsErrorDescription || ''),
+    source: 'broker',
+  };
+}
+
+function journalOrderRows(mode: 'sandbox' | 'live'): OrderRow[] {
+  const byCorr = new Map<string, { intent?: JournalEntry; result?: JournalEntry }>();
+  for (const e of journal.readTodayEntries()) {
+    const p = e.payload || {};
+    if (p.mode !== mode) continue;
+    const corr = String(p.correlation_id || '');
+    if (!corr) continue;
+    if (e.kind === 'order_intent') {
+      const row = byCorr.get(corr) || {};
+      row.intent = e;
+      byCorr.set(corr, row);
+    }
+    if (e.kind === 'order_result') {
+      const row = byCorr.get(corr) || {};
+      row.result = e;
+      byCorr.set(corr, row);
+    }
+  }
+
+  const rows: OrderRow[] = [];
+  for (const [corr, pair] of byCorr) {
+    const intent = pair.intent?.payload || {};
+    const result = pair.result?.payload || {};
+    const params = intent.params || {};
+    const ts = pair.result?.ts ?? pair.intent?.ts ?? Date.now();
+    rows.push({
+      id: String(result.order_id || pair.intent?.seq || corr),
+      corr,
+      time: new Date(ts).toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Kolkata' }),
+      instrument: String(result.symbol || params.symbol || params.security_id || '—'),
+      type: String(params.order_type || 'MARKET'),
+      side: String(params.transaction_type || result.transaction_type || ''),
+      qty: Number(params.quantity ?? result.quantity ?? 0),
+      price: Number(params.price ?? result.fill_price ?? 0),
+      filled: Number(result.quantity ?? 0),
+      avg: result.fill_price ? Number(result.fill_price) : undefined,
+      charges: 0,
+      leg: String(intent.intent_id || '—'),
+      status: mapBrokerStatus(String(result.status || 'PENDING')),
+      jid: corr,
+      latency: '—',
+      createdAt: new Date(ts).toISOString(),
+      exchangeSegment: params.exchange_segment,
+      reason: String(result.reason || ''),
+      source: 'journal',
+    });
+  }
+  return rows;
+}
+
+async function listBrokerOrders(client: DhanClient, mode: 'sandbox' | 'live' = 'live'): Promise<OrderRow[]> {
+  const raw = await client.orders.list().catch(() => []);
+  const today = marketClock().istDate;
+  const broker = (Array.isArray(raw) ? raw : [])
+    .filter((r) => !r.createTime || String(r.createTime).startsWith(today))
+    .map(normalizeBrokerOrder);
+
+  const merged = new Map<string, OrderRow>();
+  for (const row of broker) merged.set(row.corr || row.id, row);
+  for (const row of journalOrderRows(mode)) {
+    if (!merged.has(row.corr)) merged.set(row.corr, row);
+  }
+
+  return [...merged.values()].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+}
 
 export function portfolioRoutes(
   client: DhanClient,
@@ -40,7 +154,7 @@ export function portfolioRoutes(
           portfolio!.getPositions(),
           portfolio!.getWallet(),
           Promise.resolve([]),
-          brokerApiClient().orders.list().catch(() => []),
+          listBrokerOrders(brokerApiClient(), (process.env.TRADING_MODE || 'live') as 'sandbox' | 'live'),
         ]);
       const indices = market.getIndices();
       const spotMap: Record<string, number> = {};
@@ -80,7 +194,8 @@ export function portfolioRoutes(
       if (isLocalPaper() || req.query.mode === 'paper') {
         return res.json(await listPaperOrders());
       }
-      res.json(await brokerApiClient().orders.list());
+      const mode = ((process.env.TRADING_MODE || 'live') === 'sandbox' ? 'sandbox' : 'live') as 'sandbox' | 'live';
+      res.json(await listBrokerOrders(brokerApiClient(), mode));
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'orders' }, 'Orders fetch failed');
       res.json([]);
@@ -105,7 +220,8 @@ export function portfolioRoutes(
         const orders = await listPaperOrders();
         return res.json(orders.filter((o) => o.status === 'TRADED'));
       }
-      res.json(await brokerApiClient().orders.listTrades());
+      const trades = await brokerApiClient().orders.listTrades().catch(() => []);
+      res.json((Array.isArray(trades) ? trades : []).map(normalizeBrokerOrder));
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'trades' }, 'Trades fetch failed');
       res.json([]);
@@ -168,6 +284,34 @@ export function portfolioRoutes(
     }
   });
 
+  router.post('/positions/close', async (req, res) => {
+    try {
+      if (isLocalPaper()) {
+        return res.status(400).json({ error: 'Broker close is not available in paper mode — use /paper/positions/close' });
+      }
+      const { symbol, ltp } = req.body;
+      if (!symbol) return res.status(400).json({ error: 'symbol is required' });
+      const liveLtp = market.getLtp(String((await portfolio!.getPositions()).find((p: any) => p.tradingSymbol === String(symbol).toUpperCase())?.securityId ?? ''));
+      const result = await portfolio!.closePosition(String(symbol), liveLtp || (ltp ? Number(ltp) : undefined));
+      if (result.status === 'REJECTED') return res.status(422).json({ error: result.reason || 'Close rejected' });
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.post('/positions/close-all', async (req, res) => {
+    try {
+      if (isLocalPaper()) {
+        return res.status(400).json({ error: 'Broker close-all is not available in paper mode' });
+      }
+      const results = await portfolio!.closeAll((secId) => market.getLtp(secId));
+      res.json({ results });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   router.post('/paper/positions/close', async (req, res) => {
     try {
       const { symbol, ltp } = req.body;
@@ -196,6 +340,7 @@ export function portfolioRoutes(
 
   router.get('/strategies', async (_req, res) => {
     try {
+      if (!isLocalPaper()) return res.json([]);
       const strategies = await listPaperStrategies();
       const positions = await listPaperPositions();
       const posMap = new Map(positions.map((p) => [p.tradingSymbol, p]));

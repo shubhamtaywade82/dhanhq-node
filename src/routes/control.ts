@@ -101,9 +101,6 @@ export function controlRoutes(
   router.post('/reconcile-boot', async (_req, res) => {
     try {
       await crossCheckJournalOnBoot(journal.readTodayEntries(), risk, client, sandboxClient);
-      if (getSystemState() === 'DEGRADED') {
-        setSystemState('READY', 'Boot reconcile cleared — no remaining blockers');
-      }
       journal.append('control_command', { route: 'POST /reconcile-boot', systemState: getSystemState() });
       res.json({ status: 'ok', systemState: getSystemState() });
     } catch (e: any) {

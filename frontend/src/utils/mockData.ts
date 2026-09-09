@@ -18,6 +18,7 @@ export const initialAppState: AppState = {
   marketTickAgeSec: null,
   llmMode: 'deterministic',
   persistence: 'unknown',
+  tradingMode: 'paper',
   strategies: [],
   recentFills: [],
   orders: [],

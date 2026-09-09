@@ -34,6 +34,14 @@ function rawPosition(overrides: Record<string, any> = {}) {
 }
 
 describe('BrokerPortfolioSource', () => {
+  const priorMode = process.env.TRADING_MODE;
+
+  beforeEach(() => { process.env.TRADING_MODE = 'live'; });
+  afterAll(() => {
+    if (priorMode === undefined) delete process.env.TRADING_MODE;
+    else process.env.TRADING_MODE = priorMode;
+  });
+
   it('maps DhanHQ PositionResponse fields into NormalizedPosition, including strike/optionType from drv fields', async () => {
     const client = stubClient({ positions: [rawPosition()] });
     const src = new BrokerPortfolioSource(client, 60_000);
@@ -262,7 +270,6 @@ describe('BrokerPortfolioSource', () => {
   });
 
   it('tags sandbox journal rows when TRADING_MODE=sandbox', async () => {
-    const prior = process.env.TRADING_MODE;
     process.env.TRADING_MODE = 'sandbox';
     const { journal } = await import('../services/journal');
     const appendSpy = jest.spyOn(journal, 'append');
@@ -273,10 +280,10 @@ describe('BrokerPortfolioSource', () => {
       await src.closePosition('NIFTY25JAN24000CE');
       const intent = appendSpy.mock.calls.find((c) => c[0] === 'order_intent');
       expect(intent?.[1]).toMatchObject({ mode: 'sandbox' });
+      expect(place).toHaveBeenCalledWith(expect.objectContaining({ orderType: 'LIMIT', price: 105 }));
     } finally {
       appendSpy.mockRestore();
-      if (prior === undefined) delete process.env.TRADING_MODE;
-      else process.env.TRADING_MODE = prior;
+      process.env.TRADING_MODE = 'live';
     }
   });
 

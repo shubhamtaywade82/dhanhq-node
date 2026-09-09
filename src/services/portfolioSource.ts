@@ -8,6 +8,7 @@ import {
   closePaperPosition, closeAllPaperPositions, getTodayOrderStats as getPaperTodayOrderStats,
 } from '../db';
 import { marketClock } from './marketHours';
+import { buildSandboxPlaceRequest, roundToTick } from './sandboxInstruments';
 
 /**
  * Normalizes RiskEngine's and AutonomyEngine's view of "the account" across
@@ -434,16 +435,18 @@ export class BrokerPortfolioSource implements PortfolioSource {
     });
 
     try {
-      const placed: any = await this.client.orders.place({
-        correlationId,
-        securityId: pos.securityId,
-        exchangeSegment: pos.exchangeSegment as any,
-        transactionType: transactionType as any,
-        orderType: 'MARKET' as any,
-        quantity: qty,
-        price: 0,
-        productType: pos.productType as any,
-      });
+      const limitPrice = roundToTick(pos.ltp || 0, 5);
+      const placeReq = mode === 'sandbox'
+        ? buildSandboxPlaceRequest({
+          correlationId, securityId: pos.securityId, exchangeSegment: pos.exchangeSegment,
+          transactionType, orderType: 'MARKET', quantity: qty, price: limitPrice, productType: pos.productType,
+        })
+        : {
+          correlationId, securityId: pos.securityId, exchangeSegment: pos.exchangeSegment as any,
+          transactionType: transactionType as any, orderType: 'MARKET' as any, quantity: qty, price: 0,
+          productType: pos.productType as any,
+        };
+      const placed: any = await this.client.orders.place(placeReq);
       const orderId = placed?.data?.orderId ?? placed?.orderId;
       const settled: any = orderId ? await this.client.orders.getById(orderId).catch(() => placed?.data ?? placed) : placed?.data ?? placed;
       const fillPrice = Number(settled?.averagePrice ?? settled?.price ?? 0) || undefined;
