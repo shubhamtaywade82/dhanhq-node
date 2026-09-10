@@ -952,12 +952,7 @@ export class AgentOrchestrator {
 
     const deployResult = await deployMultiLeg(engine, strat, runId, this.market, this.risk);
     if (deployResult.status === 'TRADED') {
-      // Only paper mode persists a strategy record here — live/sandbox
-      // orders already live at the broker's own order book, matching the
-      // behavior this replaces (neither previously called createPaperStrategy).
-      if (engine === this.paper) {
-        await createPaperStrategy({ id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots, legs: strat.legs });
-      }
+      await createPaperStrategy({ id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots, legs: strat.legs });
       this.step(runId, 'execution', 'ACT', `Strategy deployed: ${strat.name} (${deployResult.legsFilled}/${strat.legs.length} legs filled)`);
     } else {
       this.step(runId, 'execution', 'ACT', `Strategy ${strat.name} deployment failed: ${deployResult.reason || 'rejected'}`);

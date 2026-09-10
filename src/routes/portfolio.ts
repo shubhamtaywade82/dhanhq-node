@@ -340,17 +340,20 @@ export function portfolioRoutes(
 
   router.get('/strategies', async (_req, res) => {
     try {
-      if (!isLocalPaper()) return res.json([]);
       const strategies = await listPaperStrategies();
-      const positions = await listPaperPositions();
-      const posMap = new Map(positions.map((p) => [p.tradingSymbol, p]));
+      const positions = isLocalPaper()
+        ? await listPaperPositions()
+        : (portfolio ? await portfolio.getPositions() : []);
+      const posBySymbol = new Map(positions.map((p) => [p.tradingSymbol, p]));
+      const posBySecId = new Map(positions.filter((p) => p.securityId).map((p) => [String(p.securityId), p]));
 
       const enriched = strategies.map((s) => {
         let totalPnl = 0;
         const legs = (s.legs || []).map((l: any) => {
-          const p = posMap.get(l.instrument);
-          const ltp = p ? p.ltp : l.ltp || l.price || 0;
-          const pnl = p ? p.pnl : 0;
+          const p = posBySymbol.get(l.instrument) || (l.securityId ? posBySecId.get(String(l.securityId)) : undefined);
+          const liveLtp = l.securityId ? market.getLtp(String(l.securityId)) : 0;
+          const ltp = p?.ltp || liveLtp || l.ltp || l.price || 0;
+          const pnl = p?.pnl ?? 0;
           totalPnl += pnl;
           return { ...l, ltp, pnl };
         });
@@ -555,11 +558,17 @@ export function portfolioRoutes(
       if (strat) {
         // updatePaperStrategyStatus('STOPPED') below reverses any
         // hedge-margin credit exactly once — don't duplicate it here.
+        const positions = isLocalPaper()
+          ? await listPaperPositions()
+          : (portfolio ? await portfolio.getPositions() : []);
         for (const leg of strat.legs) {
-          const positions = await listPaperPositions();
-          const pos = positions.find((p) => p.tradingSymbol === leg.instrument);
+          const pos = positions.find((p) => p.tradingSymbol === leg.instrument || (leg.securityId && String(p.securityId) === String(leg.securityId)));
           const ltp = pos ? market.getLtp(String(pos.securityId)) || pos.ltp : undefined;
-          await closePaperPosition(leg.instrument, ltp);
+          if (isLocalPaper()) {
+            await closePaperPosition(leg.instrument, ltp);
+          } else if (portfolio) {
+            await portfolio.closePosition(pos?.tradingSymbol || leg.instrument, ltp);
+          }
           if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         }
         await updatePaperStrategyStatus(id, 'STOPPED');

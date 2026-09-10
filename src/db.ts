@@ -444,12 +444,19 @@ export async function updatePaperStrategyStatus(id: string, status: string) {
  * `openPositions` is caller-supplied (paper ledger or the live/broker
  * PortfolioSource — whichever this exit path actually reads) rather than
  * fetched here, so this stays agnostic to which one applies. */
-export async function closeParentStrategyIfFlat(tradingSymbol: string, openPositions: Array<{ tradingSymbol: string; netQty: number }>): Promise<void> {
+export async function closeParentStrategyIfFlat(tradingSymbol: string, openPositions: Array<{ tradingSymbol: string; netQty: number; securityId?: string }>): Promise<void> {
   const strategies = await listPaperStrategies();
-  const strat = strategies.find((s: any) => s.status === 'RUNNING' && (s.legs || []).some((l: any) => l.instrument === tradingSymbol));
-  if (!strat) return;
+  const secMap = new Map(openPositions.filter((p) => p.securityId).map((p) => [String(p.securityId), p]));
   const posMap = new Map(openPositions.map((p) => [p.tradingSymbol, p]));
-  const stillOpen = (strat.legs || []).some((l: any) => Number(posMap.get(l.instrument)?.netQty || 0) !== 0);
+  const strat = strategies.find((s: any) =>
+    s.status === 'RUNNING' &&
+    (s.legs || []).some((l: any) => l.instrument === tradingSymbol || (l.securityId && secMap.get(String(l.securityId))?.tradingSymbol === tradingSymbol)),
+  );
+  if (!strat) return;
+  const stillOpen = (strat.legs || []).some((l: any) => {
+    const p = posMap.get(l.instrument) || (l.securityId ? secMap.get(String(l.securityId)) : undefined);
+    return Number(p?.netQty || 0) !== 0;
+  });
   if (!stillOpen) await updatePaperStrategyStatus(strat.id, 'STOPPED');
 }
 

@@ -11,6 +11,16 @@ function dhanErrorDetail(e: any): string {
   return [e.errorCode, e.errorType, e.errorMessage].filter(Boolean).join(' | ');
 }
 
+function parseCircuitClamp(desc: string | undefined, price: number, tickSize: number): number | null {
+  if (!desc) return null;
+  const m = desc.match(/Circuit Limits of ([\d.]+) to ([\d.]+)/i);
+  if (!m) return null;
+  const min = Number(m[1]), max = Number(m[2]);
+  if (!(max > 0)) return null;
+  const clamped = roundToTick(Math.min(max, Math.max(min, price)), tickSize);
+  return clamped !== price ? clamped : null;
+}
+
 /**
  * Sandbox execution engine — places orders through DhanHQ's real Sandbox
  * API (paper trading, flat ₹100 fills, no order-update WebSocket).
@@ -105,23 +115,59 @@ export class SandboxExecutionEngine {
         productType: params.product_type || 'INTRADAY',
       }));
 
-      const orderId = placed.data.orderId;
-      const settled = await this.client.orders.getById(orderId).catch(() => placed.data);
+      let orderId = String(placed?.data?.orderId || (placed as any)?.orderId || '');
+      let settledRaw = await this.client.orders.getById(orderId).catch(() => placed?.data);
+      let settled = Array.isArray(settledRaw) ? settledRaw[0] : (settledRaw?.data || settledRaw);
+
+      // Auto-retry once if sandbox contract rejected due to synthetic circuit limits
+      const circuitPrice = parseCircuitClamp(settled?.omsErrorDescription, limitPrice, leg.tickSize);
+      if (settled?.orderStatus === 'REJECTED' && circuitPrice != null) {
+        eventBus.log('INFO', `Retrying sandbox order ${correlation_id} @ ₹${circuitPrice} inside circuit limits`, 'sandbox_engine');
+        const retry = await this.client.orders.place(buildSandboxPlaceRequest({
+          correlationId: `${correlation_id.slice(0, 23)}_r`,
+          securityId: secId,
+          exchangeSegment: seg,
+          transactionType: transaction_type,
+          orderType: order_type,
+          quantity: qty,
+          price: circuitPrice,
+          productType: params.product_type || 'INTRADAY',
+        })).catch(() => null);
+        if (retry?.data?.orderId) {
+          orderId = retry.data.orderId;
+          limitPrice = circuitPrice;
+          const retryRaw = await this.client.orders.getById(orderId).catch(() => retry.data);
+          settled = Array.isArray(retryRaw) ? retryRaw[0] : (retryRaw?.data || retryRaw);
+        }
+      }
+
+      const orderStatus = String(settled?.orderStatus || 'TRADED');
+      if (orderStatus === 'REJECTED' || orderStatus === 'CANCELLED') {
+        const reason = settled?.omsErrorDescription || `Sandbox order ${orderStatus.toLowerCase()}`;
+        journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox', order_id: orderId });
+        this.risk.getPortfolio().recordOrderOutcome({ status: 'REJECTED' });
+        eventBus.log('WARN', `Sandbox order ${orderId} REJECTED: ${reason}`, 'sandbox_engine');
+        return { status: 'REJECTED', reason, orderId };
+      }
+
+      const avgTraded = Number(settled?.averageTradedPrice ?? settled?.averagePrice ?? 0);
+      const fillPrice = avgTraded > 0 ? avgTraded : limitPrice;
+      const filledQty = Number(settled?.filledQty ?? qty);
 
       const fillPayload = {
         intent_id,
         correlation_id,
         mode: 'sandbox' as const,
         is_paper: false,
-        fill_price: (settled as any).averagePrice ?? limitPrice,
-        quantity: (settled as any).filledQty ?? qty,
+        fill_price: fillPrice,
+        quantity: filledQty > 0 ? filledQty : qty,
         security_id: secId,
         order_id: orderId,
         filled_at: new Date().toISOString(),
       };
 
       eventBus.emit('order', { kind: 'fill', ...fillPayload });
-      journal.append('order_result', { status: (settled as any).orderStatus || 'TRADED', ...fillPayload });
+      journal.append('order_result', { status: orderStatus, ...fillPayload });
 
       this.risk.getPortfolio().recordOrderOutcome({ status: 'TRADED' });
       this.risk.getPortfolio().invalidate();
@@ -133,8 +179,8 @@ export class SandboxExecutionEngine {
         transactionType: transaction_type,
         orderType: order_type,
         productType: params.product_type || 'INTRADAY',
-        quantity: (settled as any).filledQty ?? qty,
-        price: (settled as any).averagePrice ?? limitPrice,
+        quantity: filledQty > 0 ? filledQty : qty,
+        price: fillPrice,
         correlationId: correlation_id.slice(0, 25),
         stopLoss: risk_limits?.stop_loss,
         target: risk_limits?.target,
@@ -142,12 +188,11 @@ export class SandboxExecutionEngine {
       }, async () => 0).catch(() => {});
 
       if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {
-        const filledQty = (settled as any).filledQty ?? qty;
         this.market.monitor.track({
           securityId: secId,
           exchangeSegment: seg,
           quantity: transaction_type === 'SELL' ? -filledQty : filledQty,
-          entryPrice: (settled as any).averagePrice ?? limitPrice,
+          entryPrice: fillPrice,
           stopLoss: risk_limits.stop_loss,
           target: risk_limits.target,
           trail: toTrailConfig(risk_limits.trailing_stop),
@@ -155,7 +200,7 @@ export class SandboxExecutionEngine {
       }
 
       this.market.addInstruments([{ securityId: secId, exchangeSegment: seg }]);
-      return { status: (settled as any).orderStatus || 'TRADED', orderId, ...fillPayload };
+      return { status: orderStatus, orderId, ...fillPayload };
     } catch (e: any) {
       const detail = dhanErrorDetail(e);
       const reason = detail ? `${e.message} (${detail})` : e.message;
@@ -188,8 +233,9 @@ export class SandboxExecutionEngine {
     })).catch(() => null);
     if (!placed) return { status: 'REJECTED' };
     const orderId = placed.data.orderId;
-    const settled = await this.client.orders.getById(orderId).catch(() => placed.data);
+    const settledRaw = await this.client.orders.getById(orderId).catch(() => placed.data);
+    const settled = Array.isArray(settledRaw) ? settledRaw[0] : (settledRaw?.data || settledRaw);
     await closePaperPosition(leg.instrument || leg.securityId, price, async () => 0, 'EXIT').catch(() => {});
-    return { status: (settled as any).orderStatus || 'TRADED', orderId };
+    return { status: settled?.orderStatus || 'TRADED', orderId };
   }
 }
