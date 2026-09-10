@@ -340,8 +340,9 @@ export class AdaptiveSupertrendScanner {
     // against (falls back to the leg's chain-snapshot price otherwise).
     this.market.addInstruments([{ securityId: leg.securityId, exchangeSegment: leg.exchangeSegment }]);
 
+    const corrId = `ast_${Date.now().toString(36)}_${leg.optionType}${leg.strike}`.slice(0, 25);
     const result: any = await this.engine.placeOrder({
-      correlation_id: `${strat.id}_${leg.optionType}_${leg.strike}`,
+      correlation_id: corrId,
       intent_id: `adaptive_supertrend_${symbol}`,
       params: {
         security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,

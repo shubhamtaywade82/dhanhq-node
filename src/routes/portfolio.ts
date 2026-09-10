@@ -153,7 +153,7 @@ export function portfolioRoutes(
         : await Promise.all([
           portfolio!.getPositions(),
           portfolio!.getWallet(),
-          Promise.resolve([]),
+          listPaperStrategies(),
           listBrokerOrders(brokerApiClient(), (process.env.TRADING_MODE || 'live') as 'sandbox' | 'live'),
         ]);
       const indices = market.getIndices();

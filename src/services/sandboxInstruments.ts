@@ -93,8 +93,9 @@ export function buildSandboxPlaceRequest(input: {
   }
   const orderType = asLimit ? 'LIMIT' : input.orderType;
   const price = orderType === 'MARKET' ? 0 : input.price;
+  const correlationId = input.correlationId ? String(input.correlationId).slice(0, 25) : undefined;
   return {
-    correlationId: input.correlationId,
+    correlationId,
     securityId: String(input.securityId),
     exchangeSegment: input.exchangeSegment as any,
     transactionType: input.transactionType as any,

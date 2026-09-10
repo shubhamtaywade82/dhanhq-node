@@ -143,7 +143,7 @@ export class LongOptionPositionManager {
           : await executePaperOrder({
               symbol: pos.tradingSymbol, securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment,
               transactionType: 'SELL', orderType: 'MARKET', productType: pos.productType, quantity: qty, price: bid,
-              correlationId: `long_policy_${pos.tradingSymbol}_${Date.now()}`,
+              correlationId: `lop_${pos.securityId}_${Date.now().toString(36)}`.slice(0, 25),
             }, defaultMarginResolver);
         if (result.status !== 'TRADED') return;
       }

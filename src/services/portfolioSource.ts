@@ -349,6 +349,9 @@ export class BrokerPortfolioSource implements PortfolioSource {
 
   async getPositions(): Promise<NormalizedPosition[]> {
     await this.ensureFresh();
+    if (this.brokerMode() === 'sandbox' && this.cachedPositions.length === 0) {
+      return listPaperPositions() as unknown as Promise<NormalizedPosition[]>;
+    }
     return this.cachedPositions;
   }
 
@@ -398,21 +401,25 @@ export class BrokerPortfolioSource implements PortfolioSource {
     if (outcome.status === 'REJECTED') this.orderRejected++;
   }
 
-  async markToMarket(_ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }> {
-    // The account's own unrealizedProfit is already computed server-side
-    // from real market prices, so there is no local tick-based math to do
-    // here (unlike paper mode, where nothing else prices the position).
-    // Respects the normal poll TTL rather than forcing — this is called on
-    // EVERY tick via AutonomyEngine.scheduleTickMark(), and a forced poll
-    // here would hammer positions.list()/funds.getLimit() on every tick
-    // instead of at most once per pollIntervalMs.
+  async markToMarket(ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }> {
+    if (this.brokerMode() === 'sandbox') {
+      await this.ensureFresh();
+      const mark = await markPositionsToMarket(ltpResolver);
+      if (this.cachedPositions.length === 0) {
+        this.cachedPositions = (await listPaperPositions()) as unknown as NormalizedPosition[];
+      }
+      this.cachedWallet.unrealizedPnl = mark.totalUnrealized;
+      this.cachedWallet.equity = Number((this.cachedWallet.totalBalance + mark.totalUnrealized).toFixed(2));
+      return mark;
+    }
     await this.ensureFresh();
     return { totalUnrealized: this.cachedWallet.unrealizedPnl, staleCount: this.degraded ? this.cachedPositions.length : 0 };
   }
 
-  private findOpenPosition(symbol: string): NormalizedPosition | undefined {
+  private async findOpenPosition(symbol: string): Promise<NormalizedPosition | undefined> {
     const sym = symbol.toUpperCase();
-    return this.cachedPositions.find((p) => p.tradingSymbol === sym && p.netQty !== 0);
+    const positions = await this.getPositions();
+    return positions.find((p) => p.tradingSymbol === sym && p.netQty !== 0);
   }
 
   /** Places a REAL reversing MARKET order — no priceHint/kind: a market
@@ -426,7 +433,7 @@ export class BrokerPortfolioSource implements PortfolioSource {
   private async reversePosition(pos: NormalizedPosition, reason: string, quantity?: number): Promise<CloseResult> {
     const transactionType = pos.netQty > 0 ? 'SELL' : 'BUY';
     const qty = Math.min(quantity ?? Math.abs(pos.netQty), Math.abs(pos.netQty));
-    const correlationId = `close_${pos.tradingSymbol}_${Date.now()}`;
+    const correlationId = `c_${pos.securityId || pos.tradingSymbol}_${Date.now().toString(36)}`.slice(0, 25);
     const mode = this.brokerMode();
 
     journal.append('order_intent', {
@@ -462,6 +469,10 @@ export class BrokerPortfolioSource implements PortfolioSource {
       journal.append('order_result', { status: 'TRADED', ...fillPayload });
       redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
+      if (mode === 'sandbox') {
+        await closePaperPosition(pos.tradingSymbol, limitPrice, async () => 0, 'EXIT').catch(() => {});
+      }
+
       this.invalidate();
       return { status: 'TRADED', symbol: pos.tradingSymbol, orderId, fillPrice };
     } catch (e: any) {
@@ -472,14 +483,8 @@ export class BrokerPortfolioSource implements PortfolioSource {
   }
 
   async closePosition(symbol: string, _priceHint?: number, _kind?: FillKind, quantity?: number): Promise<CloseResult> {
-    // Forced, not cache-respecting: this is a deliberate, rare exit
-    // decision, not a per-tick read. A cache-respecting read (ensureFresh())
-    // would return 'noop' for a position opened within the last
-    // pollIntervalMs — the real broker position stays open, now with no
-    // caller retrying the close and, if it was untracked in the same
-    // motion, no stop-loss either.
     await this.ensureFresh(true);
-    const pos = this.findOpenPosition(symbol);
+    const pos = await this.findOpenPosition(symbol);
     if (!pos) return { status: 'noop', reason: 'No open position found', symbol };
     return this.reversePosition(pos, 'manual close', quantity);
   }

@@ -53,7 +53,7 @@ export class LiveExecutionEngine {
     const settled = this.tracker.waitFor(correlation_id, { timeoutMs: 30000 });
 
     await this.client.orders.place({
-      correlationId: correlation_id,
+      correlationId: correlation_id ? String(correlation_id).slice(0, 25) : undefined,
       securityId: String(security_id),
       exchangeSegment: exchange_segment,
       transactionType: transaction_type,

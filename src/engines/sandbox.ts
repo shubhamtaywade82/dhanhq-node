@@ -5,6 +5,7 @@ import type { MarketDataService } from '../services/marketData';
 import { toTrailConfig } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 import { buildSandboxPlaceRequest, resolveSandboxOptionLeg, roundToTick } from '../services/sandboxInstruments';
+import { executePaperOrder, closePaperPosition } from '../db';
 
 function dhanErrorDetail(e: any): string {
   return [e.errorCode, e.errorType, e.errorMessage].filter(Boolean).join(' | ');
@@ -125,6 +126,21 @@ export class SandboxExecutionEngine {
       this.risk.getPortfolio().recordOrderOutcome({ status: 'TRADED' });
       this.risk.getPortfolio().invalidate();
 
+      await executePaperOrder({
+        symbol: sandboxContract || params.symbol || secId,
+        securityId: secId,
+        exchangeSegment: seg,
+        transactionType: transaction_type,
+        orderType: order_type,
+        productType: params.product_type || 'INTRADAY',
+        quantity: (settled as any).filledQty ?? qty,
+        price: (settled as any).averagePrice ?? limitPrice,
+        correlationId: correlation_id.slice(0, 25),
+        stopLoss: risk_limits?.stop_loss,
+        target: risk_limits?.target,
+        trailingStop: risk_limits?.trailing_stop,
+      }, async () => 0).catch(() => {});
+
       if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {
         const filledQty = (settled as any).filledQty ?? qty;
         this.market.monitor.track({
@@ -159,7 +175,7 @@ export class SandboxExecutionEngine {
    * Dhan Sandbox account — never in PortfolioSource — so unwinding here
    * cannot go through portfolio.closePosition() like the other two modes.
    */
-  async closeLeg(leg: { securityId: string; exchangeSegment?: string; qty: number; side: 'BUY' | 'SELL'; instrument?: string }, price: number, correlationId: string = `unwind_${leg.securityId}_${Date.now()}`): Promise<{ status: string; orderId?: string }> {
+  async closeLeg(leg: { securityId: string; exchangeSegment?: string; qty: number; side: 'BUY' | 'SELL'; instrument?: string }, price: number, correlationId: string = `u_${leg.securityId}_${Date.now().toString(36)}`.slice(0, 25)): Promise<{ status: string; orderId?: string }> {
     const placed = await this.client.orders.place(buildSandboxPlaceRequest({
       correlationId,
       securityId: String(leg.securityId),
@@ -173,6 +189,7 @@ export class SandboxExecutionEngine {
     if (!placed) return { status: 'REJECTED' };
     const orderId = placed.data.orderId;
     const settled = await this.client.orders.getById(orderId).catch(() => placed.data);
+    await closePaperPosition(leg.instrument || leg.securityId, price, async () => 0, 'EXIT').catch(() => {});
     return { status: (settled as any).orderStatus || 'TRADED', orderId };
   }
 }
