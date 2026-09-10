@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { shouldEmitBusLog, type BusLogLevel } from '../lib/logPolicy';
 
 /**
  * Central event bus. Every backend service (market data, risk engine,
@@ -132,7 +133,8 @@ export class EventBus {
     return merged.map((item) => item.env);
   }
 
-  log(level: 'INFO' | 'WARN' | 'ERROR' | 'SYSTEM' | 'TRADE', message: string, source: string): void {
+  log(level: BusLogLevel, message: string, source: string): void {
+    if (!shouldEmitBusLog(level, source, message)) return;
     this.emit('log', {
       level, message, source,
       reqId: `req_${Math.random().toString(36).slice(2, 8)}`,

@@ -35,7 +35,7 @@ fs.mkdirSync(LOG_DIR, { recursive: true });
 const logFile = path.join(LOG_DIR, `${new Date().toISOString().slice(0, 10)}.jsonl`);
 
 const options: LoggerOptions = {
-  level: process.env.LOG_LEVEL ?? (isDev ? 'debug' : 'info'),
+  level: process.env.LOG_LEVEL ?? 'info',
   base: {
     service: process.env.SERVICE_NAME ?? 'dhanhq-node',
     env: process.env.NODE_ENV ?? 'development',

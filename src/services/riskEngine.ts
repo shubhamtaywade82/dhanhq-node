@@ -1,4 +1,5 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
+import { logger } from '../lib/logger';
 import { eventBus } from './eventBus';
 import { journal } from './journal';
 import { marketClock } from './marketHours';
@@ -12,6 +13,8 @@ import {
   pushAlert, getRiskState, saveRiskState,
   listPaperStrategies, updatePaperStrategyStatus,
 } from '../db';
+
+const riskLog = logger.child({ module: 'risk_engine' });
 
 /**
  * Risk engine — computes circuit breakers from REAL account state
@@ -85,6 +88,7 @@ export class RiskEngine {
   private lastEvalAt = 0;
   private tickEvalScheduled = false;
   private lastRiskEmitAt = 0;
+  private evalInFlight: Promise<CircuitBreakerRow[]> | null = null;
 
   constructor(client: DhanClient, market: MarketDataService, portfolio: PortfolioSource = new PaperPortfolioSource()) {
     this.client = client;
@@ -138,7 +142,7 @@ export class RiskEngine {
   async setLimits(patch: Partial<RiskLimits>): Promise<RiskLimits> {
     this.limits = { ...this.limits, ...patch };
     await saveRiskState({ killed: this.killed, killedReason: this.killedReason, killedDate: this.killedDate, limits: this.limits });
-    eventBus.log('INFO', `Risk limits updated: ${JSON.stringify(this.limits)}`, 'risk_engine');
+    riskLog.debug({ limits: this.limits }, 'Risk limits updated');
     return this.getLimits();
   }
 
@@ -345,6 +349,16 @@ export class RiskEngine {
   }
 
   async evaluate(): Promise<CircuitBreakerRow[]> {
+    if (this.evalInFlight) return this.evalInFlight;
+    this.evalInFlight = this.runEvaluate();
+    try {
+      return await this.evalInFlight;
+    } finally {
+      this.evalInFlight = null;
+    }
+  }
+
+  private async runEvaluate(): Promise<CircuitBreakerRow[]> {
     this.lastEvalAt = Date.now();
     const [wallet, positions, orderStats, strategies] = await Promise.all([
       this.portfolio.getWallet(), this.portfolio.getPositions(), this.portfolio.getTodayOrderStats(), listPaperStrategies(),
@@ -428,23 +442,23 @@ export class RiskEngine {
       },
     ];
 
-    // Alert on state transitions (avoid alert storms: only on change, debounced 60s).
+    // Alert on state transitions only — one alert per rule+target state.
     const now = Date.now();
+    const nextBreakers = rows;
     for (const row of rows) {
       const prev = this.lastBreakers.find((b) => b.rule === row.rule);
-      if (prev && prev.state !== row.state && row.state !== 'OK') {
-        const lastAlert = this.lastAlertTimes.get(row.rule) || 0;
-        if (now - lastAlert >= 60_000 || prev.state === 'OK') {
-          this.lastAlertTimes.set(row.rule, now);
-          const level = row.state === 'ERROR' ? 'ERROR' : 'WARN';
-          await pushAlert(level, 'risk_engine', `${row.rule}: ${prev.state} → ${row.state} (current ${row.current}, threshold ${row.threshold}). Action: ${row.action}`);
-          eventBus.emit('alert', { level, source: 'risk_engine', msg: `${row.rule} tripped — ${row.current} vs ${row.threshold}` });
-          journal.append('risk_decision', { rule: row.rule, from: prev.state, to: row.state, current: row.current, threshold: row.threshold, action: row.action });
-        }
-      }
+      if (!prev || prev.state === row.state || row.state === 'OK') continue;
+      const alertKey = `${row.rule}:${row.state}`;
+      const lastAlert = this.lastAlertTimes.get(alertKey) || 0;
+      if (now - lastAlert < 60_000) continue;
+      this.lastAlertTimes.set(alertKey, now);
+      const level = row.state === 'ERROR' ? 'ERROR' : 'WARN';
+      await pushAlert(level, 'risk_engine', `${row.rule}: ${prev.state} → ${row.state} (current ${row.current}, threshold ${row.threshold}). Action: ${row.action}`);
+      eventBus.emit('alert', { level, source: 'risk_engine', msg: `${row.rule} tripped — ${row.current} vs ${row.threshold}` });
+      journal.append('risk_decision', { rule: row.rule, from: prev.state, to: row.state, current: row.current, threshold: row.threshold, action: row.action });
     }
 
-    this.lastBreakers = rows;
+    this.lastBreakers = nextBreakers;
 
     // Hard breakers arm the kill switch autonomously.
     if (!this.killed) {

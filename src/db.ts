@@ -1,6 +1,7 @@
 import { Pool } from 'pg';
 import type { InstrumentKey } from './lib/instrumentKey';
 import { moduleLogger } from './lib/logger';
+import { shouldEmitAlert } from './lib/logPolicy';
 import { marketClock } from './services/marketHours';
 import { eventBus } from './services/eventBus';
 import { journal } from './services/journal';
@@ -193,6 +194,7 @@ async function warmMemCache(): Promise<void> {
 
 // ── alerts ──────────────────────────────────────────────────────────────
 export async function pushAlert(level: 'INFO' | 'WARN' | 'ERROR', source: string, message: string) {
+  if (!shouldEmitAlert(level, source, message)) return;
   if (mode === 'postgres') {
     try {
       await pool.query('INSERT INTO alerts (level, source, message) VALUES ($1, $2, $3)', [level, source, message]);

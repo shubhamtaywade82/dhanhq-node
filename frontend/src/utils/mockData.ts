@@ -50,5 +50,5 @@ export const initialAppState: AppState = {
   alertIdCounter: 0,
   pnlHistory: [],
   rateLimitHistory: [],
-  logFilter: 'all',
+  logFilter: 'important',
 };

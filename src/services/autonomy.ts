@@ -14,6 +14,7 @@ import {
   reconcileLedger, correctLedgerFromPostgres, closeParentStrategyIfFlat,
 } from '../db';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
+import { shouldEmitKeyedLog } from '../lib/logPolicy';
 
 /**
  * Autonomy engine — the heartbeat that keeps the system trading when no
@@ -263,8 +264,10 @@ export class AutonomyEngine {
       const key = `${t.exchangeSegment}:${t.securityId}`;
       if (open.has(key)) continue;
       this.market.monitor.untrack(t.exchangeSegment, t.securityId);
-      eventBus.log('WARN', `Reconciler: untracked stale monitor entry ${key} — no matching open position`, 'autonomy');
-      await pushAlert('WARN', 'autonomy', `Monitor/position drift corrected: untracked stale entry ${key}`);
+      if (shouldEmitKeyedLog(`reconcile:untrack:${key}`, 300_000)) {
+        eventBus.log('WARN', `Reconciler: untracked stale monitor entry ${key} — no matching open position`, 'autonomy');
+        await pushAlert('WARN', 'autonomy', `Monitor/position drift corrected: untracked stale entry ${key}`);
+      }
     }
 
     // Re-check after untracking above rather than reusing `tracked` — keeps
@@ -284,8 +287,10 @@ export class AutonomyEngine {
         target: p.target ?? undefined,
         trail: toTrailConfig(p.trailingStop),
       });
-      eventBus.log('WARN', `Reconciler: re-armed missing protection for ${key}`, 'autonomy');
-      await pushAlert('WARN', 'autonomy', `Monitor/position drift corrected: re-armed protection for ${key}`);
+      if (shouldEmitKeyedLog(`reconcile:rearm:${key}`, 300_000)) {
+        eventBus.log('WARN', `Reconciler: re-armed missing protection for ${key}`, 'autonomy');
+        await pushAlert('WARN', 'autonomy', `Monitor/position drift corrected: re-armed protection for ${key}`);
+      }
     }
   }
 

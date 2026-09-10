@@ -351,10 +351,30 @@ export class BrokerPortfolioSource implements PortfolioSource {
 
   async getPositions(): Promise<NormalizedPosition[]> {
     await this.ensureFresh();
-    if (this.brokerMode() === 'sandbox' && this.cachedPositions.length === 0) {
-      return listPaperPositions() as unknown as Promise<NormalizedPosition[]>;
-    }
+    if (this.brokerMode() === 'sandbox') return this.mergeSandboxPositions();
     return this.cachedPositions;
+  }
+
+  /** Sandbox reads broker funds/positions but stores SL/target on the paper
+   * ledger. Merging both avoids reconcileMonitor seeing a tracked monitor
+   * entry with "no matching open position" when broker and paper disagree. */
+  private async mergeSandboxPositions(): Promise<NormalizedPosition[]> {
+    const paper = (await listPaperPositions()).filter((p) => p.netQty !== 0);
+    const brokerOpen = this.cachedPositions.filter((p) => p.netQty !== 0);
+    if (brokerOpen.length === 0) return paper as unknown as NormalizedPosition[];
+    const byKey = new Map(brokerOpen.map((p) => [`${p.exchangeSegment}:${p.securityId}`, { ...p }]));
+    for (const pp of paper) {
+      const key = `${pp.exchangeSegment || 'NSE_FNO'}:${pp.securityId}`;
+      const existing = byKey.get(key);
+      if (existing) {
+        if (pp.stopLoss != null) existing.stopLoss = pp.stopLoss;
+        if (pp.target != null) existing.target = pp.target;
+        if (pp.trailingStop != null) existing.trailingStop = pp.trailingStop;
+      } else {
+        byKey.set(key, pp as unknown as NormalizedPosition);
+      }
+    }
+    return [...byKey.values()];
   }
 
   async getWallet(): Promise<WalletSnapshot> {

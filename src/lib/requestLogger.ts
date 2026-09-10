@@ -54,10 +54,19 @@ export const requestLogger: import('express').RequestHandler = pinoHttp({
   },
   autoLogging: {
     ignore: (req: Request) => {
-      const url = req.url ?? '';
-      // Health/readiness probes are polled continuously — keep them out
-      // of the access log so real traffic stays readable.
-      return url === '/api/health' || url.startsWith('/api/health?');
+      const path = (req.url ?? '').split('?')[0];
+      // Background polls from the dashboard — hide so operator actions stand out.
+      const quiet = [
+        '/api/health',
+        '/api/control/state',
+        '/api/portfolio/positions',
+        '/api/portfolio/funds',
+        '/api/portfolio/orders',
+        '/api/portfolio/strategies',
+        '/api/portfolio/margin/reconcile',
+        '/api/market/indices',
+      ];
+      return quiet.some((p) => path === p || path.startsWith(`${p}/`));
     },
   },
   // Quiet serializers: no request bodies in logs (they can carry order

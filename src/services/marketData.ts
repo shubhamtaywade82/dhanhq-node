@@ -108,6 +108,8 @@ export class MarketDataService {
   private wsConnecting = false;
   private wsConnectingAt = 0;
   private pollInFlight = false;
+  /** Transition-only feed logs — avoids repeating the same status every poll/retry. */
+  private feedLog = { offHours: false, noCreds: false, marketWs: false, ordersWs: false };
   readonly monitor = new PositionMonitor();
 
   constructor(client: DhanClient) {
@@ -154,6 +156,8 @@ export class MarketDataService {
   private disconnectWs(): void {
     this.wsConnecting = false;
     this.wsStarted = false;
+    this.feedLog.marketWs = false;
+    this.feedLog.ordersWs = false;
     if (this.wsRetryTimer) {
       clearTimeout(this.wsRetryTimer);
       this.wsRetryTimer = null;
@@ -169,19 +173,26 @@ export class MarketDataService {
 
   private tryStartWs(force = false): void {
     if (!force && !isWsMarketWindowOpen(this.hasMcxSubscription())) {
-      const nextMs = msUntilNextWsWindow(this.hasMcxSubscription());
-      const nextMin = Math.round(nextMs / 60_000);
-      eventBus.log('INFO', `Outside WebSocket market hours (window: 09:10–15:35 IST) — connection deferred (${nextMin}m until open)`, 'market_data');
+      if (!this.feedLog.offHours) {
+        const nextMin = Math.round(msUntilNextWsWindow(this.hasMcxSubscription()) / 60_000);
+        eventBus.log('INFO', `Outside WebSocket market hours (window: 09:10–15:35 IST) — connection deferred (${nextMin}m until open)`, 'market_data');
+        this.feedLog.offHours = true;
+      }
       if (this.wsStarted) this.disconnectWs();
       return;
     }
+    this.feedLog.offHours = false;
 
     // Only bring up the DhanHQ binary WS when credentials can resolve a token
     const tokenResolvable = hasTotpCredentials() || hasExternalAuthProvider();
     if (!tokenResolvable) {
-      eventBus.log('WARN', 'No DhanHQ credentials configured — binary WS disabled, REST polling will serve market data when a token appears', 'market_data');
+      if (!this.feedLog.noCreds) {
+        eventBus.log('WARN', 'No DhanHQ credentials configured — binary WS disabled, REST polling will serve market data when a token appears', 'market_data');
+        this.feedLog.noCreds = true;
+      }
       return;
     }
+    this.feedLog.noCreds = false;
 
     // Back off if recently rate-limited (429) on WebSocket
     if (this.wsConnecting) {
@@ -224,7 +235,10 @@ export class MarketDataService {
           this.wsStarted = true;
           this.wsRetryAttempts = 0;
           this.lastWsTickAt = Date.now();
-          eventBus.log('INFO', 'DhanHQ binary WebSocket connected — real-time tick stream live', 'market_data');
+          if (!this.feedLog.marketWs) {
+            eventBus.log('INFO', 'DhanHQ binary WebSocket connected — real-time tick stream live', 'market_data');
+            this.feedLog.marketWs = true;
+          }
           this.armSilenceWatch();
         });
         ws.market?.on?.('tick', (tick: any) => {
@@ -239,7 +253,10 @@ export class MarketDataService {
           if (!this.wsStarted) return;
           this.wsStarted = false;
           // SDK BaseWS emits "close" with no args — the underlying ws code/reason are not forwarded.
-          eventBus.log('WARN', 'Market WS closed — reconnecting', 'market_data');
+          if (this.feedLog.marketWs) {
+            eventBus.log('WARN', 'Market WS closed — reconnecting', 'market_data');
+            this.feedLog.marketWs = false;
+          }
           eventBus.emit('system', { type: 'feed_degraded', source: 'rest' });
           this.scheduleWsRetry(undefined, force);
         });
@@ -263,7 +280,10 @@ export class MarketDataService {
 
         // Always register error and close handlers on orders WS to prevent Uncaught Exception
         ws.orders?.on?.('open', () => {
-          eventBus.log('INFO', 'DhanHQ orders WebSocket connected', 'market_data');
+          if (!this.feedLog.ordersWs) {
+            eventBus.log('INFO', 'DhanHQ orders WebSocket connected', 'market_data');
+            this.feedLog.ordersWs = true;
+          }
         });
         ws.orders?.on?.('order', (order: any) => {
           eventBus.emit('order', { kind: 'order_update', order });
@@ -275,7 +295,10 @@ export class MarketDataService {
           }
         });
         ws.orders?.on?.('close', () => {
-          eventBus.log('INFO', 'Orders WS closed', 'market_data');
+          if (this.feedLog.ordersWs) {
+            eventBus.log('INFO', 'Orders WS closed', 'market_data');
+            this.feedLog.ordersWs = false;
+          }
         });
       }
 
@@ -342,7 +365,9 @@ export class MarketDataService {
       if (wsWindowOpen && !this.wsStarted && !this.wsConnecting) {
         this.tryStartWs();
       } else if (!wsWindowOpen && (this.wsStarted || this.wsConnecting || (this.client as any).ws?.market?.isConnected)) {
-        eventBus.log('INFO', 'Market hours ended (15:35 IST) — cleanly disconnecting DhanHQ WebSocket feed', 'market_data');
+        if (this.feedLog.marketWs || this.feedLog.ordersWs) {
+          eventBus.log('INFO', 'Market hours ended (15:35 IST) — cleanly disconnecting DhanHQ WebSocket feed', 'market_data');
+        }
         this.disconnectWs();
       }
 

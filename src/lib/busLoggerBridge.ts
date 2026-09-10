@@ -29,7 +29,7 @@ import { logger } from './logger';
 const log = logger.child({ module: 'bus' });
 
 const SKIPPED: ReadonlySet<Channel> = new Set(['tick', 'portfolio']);
-const DEBUG_CHANNELS: ReadonlySet<Channel> = new Set(['risk', 'telemetry']);
+const DEBUG_CHANNELS: ReadonlySet<Channel> = new Set(['risk', 'telemetry', 'system']);
 
 const BUDGET = Number(process.env.BUS_BRIDGE_BUDGET ?? 300); // lines/min
 let windowStart = Date.now();
@@ -89,9 +89,12 @@ function handleEvent(channel: Channel, payload: any, ts: number): void {
     }
     case 'order': {
       const kind = payload?.kind ?? 'event';
-      write(kind === 'rejection' ? 'warn' : 'info',
-        { ...base, kind, correlationId: payload?.correlationId, symbol: payload?.symbol, qty: payload?.quantity, fillPrice: payload?.fillPrice, reason: payload?.reason, isPaper: payload?.is_paper },
-        kind === 'rejection' ? 'Order rejected' : 'Order filled');
+      // Fills are already mirrored via eventBus.log('TRADE', …) — logging
+      // both here duplicates every fill on stdout.
+      if (kind !== 'rejection') return;
+      write('warn',
+        { ...base, kind, correlationId: payload?.correlationId, symbol: payload?.symbol, qty: payload?.quantity, reason: payload?.reason, isPaper: payload?.is_paper },
+        'Order rejected');
       return;
     }
     case 'system': {
