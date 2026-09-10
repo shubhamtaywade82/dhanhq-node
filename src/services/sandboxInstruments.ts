@@ -1,16 +1,8 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 
-const MONTH: Record<string, number> = {
-  JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5,
-  JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11,
-};
-
 export type SandboxLegInput = {
-  underlying: string;
-  strike: number;
-  optionType: 'CE' | 'PE';
-  expiry?: string;
-  exchangeSegment?: string;
+  securityId: string | number;
+  exchangeSegment: string;
 };
 
 export type SandboxLeg = {
@@ -21,53 +13,28 @@ export type SandboxLeg = {
   displayName?: string;
 };
 
-function segmentFor(underlying: string, hint?: string): string {
-  if (hint) return hint;
-  return underlying.toUpperCase() === 'SENSEX' ? 'BSE_FNO' : 'NSE_FNO';
-}
-
-function parseDisplayExpiry(displayName?: string): number | null {
-  const m = displayName?.match(/\b(\d{1,2})\s+([A-Z]{3})\s+\d+/);
-  if (!m) return null;
-  const month = MONTH[m[2]!];
-  if (month == null) return null;
-  const year = new Date().getFullYear();
-  return Date.UTC(year, month, Number(m[1]));
-}
-
-/** Sandbox security IDs differ from production — map by underlying/strike/type/expiry. */
+/**
+ * Resolves instrument metadata (lot size, tick size) by exact
+ * exchangeSegment + securityId lookup. Uses the production scrip master so
+ * BSE_FNO (SENSEX), NSE_FNO, and every other segment are all available.
+ */
 export async function resolveSandboxOptionLeg(
   client: DhanClient,
   input: SandboxLegInput,
 ): Promise<SandboxLeg | null> {
-  const underlying = input.underlying.toUpperCase();
-  const seg = segmentFor(underlying, input.exchangeSegment);
-  const optType = input.optionType === 'PE' ? 'PE' : 'CE';
-  const instruments = await client.instruments.bySegment(seg as any);
-  const matches = (instruments || []).filter((i: any) =>
-    i?.underlyingSymbol === underlying &&
-    i?.instrument === 'OPTIDX' &&
-    Number(i?.strikePrice) === input.strike &&
-    i?.optionType === optType,
+  const instrument = await client.instruments.findBySecurityId(
+    input.exchangeSegment,
+    input.securityId,
   );
-  if (!matches.length) return null;
-
-  const target = input.expiry ? Date.parse(input.expiry) : null;
-  const ranked = matches
-    .map((row: any) => ({ row, exp: parseDisplayExpiry(row.displayName) ?? Number.MAX_SAFE_INTEGER }))
-    .sort((a, b) => (target != null
-      ? Math.abs(a.exp - target) - Math.abs(b.exp - target)
-      : b.exp - a.exp));
-
-  const best = ranked[0]!.row;
-  const lot = Number(best.lotSize);
+  if (!instrument) return null;
+  const lot = Number(instrument.lotSize);
   if (!(lot > 0)) return null;
   return {
-    securityId: String(best.securityId),
+    securityId: String(instrument.securityId),
     quantity: lot,
-    exchangeSegment: seg,
-    tickSize: Number(best.tickSize) || 0.05,
-    displayName: best.displayName,
+    exchangeSegment: input.exchangeSegment,
+    tickSize: Number(instrument.tickSize) || 0.05,
+    displayName: instrument.displayName,
   };
 }
 

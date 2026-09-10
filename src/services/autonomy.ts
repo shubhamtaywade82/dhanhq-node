@@ -219,7 +219,7 @@ export class AutonomyEngine {
         // adverse move that fired it — priced with extra slippage vs. a
         // target hit or a manual close, which fill more like a resting order.
         const kind = p.reason === 'stop_loss' || p.reason === 'trailing_stop' ? 'STOP' : 'EXIT';
-        const res = await this.portfolio.closePosition(pos.tradingSymbol, ltp, kind);
+        const res = await this.portfolio.closePosition({ securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment }, ltp, kind);
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         eventBus.log('TRADE', `Auto-exit ${pos.tradingSymbol}: ${res.status} @ ₹${ltp} (${p.reason})`, 'autonomy');
         await closeParentStrategyIfFlat(pos.tradingSymbol, await this.portfolio.getPositions());
@@ -341,7 +341,7 @@ export class AutonomyEngine {
         threshold: 'every open broker position must be tracked by PositionMonitor', action: 'Squared off and armed kill switch',
       });
 
-      const closeResult = await this.portfolio.closePosition(p.tradingSymbol).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
+      const closeResult = await this.portfolio.closePosition({ securityId: String(p.securityId), exchangeSegment: p.exchangeSegment }).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
       eventBus.log(
         closeResult.status === 'TRADED' ? 'TRADE' : 'ERROR',
         `Unmanaged position square-off ${p.tradingSymbol}: ${closeResult.status}${closeResult.reason ? ` (${closeResult.reason})` : ''}`,
@@ -445,7 +445,7 @@ export class AutonomyEngine {
       const pos = positions.find((p) => p.tradingSymbol === leg.instrument);
       if (pos && pos.netQty !== 0) {
         const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
-        await this.portfolio.closePosition(leg.instrument, ltp).catch(() => {});
+        await this.portfolio.closePosition({ securityId: String(leg.securityId || pos.securityId), exchangeSegment: leg.exchangeSegment || pos.exchangeSegment }, ltp).catch(() => {});
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       }
     }
@@ -458,7 +458,7 @@ export class AutonomyEngine {
     for (const pos of positions) {
       if (pos.netQty === 0) continue;
       const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
-      await this.portfolio.closePosition(pos.tradingSymbol, ltp).catch(() => {});
+      await this.portfolio.closePosition({ securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment }, ltp).catch(() => {});
       this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       closed++;
     }

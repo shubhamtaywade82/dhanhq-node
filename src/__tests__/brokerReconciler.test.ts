@@ -60,7 +60,7 @@ describe('AutonomyEngine — unmanaged live position reconciler', () => {
     expect(market.monitor.tracked().find((t) => t.securityId === '77001')).toBeUndefined();
     await (autonomy as any).reconcileUnmanagedLivePositions();
 
-    expect(closePosition).toHaveBeenCalledWith('NIFTY25JAN24000CE');
+    expect(closePosition).toHaveBeenCalledWith({ securityId: '77001', exchangeSegment: 'NSE_FNO' });
     expect(armSpy).toHaveBeenCalledTimes(1);
     expect(armSpy.mock.calls[0][0]).toContain('NIFTY25JAN24000CE');
     expect(alertSpy).toHaveBeenCalledWith('ERROR', 'autonomy', expect.stringContaining('UNMANAGED LIVE POSITION'));

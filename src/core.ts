@@ -130,7 +130,7 @@ export async function startCore(): Promise<Core> {
   const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk, portfolio);
   // Sandbox client always uses the Real client for market data/WS (Dhan's
   // sandbox has neither) — only order routing goes to the sandbox account.
-  const sandbox = sandboxClient ? new SandboxExecutionEngine(sandboxClient, market, risk) : undefined;
+  const sandbox = sandboxClient ? new SandboxExecutionEngine(sandboxClient, market, risk, client) : undefined;
   const agent = new AgentOrchestrator(client, market, risk, paper, live, sandbox);
   const ollama = process.env.OLLAMA_ENABLED !== 'false'
     ? new OllamaClient({ baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434', timeoutMs: 15000, retries: 0 })

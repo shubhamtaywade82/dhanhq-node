@@ -31,7 +31,7 @@ describe('SandboxExecutionEngine.placeOrder', () => {
       correlation_id: 'corr1', intent_id: 'i1',
       params: {
         security_id: '11111', quantity: 50, transaction_type: 'BUY', price: 99.5,
-        underlying: 'NIFTY', strike: 23600, option_type: 'CE', expiry: '2026-09-15',
+        exchange_segment: 'NSE_FNO',
       },
     });
     expect(res.status).toBe('TRADED');
@@ -43,7 +43,7 @@ describe('SandboxExecutionEngine.placeOrder', () => {
     }));
   });
 
-  it('remaps production security_id to sandbox scrip master before place', async () => {
+  it('uses lot size and tick size from the scrip master, not the caller-supplied values', async () => {
     const { sandbox, client } = setup({ orderStatus: 'TRADED', averagePrice: 100, filledQty: 65 });
     jest.spyOn(sandboxInstruments, 'resolveSandboxOptionLeg').mockResolvedValue({
       securityId: '46026', quantity: 65, exchangeSegment: 'NSE_FNO', tickSize: 5,
@@ -51,8 +51,8 @@ describe('SandboxExecutionEngine.placeOrder', () => {
     const res = await sandbox.placeOrder({
       correlation_id: 'corr3', intent_id: 'i3',
       params: {
-        security_id: '47301', quantity: 65, transaction_type: 'BUY', price: 123,
-        underlying: 'NIFTY', strike: 23600, option_type: 'CE', expiry: '2026-09-15',
+        security_id: '46026', quantity: 10, transaction_type: 'BUY', price: 123,
+        exchange_segment: 'NSE_FNO',
       },
     });
     expect(res.status).toBe('TRADED');
@@ -68,7 +68,7 @@ describe('SandboxExecutionEngine.placeOrder', () => {
       correlation_id: 'corr2', intent_id: 'i2',
       params: {
         security_id: '22222', quantity: 10, transaction_type: 'BUY', price: 50,
-        underlying: 'NIFTY', strike: 23600, option_type: 'CE',
+        exchange_segment: 'NSE_FNO',
       },
     });
     expect(res.status).toBe('REJECTED');
@@ -86,7 +86,7 @@ describe('SandboxExecutionEngine.placeOrder', () => {
       correlation_id: 'corr-sl', intent_id: 'i-sl',
       params: {
         security_id: '11111', quantity: 50, transaction_type: 'BUY', price: 100,
-        underlying: 'NIFTY', strike: 23600, option_type: 'CE', expiry: '2026-09-15',
+        exchange_segment: 'NSE_FNO',
       },
       risk_limits: { stop_loss: 80, target: 140, trailing_stop: { distance: 10 } },
     });
@@ -119,5 +119,12 @@ describe('SandboxExecutionEngine.closeLeg', () => {
 
     expect(res.status).toBe('TRADED');
     expect(client.orders.place).toHaveBeenCalledWith(expect.objectContaining({ transactionType: 'SELL', quantity: 50 }));
+  });
+
+  it('invalidates the portfolio cache after closeLeg so margin/position reads refresh', async () => {
+    const { sandbox, risk } = setup({ orderStatus: 'TRADED' });
+    const invalidateSpy = jest.spyOn(risk.getPortfolio(), 'invalidate');
+    await sandbox.closeLeg({ securityId: '11111', qty: 50, side: 'BUY', instrument: 'NIFTY24000CE' }, 100);
+    expect(invalidateSpy).toHaveBeenCalled();
   });
 });

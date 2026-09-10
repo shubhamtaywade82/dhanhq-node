@@ -1,4 +1,4 @@
-import { BrokerPortfolioSource } from '../services/portfolioSource';
+import { BrokerPortfolioSource, buildMarginReconcileReport, buildPaperMarginReconcileReport } from '../services/portfolioSource';
 
 // A lightweight object shaped like the three DhanClient namespaces
 // BrokerPortfolioSource actually touches — same pattern as
@@ -20,10 +20,12 @@ function stubClient(opts: {
   } as any;
 }
 
+const LEG_KEY = { securityId: '123456', exchangeSegment: 'NSE_FNO' };
+
 function rawPosition(overrides: Record<string, any> = {}) {
   return {
     tradingSymbol: 'NIFTY25JAN24000CE',
-    securityId: '123456',
+    securityId: LEG_KEY.securityId,
     exchangeSegment: 'NSE_FNO',
     productType: 'INTRADAY',
     buyQty: 50, buyAvg: 100, sellQty: 0, sellAvg: 0, netQty: 50,
@@ -202,7 +204,7 @@ describe('BrokerPortfolioSource', () => {
     const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord42' } }));
     const client = stubClient({ positions: [rawPosition({ netQty: 50 })], place });
     const src = new BrokerPortfolioSource(client, 60_000);
-    const result = await src.closePosition('NIFTY25JAN24000CE');
+    const result = await src.closePosition(LEG_KEY);
     expect(result.status).toBe('TRADED');
     expect(result.orderId).toBe('ord42');
     expect(place).toHaveBeenCalledWith(expect.objectContaining({ transactionType: 'SELL', quantity: 50, orderType: 'MARKET' }));
@@ -224,7 +226,7 @@ describe('BrokerPortfolioSource', () => {
     const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord99' } }));
     (client.orders.place as jest.Mock) = place;
 
-    const result = await src.closePosition('NIFTY25JAN24000CE');
+    const result = await src.closePosition(LEG_KEY);
     expect(result.status).toBe('TRADED');
     expect(place).toHaveBeenCalled();
   });
@@ -233,14 +235,14 @@ describe('BrokerPortfolioSource', () => {
     const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord43' } }));
     const client = stubClient({ positions: [rawPosition({ netQty: -50, buyQty: 0, sellQty: 50 })], place });
     const src = new BrokerPortfolioSource(client, 60_000);
-    await src.closePosition('NIFTY25JAN24000CE');
+    await src.closePosition(LEG_KEY);
     expect(place).toHaveBeenCalledWith(expect.objectContaining({ transactionType: 'BUY', quantity: 50 }));
   });
 
   it('closePosition is a noop when no matching open position exists', async () => {
     const client = stubClient({ positions: [] });
     const src = new BrokerPortfolioSource(client, 60_000);
-    const result = await src.closePosition('GHOST');
+    const result = await src.closePosition({ securityId: '999', exchangeSegment: 'NSE_FNO' });
     expect(result.status).toBe('noop');
   });
 
@@ -264,7 +266,7 @@ describe('BrokerPortfolioSource', () => {
     const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord50' } }));
     const client = stubClient({ positions: [rawPosition({ netQty: 75 })], place });
     const src = new BrokerPortfolioSource(client, 60_000);
-    const result = await src.closePosition('NIFTY25JAN24000CE', 120, undefined, 25);
+    const result = await src.closePosition(LEG_KEY, 120, undefined, 25);
     expect(result.status).toBe('TRADED');
     expect(place).toHaveBeenCalledWith(expect.objectContaining({ transactionType: 'SELL', quantity: 25 }));
   });
@@ -277,7 +279,7 @@ describe('BrokerPortfolioSource', () => {
       const place = jest.fn(async () => ({ correlationId: 'c1', data: { orderId: 'ord_sbx' } }));
       const client = stubClient({ positions: [rawPosition({ netQty: 50 })], place });
       const src = new BrokerPortfolioSource(client, 60_000);
-      await src.closePosition('NIFTY25JAN24000CE');
+      await src.closePosition(LEG_KEY);
       const intent = appendSpy.mock.calls.find((c) => c[0] === 'order_intent');
       expect(intent?.[1]).toMatchObject({ mode: 'sandbox' });
       expect(place).toHaveBeenCalledWith(expect.objectContaining({ orderType: 'LIMIT', price: 105 }));
@@ -291,8 +293,44 @@ describe('BrokerPortfolioSource', () => {
     const place = jest.fn(async () => { throw new Error('margin insufficient'); });
     const client = stubClient({ positions: [rawPosition({ netQty: 50 })], place });
     const src = new BrokerPortfolioSource(client, 60_000);
-    const result = await src.closePosition('NIFTY25JAN24000CE');
+    const result = await src.closePosition(LEG_KEY);
     expect(result.status).toBe('REJECTED');
     expect(result.reason).toContain('margin insufficient');
+  });
+});
+
+describe('buildMarginReconcileReport', () => {
+  const priorMode = process.env.TRADING_MODE;
+
+  beforeEach(() => { process.env.TRADING_MODE = 'sandbox'; });
+  afterAll(() => {
+    if (priorMode === undefined) delete process.env.TRADING_MODE;
+    else process.env.TRADING_MODE = priorMode;
+  });
+
+  it('flags pending orders and broker-vs-paper drift in sandbox mode', async () => {
+    const client = stubClient({
+      positions: [rawPosition({ netQty: 50 })],
+      funds: { availabelBalance: 20000, utilizedAmount: 80000 },
+    });
+    (client.orders as any).list = jest.fn(async () => [
+      { orderId: 'p1', tradingSymbol: 'NIFTY25JAN24000CE', transactionType: 'BUY', quantity: 50, orderStatus: 'PENDING' },
+    ]);
+    const src = new BrokerPortfolioSource(client, 60_000);
+    const report = await buildMarginReconcileReport(client, src);
+    expect(report.broker.usedMargin).toBe(80000);
+    expect(report.broker.availableMargin).toBe(20000);
+    expect(report.pendingOrders).toHaveLength(1);
+    expect(report.healthy).toBe(false);
+    expect(report.notes.some((n) => n.includes('pending order'))).toBe(true);
+  });
+});
+
+describe('buildPaperMarginReconcileReport', () => {
+  it('returns derived paper-wallet margin without broker fields', async () => {
+    const report = await buildPaperMarginReconcileReport();
+    expect(report.mode).toBe('paper');
+    expect(report.healthy).toBe(true);
+    expect(report.broker.totalBalance).toBeGreaterThan(0);
   });
 });

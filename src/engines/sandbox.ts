@@ -33,11 +33,21 @@ function parseCircuitClamp(desc: string | undefined, price: number, tickSize: nu
  */
 export class SandboxExecutionEngine {
   private client: DhanClient;
+  private instrumentsClient: DhanClient;
   private market: MarketDataService;
   private risk: RiskEngine;
 
-  constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine) {
+  /**
+   * @param client - Sandbox-account client (order routing only).
+   * @param market - Market data service (production WS/quotes).
+   * @param risk - Risk engine.
+   * @param instrumentsClient - Production client for scrip lookups. Sandbox's
+   *   /v2/instrument endpoint has a limited scrip master and is missing many
+   *   live contracts (e.g. SENSEX options) — always use the prod endpoint.
+   */
+  constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, instrumentsClient?: DhanClient) {
     this.client = client;
+    this.instrumentsClient = instrumentsClient ?? client;
     this.market = market;
     this.risk = risk;
   }
@@ -59,28 +69,12 @@ export class SandboxExecutionEngine {
     let limitPrice = price;
     let sandboxContract: string | undefined;
 
-    if (!params.underlying || params.strike == null || !params.option_type) {
-      const reason = 'sandbox: missing underlying/strike/option_type — cannot map production securityId to sandbox scrip';
-      journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'sandbox' });
-      journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
-      return { status: 'REJECTED', reason };
-    }
-
-    const leg = await resolveSandboxOptionLeg(this.client, {
-      underlying: params.underlying,
-      strike: Number(params.strike),
-      optionType: params.option_type,
-      expiry: params.expiry,
+    const leg = await resolveSandboxOptionLeg(this.instrumentsClient, {
+      securityId: security_id,
       exchangeSegment: exchange_segment,
     });
     if (!leg) {
-      const reason = `sandbox: no ${params.underlying} ${params.strike}${params.option_type} in sandbox scrip master`;
-      journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'sandbox' });
-      journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
-      return { status: 'REJECTED', reason };
-    }
-    if (params.underlying.toUpperCase() === 'SENSEX') {
-      const reason = 'sandbox: SENSEX BSE_FNO not supported by Dhan sandbox (DH-906)';
+      const reason = `sandbox: ${exchange_segment}/${security_id} not found in scrip master`;
       journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'sandbox' });
       journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
       return { status: 'REJECTED', reason };
@@ -235,7 +229,8 @@ export class SandboxExecutionEngine {
     const orderId = placed.data.orderId;
     const settledRaw = await this.client.orders.getById(orderId).catch(() => placed.data);
     const settled = Array.isArray(settledRaw) ? settledRaw[0] : (settledRaw?.data || settledRaw);
-    await closePaperPosition(leg.instrument || leg.securityId, price, async () => 0, 'EXIT').catch(() => {});
+    await closePaperPosition({ securityId: String(leg.securityId), exchangeSegment: leg.exchangeSegment || 'NSE_FNO' }, price, async () => 0, 'EXIT').catch(() => {});
+    this.risk.getPortfolio().invalidate();
     return { status: settled?.orderStatus || 'TRADED', orderId };
   }
 }

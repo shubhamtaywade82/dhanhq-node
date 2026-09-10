@@ -1,3 +1,9 @@
+/** Canonical instrument identity for order/position actions. */
+export interface InstrumentKey {
+  securityId: string;
+  exchangeSegment: string;
+}
+
 export interface IndexData {
   ltp: number;
   change: number;

@@ -88,6 +88,7 @@ export const api = {
   executeStrategy: (id: string) => request<any>('/api/portfolio/paper/strategy/execute', { method: 'POST', body: JSON.stringify({ id }) }),
   closeStrategy: (id: string) => request<any>('/api/portfolio/paper/strategy/close', { method: 'POST', body: JSON.stringify({ id }) }),
   calculateMargin: (items: any[]) => request<any>('/api/portfolio/margin/calculate', { method: 'POST', body: JSON.stringify({ items }) }),
+  marginReconcile: () => request<any>('/api/portfolio/margin/reconcile'),
 
   placePaperOrder: (order: { symbol: string; quantity: number; transactionType: 'BUY' | 'SELL'; price?: number; orderType?: string; productType?: string; securityId?: string }) =>
     request<any>('/api/portfolio/paper/order', {
@@ -95,16 +96,16 @@ export const api = {
       body: JSON.stringify(order),
     }),
 
-  closePaperPosition: (symbol: string, ltp?: number) =>
+  closePaperPosition: (key: { securityId: string; exchangeSegment: string }, ltp?: number) =>
     request<any>('/api/portfolio/paper/positions/close', {
       method: 'POST',
-      body: JSON.stringify({ symbol, ltp }),
+      body: JSON.stringify({ ...key, ltp }),
     }),
 
-  closePosition: (symbol: string, ltp?: number) =>
+  closePosition: (key: { securityId: string; exchangeSegment: string }, ltp?: number) =>
     request<any>('/api/portfolio/positions/close', {
       method: 'POST',
-      body: JSON.stringify({ symbol, ltp }),
+      body: JSON.stringify({ ...key, ltp }),
     }),
 
   closeAllPositions: () =>

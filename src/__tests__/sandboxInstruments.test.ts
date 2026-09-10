@@ -1,21 +1,30 @@
 import { resolveSandboxOptionLeg, roundToTick } from '../services/sandboxInstruments';
 
-function mockClient(rows: any[]) {
+function mockClient(instrument: any) {
   return {
     instruments: {
-      bySegment: jest.fn().mockResolvedValue(rows),
+      findBySecurityId: jest.fn().mockResolvedValue(instrument),
     },
   } as any;
 }
 
 describe('sandboxInstruments', () => {
-  it('maps production strike to sandbox securityId by underlying/strike/type', async () => {
-    const leg = await resolveSandboxOptionLeg(mockClient([
-      { underlyingSymbol: 'NIFTY', instrument: 'OPTIDX', strikePrice: 23600, optionType: 'CE', securityId: '46026', lotSize: 65, tickSize: 5, displayName: 'NIFTY 13 JAN 23600 CALL' },
-      { underlyingSymbol: 'NIFTY', instrument: 'OPTIDX', strikePrice: 23600, optionType: 'CE', securityId: '40293', lotSize: 65, tickSize: 5, displayName: 'NIFTY 06 JAN 23600 CALL' },
-    ]), { underlying: 'NIFTY', strike: 23600, optionType: 'CE', expiry: '2026-01-13' });
+  it('resolves lot size and tick size from exchangeSegment + securityId', async () => {
+    const leg = await resolveSandboxOptionLeg(
+      mockClient({ securityId: '46026', lotSize: 65, tickSize: 5, displayName: 'NIFTY 13 JAN 23600 CALL' }),
+      { securityId: '46026', exchangeSegment: 'NSE_FNO' },
+    );
     expect(leg?.securityId).toBe('46026');
     expect(leg?.quantity).toBe(65);
+    expect(leg?.tickSize).toBe(5);
+  });
+
+  it('returns null when instrument not found', async () => {
+    const leg = await resolveSandboxOptionLeg(
+      mockClient(undefined),
+      { securityId: '99999', exchangeSegment: 'BSE_FNO' },
+    );
+    expect(leg).toBeNull();
   });
 
   it('rounds limit price to the contract tick size', () => {

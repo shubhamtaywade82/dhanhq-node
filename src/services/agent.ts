@@ -283,7 +283,7 @@ async function unwindLegs(engine: ExecutionEngine, stratId: string, filledLegs: 
       // id to be resolvable via getByCorrelationId() on the next boot,
       // same as an entry leg's correlation_id.
       ? await engine.closeLeg({ securityId: leg.securityId, exchangeSegment: leg.exchangeSegment, qty: leg.qty, side: leg.side, instrument: leg.instrument }, unwindPrice, `unwind_${stratId}_${leg.securityId}`).catch((e: any) => ({ status: 'REJECTED', reason: e.message }))
-      : await portfolio.closePosition(leg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
+      : await portfolio.closePosition({ securityId: String(leg.securityId), exchangeSegment: leg.exchangeSegment || 'NSE_FNO' }, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
 
     if (result.status === 'TRADED' || result.status === 'noop') {
       // 'noop' ("no open position found") means something else — the

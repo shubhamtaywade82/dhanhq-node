@@ -733,7 +733,8 @@ describe('AgentOrchestrator — honest LLM fallback', () => {
   // every test; a test that wants cloud-mode behavior sets its own fake
   // key(s) explicitly, on top of this clean baseline.
   let ollamaKeyEnvSnapshot: Record<string, string | undefined> = {};
-  beforeEach(() => {
+  beforeEach(async () => {
+    await resetPaperWallet(100000);
     ollamaKeyEnvSnapshot = {};
     for (const key of Object.keys(process.env)) {
       if (/^OLLAMA_API_KEY_\d+$/.test(key)) {

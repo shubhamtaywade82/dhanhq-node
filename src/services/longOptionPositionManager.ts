@@ -134,12 +134,12 @@ export class LongOptionPositionManager {
     try {
       let result: any;
       if (this.portfolio?.kind === 'broker') {
-        result = await this.portfolio.closePosition(pos.tradingSymbol, bid, undefined, qty);
+        result = await this.portfolio.closePosition({ securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment }, bid, undefined, qty);
         if (result.status !== 'TRADED') return;
         result = { status: 'TRADED', fillPrice: result.fillPrice ?? bid };
       } else {
         result = qty >= pos.netQty
-          ? await closePaperPosition(pos.tradingSymbol, bid)
+          ? await closePaperPosition({ securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment }, bid)
           : await executePaperOrder({
               symbol: pos.tradingSymbol, securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment,
               transactionType: 'SELL', orderType: 'MARKET', productType: pos.productType, quantity: qty, price: bid,

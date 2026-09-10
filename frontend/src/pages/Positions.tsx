@@ -6,6 +6,7 @@ import { LerpNumber } from '../components/ui/LerpNumber';
 import { fmt, fmtINR, pnlClass, sideClass } from '../utils/formatters';
 import { RotateCcw, Power } from 'lucide-react';
 import { api } from '../services/api';
+import type { InstrumentKey } from '../store/types';
 
 type PolicyState = { peakNet: number; floorNet: number; captureRatioSoFar: number | null; partialTaken: boolean };
 type TradingMode = 'paper' | 'sandbox' | 'live';
@@ -67,6 +68,10 @@ export function Positions() {
       id: p.id || p.tradingSymbol,
       strategy: modeLabel(mode),
       instrument: p.tradingSymbol || p.symbol || p.id,
+      key: {
+        securityId: String(p.securityId ?? p.security_id ?? ''),
+        exchangeSegment: String(p.exchangeSegment ?? p.exchange_segment ?? 'NSE_FNO'),
+      } satisfies InstrumentKey,
       side: net >= 0 ? ('BUY' as const) : ('SELL' as const),
       qty: Math.abs(net),
       bAvg: buyAvg,
@@ -82,19 +87,19 @@ export function Positions() {
     };
   });
 
-  const closeOne = async (instrument: string, ltp: number) => {
-    if (isPaper) return api.closePaperPosition(instrument, ltp);
-    return api.closePosition(instrument, ltp);
+  const closeOne = async (key: InstrumentKey, ltp: number) => {
+    if (isPaper) return api.closePaperPosition(key, ltp);
+    return api.closePosition(key, ltp);
   };
 
-  const handleClose = async (instrument: string, ltp: number) => {
+  const handleClose = async (key: InstrumentKey, label: string, ltp: number) => {
     try {
-      await closeOne(instrument, ltp);
-      showToast(`Position ${instrument} closed successfully`, 'success');
-      addSystemLog('INFO', `Position closed for ${instrument} @ ${ltp}`, isPaper ? 'paper_execution' : 'portfolio_source');
+      await closeOne(key, ltp);
+      showToast(`Position ${label} closed successfully`, 'success');
+      addSystemLog('INFO', `Position closed for ${label} (${key.exchangeSegment}/${key.securityId}) @ ${ltp}`, isPaper ? 'paper_execution' : 'portfolio_source');
       await refreshPortfolio();
     } catch (e: any) {
-      showToast(`Failed to close ${instrument}: ${e.message}`, 'error');
+      showToast(`Failed to close ${label}: ${e.message}`, 'error');
     }
   };
 
@@ -116,7 +121,7 @@ export function Positions() {
             closeModal();
             try {
               if (isPaper) {
-                for (const p of realPositions) await api.closePaperPosition(p.instrument, p.ltp);
+                for (const p of realPositions) await api.closePaperPosition(p.key, p.ltp);
               } else {
                 await api.closeAllPositions();
               }
@@ -198,7 +203,7 @@ export function Positions() {
                   <td className={`px-2.5 py-[7px] border-b border-border/60 font-bold font-mono ${pnlClass(p.pnl)}`}><LerpNumber value={p.pnl} format={fmtINR} /></td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 text-muted text-[10px]">{p.product}</td>
                   <td className="px-2.5 py-[7px] border-b border-border/60">
-                    <Button variant="danger" className="text-[9px] px-2 py-0.5" onClick={() => handleClose(p.instrument, p.ltp)}>Close</Button>
+                    <Button variant="danger" className="text-[9px] px-2 py-0.5" onClick={() => handleClose(p.key, p.instrument, p.ltp)}>Close</Button>
                   </td>
                 </tr>
               ))

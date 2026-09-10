@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import type { InstrumentKey } from './lib/instrumentKey';
 import { moduleLogger } from './lib/logger';
 import { marketClock } from './services/marketHours';
 import { eventBus } from './services/eventBus';
@@ -902,10 +903,21 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
  * adverse-crossing cost a real stop pays; callers that don't care default
  * to the plain exit cost.
  */
-export async function closePaperPosition(symbol: string, currentLtp?: number, marginResolver?: MarginResolver, kind: FillKind = 'EXIT') {
-  const sym = symbol.toUpperCase();
-  const pos = mem.positions.get(sym);
+function findPaperPosition(target: InstrumentKey | string): any | undefined {
+  if (typeof target === 'string') return mem.positions.get(target.toUpperCase());
+  for (const pos of mem.positions.values()) {
+    if (Number(pos.net_qty) === 0) continue;
+    if (String(pos.security_id) === String(target.securityId) && String(pos.exchange_segment) === target.exchangeSegment) {
+      return pos;
+    }
+  }
+  return undefined;
+}
+
+export async function closePaperPosition(target: InstrumentKey | string, currentLtp?: number, marginResolver?: MarginResolver, kind: FillKind = 'EXIT') {
+  const pos = findPaperPosition(target);
   if (!pos || Number(pos.net_qty) === 0) return { status: 'noop', message: 'No open position found' };
+  const sym = String(pos.symbol).toUpperCase();
   const netQty = Number(pos.net_qty);
   const transactionType: 'BUY' | 'SELL' = netQty > 0 ? 'SELL' : 'BUY';
   const referencePrice = currentLtp || Number(pos.ltp || (netQty > 0 ? pos.buy_avg : pos.sell_avg));
@@ -998,7 +1010,7 @@ export async function closeAllPaperPositions(ltpResolver: (securityId: string, s
   for (const p of await listPaperPositions()) {
     if (p.netQty === 0) continue;
     const ltp = ltpResolver(String(p.securityId), p.tradingSymbol) || p.ltp;
-    results.push(await closePaperPosition(p.tradingSymbol, ltp));
+    results.push(await closePaperPosition({ securityId: String(p.securityId), exchangeSegment: p.exchangeSegment }, ltp));
   }
   return results;
 }

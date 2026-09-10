@@ -114,7 +114,7 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
         <div className="flex items-center justify-between w-[250px] shrink-0 px-3 py-1.5 rounded-lg bg-surface-50 border border-border/80 font-mono shadow-sm tabular-nums">
           <div className="flex flex-col w-[95px] shrink-0">
             <span className="text-[8.5px] font-mono text-muted uppercase tracking-wider leading-none">
-              Equity
+              {state.tradingMode === 'paper' ? 'Equity' : 'Net Worth'}
             </span>
             <span className="text-xs font-bold text-white leading-tight truncate">
               <LerpNumber value={totalEquity} decimals={0} prefix="₹" />

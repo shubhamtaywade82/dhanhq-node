@@ -267,14 +267,17 @@ function MetricsGrid({
       </Card>
       <Card className="p-3.5">
         <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">
-          {isPaper ? 'Demo Wallet' : isSandbox ? 'Sandbox Equity' : 'Live Equity'}
+          {isPaper ? 'Demo Wallet' : isSandbox ? 'Sandbox Net Worth' : 'Live Net Worth'}
         </div>
         <div className="text-xl font-bold font-mono text-gold"><LerpNumber value={equity} format={fmtINR} /></div>
         <div className="text-[10px] font-mono text-muted mt-1">
           {isPaper ? (
             <>Initial: <span className="text-muted">₹1,00,000</span></>
           ) : (
-            <>Base: <span className="text-accent">{fmtINR(total)}</span></>
+            <>
+              Avail: <span className="text-accent"><LerpNumber value={avail} format={fmtINR} /></span>
+              {' · '}Blocked: <span className="text-gold"><LerpNumber value={used} format={fmtINR} /></span>
+            </>
           )}
         </div>
       </Card>

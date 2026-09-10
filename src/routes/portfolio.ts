@@ -13,11 +13,26 @@ import { aggregatePortfolioGreeks } from '../services/optionsAnalytics';
 
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { AgentOrchestrator } from '../services/agent';
+import type { InstrumentKey } from '../lib/instrumentKey';
+import { keysMatch, toInstrumentKey } from '../lib/instrumentKey';
 import type { PortfolioSource } from '../services/portfolioSource';
+import { buildMarginReconcileReport, buildPaperMarginReconcileReport } from '../services/portfolioSource';
 import { marketClock } from '../services/marketHours';
 import { journal, type JournalEntry } from '../services/journal';
 
 const log = moduleLogger('portfolio');
+
+function parseInstrumentKey(body: { securityId?: string; exchangeSegment?: string }): InstrumentKey {
+  if (!body.securityId || !body.exchangeSegment) {
+    throw new Error('securityId and exchangeSegment are required');
+  }
+  return { securityId: String(body.securityId), exchangeSegment: String(body.exchangeSegment) };
+}
+
+async function findPositionByKey(key: InstrumentKey, portfolio?: PortfolioSource) {
+  const positions = portfolio ? await portfolio.getPositions() : await listPaperPositions();
+  return positions.find((p) => keysMatch(toInstrumentKey(p), key));
+}
 
 type OrderRow = ReturnType<typeof normalizeBrokerOrder>;
 
@@ -289,14 +304,16 @@ export function portfolioRoutes(
       if (isLocalPaper()) {
         return res.status(400).json({ error: 'Broker close is not available in paper mode — use /paper/positions/close' });
       }
-      const { symbol, ltp } = req.body;
-      if (!symbol) return res.status(400).json({ error: 'symbol is required' });
-      const liveLtp = market.getLtp(String((await portfolio!.getPositions()).find((p: any) => p.tradingSymbol === String(symbol).toUpperCase())?.securityId ?? ''));
-      const result = await portfolio!.closePosition(String(symbol), liveLtp || (ltp ? Number(ltp) : undefined));
+      const key = parseInstrumentKey(req.body);
+      const { ltp } = req.body;
+      const pos = await findPositionByKey(key, portfolio);
+      const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
+      const result = await portfolio!.closePosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
+      if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       if (result.status === 'REJECTED') return res.status(422).json({ error: result.reason || 'Close rejected' });
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(e.message?.includes('required') ? 400 : 500).json({ error: e.message });
     }
   });
 
@@ -314,16 +331,23 @@ export function portfolioRoutes(
 
   router.post('/paper/positions/close', async (req, res) => {
     try {
-      const { symbol, ltp } = req.body;
-      if (!symbol) return res.status(400).json({ error: 'symbol is required' });
-      const positions = await listPaperPositions();
-      const pos = positions.find((p) => p.tradingSymbol === symbol.toUpperCase());
+      const key = parseInstrumentKey(req.body);
+      const { ltp } = req.body;
+      if (!isLocalPaper() && portfolio) {
+        const pos = await findPositionByKey(key, portfolio);
+        const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
+        const result = await portfolio.closePosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
+        if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
+        if (result.status === 'REJECTED') return res.status(422).json({ error: result.reason || 'Close rejected' });
+        return res.json(result);
+      }
+      const pos = await findPositionByKey(key);
       const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
-      const result = await closePaperPosition(symbol, liveLtp || (ltp ? Number(ltp) : undefined));
+      const result = await closePaperPosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
       if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(e.message?.includes('required') ? 400 : 500).json({ error: e.message });
     }
   });
 
@@ -458,7 +482,10 @@ export function portfolioRoutes(
         // by the entry gate; closePaperPosition() doesn't check it.
         for (const filledLeg of legsWithPx) {
           const unwindPrice = market.getFillablePrice(String(filledLeg.securityId || '0'), { allowClosed: true }) ?? filledLeg.ltp;
-          const result: any = await closePaperPosition(filledLeg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED', message: e.message }));
+          const legKey = { securityId: String(filledLeg.securityId), exchangeSegment: filledLeg.exchangeSegment || 'NSE_FNO' };
+          const result: any = isLocalPaper()
+            ? await closePaperPosition(legKey, unwindPrice).catch((e: any) => ({ status: 'REJECTED', message: e.message }))
+            : await portfolio!.closePosition(legKey, unwindPrice).catch((e: any) => ({ status: 'REJECTED', message: e.message }));
           if (result.status === 'TRADED' && filledLeg.securityId) {
             market.monitor.untrack(filledLeg.exchangeSegment || 'NSE_FNO', String(filledLeg.securityId));
           } else if (result.status !== 'TRADED') {
@@ -564,10 +591,11 @@ export function portfolioRoutes(
         for (const leg of strat.legs) {
           const pos = positions.find((p) => p.tradingSymbol === leg.instrument || (leg.securityId && String(p.securityId) === String(leg.securityId)));
           const ltp = pos ? market.getLtp(String(pos.securityId)) || pos.ltp : undefined;
+          const legKey = { securityId: String(leg.securityId || pos?.securityId), exchangeSegment: leg.exchangeSegment || pos?.exchangeSegment || 'NSE_FNO' };
           if (isLocalPaper()) {
-            await closePaperPosition(leg.instrument, ltp);
+            await closePaperPosition(legKey, ltp);
           } else if (portfolio) {
-            await portfolio.closePosition(pos?.tradingSymbol || leg.instrument, ltp);
+            await portfolio.closePosition(legKey, ltp);
           }
           if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         }
@@ -634,6 +662,19 @@ export function portfolioRoutes(
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'profile' }, 'Profile fetch failed');
       // Honest error — no fake trader identity.
       res.status(502).json({ error: `DhanHQ profile unavailable: ${e.message}`, authenticated: false });
+    }
+  });
+
+  router.get('/margin/reconcile', async (req, res) => {
+    try {
+      if (isLocalPaper()) {
+        return res.json(await buildPaperMarginReconcileReport());
+      }
+      if (!portfolio) return res.status(503).json({ error: 'Portfolio source unavailable' });
+      res.json(await buildMarginReconcileReport(brokerApiClient(), portfolio));
+    } catch (e: any) {
+      log.warn({ requestId: req.id, err: { message: e.message }, resource: 'margin_reconcile' }, 'Margin reconcile failed');
+      res.status(500).json({ error: e.message });
     }
   });
 
