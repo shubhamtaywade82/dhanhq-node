@@ -690,6 +690,25 @@ export function patchOrderWsSafety(): void {
     };
   }
 
+  // DhanHQ servers use WebSocket transport-level pings, not client-side JSON {"type":"ping"}.
+  // The SDK default BaseWS.startHeartbeat sets a 10s pongTimeout that forcibly closes the
+  // connection when no JSON pong is returned, causing a reconnect storm every 30 seconds.
+  if (baseProto && !Object.prototype.hasOwnProperty.call(baseProto, '__heartbeatSafetyPatched')) {
+    baseProto.__heartbeatSafetyPatched = true;
+    baseProto.startHeartbeat = function (this: any) {
+      if (this.pingInterval) clearInterval(this.pingInterval);
+      if (this.pongTimeout) clearTimeout(this.pongTimeout);
+      this.pingInterval = setInterval(() => {
+        try {
+          if (this.connection?.readyState === 1 && typeof this.connection.ping === 'function') {
+            this.connection.ping();
+          }
+        } catch { /* connection dropped mid-ping */ }
+      }, this.pingIntervalMs || 30_000);
+      this.pingInterval.unref?.();
+    };
+  }
+
   const proto = (OrderUpdateWS as any)?.prototype;
   if (!proto || Object.prototype.hasOwnProperty.call(proto, '__onMessageSafetyPatched')) return;
   proto.__onMessageSafetyPatched = true;

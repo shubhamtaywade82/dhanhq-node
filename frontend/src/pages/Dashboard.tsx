@@ -224,6 +224,7 @@ function MetricsGrid({
   const utilPct = total > 0 ? (used / total) * 100 : 0;
   const realized = Number(state.funds.sessionRealizedPnl ?? state.funds.realizedPnl ?? 0);
   const unrealized = totalPnl - realized;
+  const equity = Number(state.funds.equity ?? (total + unrealized));
   const totalOrders = state.orders.length;
   const filledOrders = state.orders.filter((o) => o.status === "TRADED").length;
   const rejectedOrders = state.orders.filter((o) => o.status === "REJECTED").length;
@@ -266,14 +267,14 @@ function MetricsGrid({
       </Card>
       <Card className="p-3.5">
         <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">
-          {isPaper ? 'Demo Wallet' : isSandbox ? 'Sandbox Account' : 'Live Account'}
+          {isPaper ? 'Demo Wallet' : isSandbox ? 'Sandbox Equity' : 'Live Equity'}
         </div>
-        <div className="text-xl font-bold font-mono text-gold">{fmtINR(total)}</div>
+        <div className="text-xl font-bold font-mono text-gold"><LerpNumber value={equity} format={fmtINR} /></div>
         <div className="text-[10px] font-mono text-muted mt-1">
           {isPaper ? (
             <>Initial: <span className="text-muted">₹1,00,000</span></>
           ) : (
-            <span className="text-accent">DhanHQ {isSandbox ? 'sandbox' : 'live'} funds</span>
+            <>Base: <span className="text-accent">{fmtINR(total)}</span></>
           )}
         </div>
       </Card>

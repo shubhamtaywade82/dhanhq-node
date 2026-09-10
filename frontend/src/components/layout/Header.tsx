@@ -61,10 +61,12 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
 
   // Real-time Day P&L and Total Equity calculation from live state
   const realizedPnl = Number(state.funds.realizedPnl || 0);
-  const unrealizedPnl = state.positions.reduce((acc, p) => {
-    const un = p.unrealizedProfit ?? p.unrealizedPnl ?? (Number(p.pnl || 0) - Number(p.realizedProfit || p.realized_pnl || 0));
-    return acc + Number(un || 0);
-  }, 0);
+  const unrealizedPnl = state.positions
+    .filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0)
+    .reduce((acc, p) => {
+      const un = p.unrealizedProfit ?? p.unrealizedPnl ?? (Number(p.pnl || 0) - Number(p.realizedProfit || p.realized_pnl || 0));
+      return acc + Number(un || 0);
+    }, 0);
   const totalPnl = realizedPnl + unrealizedPnl;
   const avail = Number(state.funds.availableMargin || 100000);
   const used = Number(state.funds.usedMargin || 0);

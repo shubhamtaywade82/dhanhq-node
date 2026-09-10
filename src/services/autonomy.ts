@@ -43,6 +43,7 @@ export class AutonomyEngine {
   private lastCycleAt = 0;
   private lastScanAt = 0;
   private lastLedgerCheckAt = 0;
+  private lastStaleWarnAt = 0;
   private cycles = 0;
   private eodDone = false;
   private eodDate = '';
@@ -150,7 +151,8 @@ export class AutonomyEngine {
 
       if (this.enabled) {
         const mark = await this.portfolio.markToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
-        if (clock.isMarketOpen && mark.staleCount > 0) {
+        if (clock.isMarketOpen && mark.staleCount > 0 && Date.now() - this.lastStaleWarnAt > 60_000) {
+          this.lastStaleWarnAt = Date.now();
           eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
         }
         await this.longOptionManager.evaluate(clock.squareOffWindow);

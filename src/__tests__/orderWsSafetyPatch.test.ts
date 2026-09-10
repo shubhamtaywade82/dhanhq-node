@@ -64,4 +64,26 @@ describe('patchOrderWsSafety', () => {
       });
     });
   });
+
+  it('patches startHeartbeat to send ws ping frames and avoid false close', () => {
+    patchOrderWsSafety();
+    const baseProto = Object.getPrototypeOf(OrderUpdateWS.prototype);
+    let pingCalls = 0;
+    const conn: any = {
+      readyState: 1,
+      ping: () => { pingCalls++; },
+      close: jest.fn(),
+    };
+    const ctx: any = { connection: conn, pingIntervalMs: 50 };
+    baseProto.startHeartbeat.call(ctx);
+    expect(ctx.pongTimeout).toBeUndefined();
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        clearInterval(ctx.pingInterval);
+        expect(pingCalls).toBeGreaterThan(0);
+        expect(conn.close).not.toHaveBeenCalled();
+        resolve();
+      }, 120);
+    });
+  });
 });
