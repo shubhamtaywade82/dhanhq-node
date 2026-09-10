@@ -1,4 +1,4 @@
-import { classifyDispatchRegime } from '../services/agent';
+import { classifyDispatchRegime, classifyObjectiveIntent, matchIndexSymbol } from '../services/agent';
 
 // Regression coverage: synthesizeStrategy's regime dispatcher used to
 // compare analytics.regime against 'THETA_DECAY', 'RANGE_BOUND' and
@@ -50,3 +50,42 @@ describe('classifyDispatchRegime', () => {
     expect(classifyDispatchRegime('GAMMA_BLAST', 14)).toBe('TRENDING_DRIFT');
   });
 });
+
+describe('classifyObjectiveIntent', () => {
+  it('classifies informational and lot size questions as QUERY', () => {
+    expect(classifyObjectiveIntent('What is the lot size of options for SENSEX currently')).toBe('QUERY');
+    expect(classifyObjectiveIntent('what is the lot size of NIFTY?')).toBe('QUERY');
+    expect(classifyObjectiveIntent('What are my open positions?')).toBe('QUERY');
+    expect(classifyObjectiveIntent('What is the current margin available?')).toBe('QUERY');
+    expect(classifyObjectiveIntent('Show open positions')).toBe('QUERY');
+    expect(classifyObjectiveIntent('Is the market open right now?')).toBe('QUERY');
+    expect(classifyObjectiveIntent('Explain how Iron Condor works')).toBe('QUERY');
+  });
+
+  it('classifies trade execution directives as TRADE', () => {
+    expect(classifyObjectiveIntent('Deploy Iron Condor on NIFTY')).toBe('TRADE');
+    expect(classifyObjectiveIntent('Buy 1 lot ATM call on BANKNIFTY')).toBe('TRADE');
+    expect(classifyObjectiveIntent('Sell OTM put on SENSEX')).toBe('TRADE');
+    expect(classifyObjectiveIntent('Execute breakout strategy on NIFTY')).toBe('TRADE');
+    expect(classifyObjectiveIntent('Scan watchlist and find highest probability trade')).toBe('TRADE');
+  });
+});
+
+describe('matchIndexSymbol', () => {
+  it('correctly matches compound index symbols and avoids NIFTY substring collision', () => {
+    expect(matchIndexSymbol('What is the lot size of options for BANKNIFTY currently')).toBe('BANKNIFTY');
+    expect(matchIndexSymbol('What is the lot size of options for BANK NIFTY currently')).toBe('BANKNIFTY');
+    expect(matchIndexSymbol('What is the lot size of options for BNF currently')).toBe('BANKNIFTY');
+    expect(matchIndexSymbol('What is the lot size of options for FINNIFTY currently')).toBe('FINNIFTY');
+    expect(matchIndexSymbol('What is the lot size of options for FIN NIFTY currently')).toBe('FINNIFTY');
+    expect(matchIndexSymbol('What is the lot size of options for MIDCPNIFTY currently')).toBe('MIDCPNIFTY');
+    expect(matchIndexSymbol('What is the lot size of options for MIDCAP NIFTY currently')).toBe('MIDCPNIFTY');
+    expect(matchIndexSymbol('What is the lot size of options for SENSEX currently')).toBe('SENSEX');
+    expect(matchIndexSymbol('What is the lot size of options for BSE SENSEX currently')).toBe('SENSEX');
+    expect(matchIndexSymbol('What is India VIX right now?')).toBe('INDIAVIX');
+    expect(matchIndexSymbol('What is the lot size of options for NIFTY currently')).toBe('NIFTY');
+    expect(matchIndexSymbol('What is the lot size of options for NIFTY 50 currently')).toBe('NIFTY');
+    expect(matchIndexSymbol('What are my open positions?')).toBeNull();
+  });
+});
+

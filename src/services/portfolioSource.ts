@@ -1,4 +1,6 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
+import type { InstrumentKey } from '../lib/instrumentKey';
+import { keysMatch, toInstrumentKey } from '../lib/instrumentKey';
 import { eventBus } from './eventBus';
 import { journal } from './journal';
 import type { FillKind } from './fillModel';
@@ -8,6 +10,7 @@ import {
   closePaperPosition, closeAllPaperPositions, getTodayOrderStats as getPaperTodayOrderStats,
 } from '../db';
 import { marketClock } from './marketHours';
+import { buildSandboxPlaceRequest, roundToTick } from './sandboxInstruments';
 
 /**
  * Normalizes RiskEngine's and AutonomyEngine's view of "the account" across
@@ -123,7 +126,7 @@ export interface PortfolioSource {
    * own unrealizedProfit is already server-computed from real prices, so
    * this just forces a fresh poll rather than doing any local math. */
   markToMarket(ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }>;
-  closePosition(symbol: string, priceHint?: number, kind?: FillKind): Promise<CloseResult>;
+  closePosition(key: InstrumentKey, priceHint?: number, kind?: FillKind, quantity?: number): Promise<CloseResult>;
   closeAll(ltpResolver: LtpResolver): Promise<CloseResult[]>;
   /** Forces the next read to bypass any internal cache. Paper mode's mem
    * reads are always current, so this is a no-op there; BrokerPortfolioSource
@@ -161,8 +164,8 @@ export class PaperPortfolioSource implements PortfolioSource {
     return markPositionsToMarket(ltpResolver);
   }
 
-  async closePosition(symbol: string, priceHint?: number, kind?: FillKind): Promise<CloseResult> {
-    return closePaperPosition(symbol, priceHint, undefined, kind) as unknown as Promise<CloseResult>;
+  async closePosition(key: InstrumentKey, priceHint?: number, kind?: FillKind, _quantity?: number): Promise<CloseResult> {
+    return closePaperPosition(key, priceHint, undefined, kind) as unknown as Promise<CloseResult>;
   }
 
   async closeAll(ltpResolver: LtpResolver): Promise<CloseResult[]> {
@@ -348,6 +351,9 @@ export class BrokerPortfolioSource implements PortfolioSource {
 
   async getPositions(): Promise<NormalizedPosition[]> {
     await this.ensureFresh();
+    if (this.brokerMode() === 'sandbox' && this.cachedPositions.length === 0) {
+      return listPaperPositions() as unknown as Promise<NormalizedPosition[]>;
+    }
     return this.cachedPositions;
   }
 
@@ -397,82 +403,91 @@ export class BrokerPortfolioSource implements PortfolioSource {
     if (outcome.status === 'REJECTED') this.orderRejected++;
   }
 
-  async markToMarket(_ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }> {
-    // The account's own unrealizedProfit is already computed server-side
-    // from real market prices, so there is no local tick-based math to do
-    // here (unlike paper mode, where nothing else prices the position).
-    // Respects the normal poll TTL rather than forcing — this is called on
-    // EVERY tick via AutonomyEngine.scheduleTickMark(), and a forced poll
-    // here would hammer positions.list()/funds.getLimit() on every tick
-    // instead of at most once per pollIntervalMs.
+  async markToMarket(ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }> {
+    if (this.brokerMode() === 'sandbox') {
+      await this.ensureFresh();
+      const mark = await markPositionsToMarket(ltpResolver);
+      if (this.cachedPositions.length === 0) {
+        this.cachedPositions = (await listPaperPositions()) as unknown as NormalizedPosition[];
+      }
+      this.cachedWallet.unrealizedPnl = mark.totalUnrealized;
+      this.cachedWallet.equity = Number((this.cachedWallet.totalBalance + mark.totalUnrealized).toFixed(2));
+      return mark;
+    }
     await this.ensureFresh();
     return { totalUnrealized: this.cachedWallet.unrealizedPnl, staleCount: this.degraded ? this.cachedPositions.length : 0 };
   }
 
-  private findOpenPosition(symbol: string): NormalizedPosition | undefined {
-    const sym = symbol.toUpperCase();
-    return this.cachedPositions.find((p) => p.tradingSymbol === sym && p.netQty !== 0);
+  private async findOpenPosition(key: InstrumentKey): Promise<NormalizedPosition | undefined> {
+    const positions = await this.getPositions();
+    return positions.find((p) => p.netQty !== 0 && keysMatch(toInstrumentKey(p), key));
   }
 
   /** Places a REAL reversing MARKET order — no priceHint/kind: a market
    * order lets the broker fill at its own best price, which is more
    * correct for real capital than forcing a specific price the way the
    * paper fill model does. */
-  private async reversePosition(pos: NormalizedPosition, reason: string): Promise<CloseResult> {
+  private brokerMode(): 'sandbox' | 'live' {
+    return process.env.TRADING_MODE === 'sandbox' ? 'sandbox' : 'live';
+  }
+
+  private async reversePosition(pos: NormalizedPosition, reason: string, quantity?: number): Promise<CloseResult> {
     const transactionType = pos.netQty > 0 ? 'SELL' : 'BUY';
-    const quantity = Math.abs(pos.netQty);
-    const correlationId = `close_${pos.tradingSymbol}_${Date.now()}`;
+    const qty = Math.min(quantity ?? Math.abs(pos.netQty), Math.abs(pos.netQty));
+    const correlationId = `c_${pos.securityId || pos.tradingSymbol}_${Date.now().toString(36)}`.slice(0, 25);
+    const mode = this.brokerMode();
 
     journal.append('order_intent', {
-      correlation_id: correlationId, mode: 'live',
-      params: { security_id: pos.securityId, quantity, transaction_type: transactionType, exchange_segment: pos.exchangeSegment, product_type: pos.productType },
+      correlation_id: correlationId, mode,
+      params: { security_id: pos.securityId, quantity: qty, transaction_type: transactionType, exchange_segment: pos.exchangeSegment, product_type: pos.productType },
     });
 
     try {
-      const result: any = await this.client.orders.place({
-        correlationId,
-        securityId: pos.securityId,
-        exchangeSegment: pos.exchangeSegment as any,
-        transactionType: transactionType as any,
-        orderType: 'MARKET' as any,
-        quantity,
-        price: 0,
-        productType: pos.productType as any,
-      });
+      const fallbackPrice = pos.costPrice || pos.buyAvg || pos.sellAvg || 100;
+      const limitPrice = roundToTick(pos.ltp > 0 ? pos.ltp : fallbackPrice, 5);
+      const placeReq = mode === 'sandbox'
+        ? buildSandboxPlaceRequest({
+          correlationId, securityId: pos.securityId, exchangeSegment: pos.exchangeSegment,
+          transactionType, orderType: 'MARKET', quantity: qty, price: limitPrice, productType: pos.productType,
+        })
+        : {
+          correlationId, securityId: pos.securityId, exchangeSegment: pos.exchangeSegment as any,
+          transactionType: transactionType as any, orderType: 'MARKET' as any, quantity: qty, price: 0,
+          productType: pos.productType as any,
+        };
+      const placed: any = await this.client.orders.place(placeReq);
+      const orderId = placed?.data?.orderId ?? placed?.orderId;
+      const settled: any = orderId ? await this.client.orders.getById(orderId).catch(() => placed?.data ?? placed) : placed?.data ?? placed;
+      const fillPrice = Number(settled?.averagePrice ?? settled?.price ?? 0) || undefined;
 
       const fillPayload = {
-        correlation_id: correlationId, is_paper: false, symbol: pos.tradingSymbol,
-        security_id: pos.securityId, quantity, transaction_type: transactionType,
-        order_id: result?.data?.orderId ?? result?.orderId, filled_at: new Date().toISOString(), reason,
+        correlation_id: correlationId, mode, is_paper: false, symbol: pos.tradingSymbol,
+        security_id: pos.securityId, quantity: qty, transaction_type: transactionType,
+        order_id: orderId, fill_price: fillPrice, filled_at: new Date().toISOString(), reason,
       };
-      eventBus.log('TRADE', `Live close ${transactionType} ${quantity} ${pos.tradingSymbol} (${reason})`, 'portfolio_source');
+      eventBus.log('TRADE', `Broker close ${transactionType} ${qty} ${pos.tradingSymbol} (${reason})`, 'portfolio_source');
       eventBus.emit('order', { kind: 'fill', ...fillPayload });
       journal.append('order_result', { status: 'TRADED', ...fillPayload });
       redisPublisher.publish('dhan:execution:fills', JSON.stringify(fillPayload)).catch(() => {});
 
-      // The broker won't reflect this fill in positions.list() until its
-      // own books settle — force a re-poll on the NEXT read rather than
-      // serving a stale "still open" snapshot for a full pollIntervalMs.
+      if (mode === 'sandbox') {
+        await closePaperPosition(toInstrumentKey(pos), limitPrice, async () => 0, 'EXIT').catch(() => {});
+      }
+
       this.invalidate();
-      return { status: 'TRADED', symbol: pos.tradingSymbol, orderId: fillPayload.order_id };
+      return { status: 'TRADED', symbol: pos.tradingSymbol, orderId, fillPrice };
     } catch (e: any) {
-      eventBus.log('ERROR', `Live close FAILED for ${pos.tradingSymbol}: ${e.message}`, 'portfolio_source');
-      journal.append('order_result', { correlation_id: correlationId, status: 'REJECTED', reason: e.message });
+      eventBus.log('ERROR', `Broker close FAILED for ${pos.tradingSymbol}: ${e.message}`, 'portfolio_source');
+      journal.append('order_result', { correlation_id: correlationId, status: 'REJECTED', reason: e.message, mode });
       return { status: 'REJECTED', symbol: pos.tradingSymbol, reason: e.message };
     }
   }
 
-  async closePosition(symbol: string, _priceHint?: number, _kind?: FillKind): Promise<CloseResult> {
-    // Forced, not cache-respecting: this is a deliberate, rare exit
-    // decision, not a per-tick read. A cache-respecting read (ensureFresh())
-    // would return 'noop' for a position opened within the last
-    // pollIntervalMs — the real broker position stays open, now with no
-    // caller retrying the close and, if it was untracked in the same
-    // motion, no stop-loss either.
+  async closePosition(key: InstrumentKey, _priceHint?: number, _kind?: FillKind, quantity?: number): Promise<CloseResult> {
     await this.ensureFresh(true);
-    const pos = this.findOpenPosition(symbol);
-    if (!pos) return { status: 'noop', reason: 'No open position found', symbol };
-    return this.reversePosition(pos, 'manual close');
+    const pos = await this.findOpenPosition(key);
+    if (!pos) return { status: 'noop', reason: 'No open position found', securityId: key.securityId };
+    return this.reversePosition(pos, 'manual close', quantity);
   }
 
   async closeAll(_ltpResolver: LtpResolver): Promise<CloseResult[]> {
@@ -484,4 +499,129 @@ export class BrokerPortfolioSource implements PortfolioSource {
     }
     return results;
   }
+}
+
+// ── margin reconcile (sandbox/live diagnostics) ─────────────────────────
+
+export interface MarginReconcileReport {
+  mode: string;
+  healthy: boolean;
+  notes: string[];
+  broker: { usedMargin: number; availableMargin: number; totalBalance: number; equity: number };
+  paperLedger: { usedMargin: number; availableMargin: number; openCount: number };
+  positions: { brokerOpen: number; paperOpen: number; brokerOnly: string[]; paperOnly: string[] };
+  pendingOrders: Array<{ id: string; instrument: string; side: string; qty: number; status: string }>;
+  drift: { brokerVsPaperUsed: number };
+}
+
+function openSymbols(positions: Array<{ netQty: number; tradingSymbol: string }>): Set<string> {
+  return new Set(positions.filter((p) => p.netQty !== 0).map((p) => p.tradingSymbol));
+}
+
+function symDiff(a: Set<string>, b: Set<string>): string[] {
+  return [...a].filter((s) => !b.has(s));
+}
+
+async function listPendingBrokerOrders(client: DhanClient): Promise<MarginReconcileReport['pendingOrders']> {
+  const raw = await client.orders.list().catch(() => []);
+  return (Array.isArray(raw) ? raw : [])
+    .filter((r) => ['PENDING', 'TRANSIT'].includes(String(r.orderStatus ?? '')))
+    .map((r) => ({
+      id: String(r.orderId ?? ''),
+      instrument: String(r.tradingSymbol ?? ''),
+      side: String(r.transactionType ?? ''),
+      qty: Number(r.quantity ?? 0),
+      status: String(r.orderStatus ?? 'PENDING'),
+    }));
+}
+
+/** Compares Dhan's fund-limit margin against the local paper ledger and
+ * open-position books — surfaces stale collateral, pending-order blocks,
+ * and broker/local position drift in sandbox/live mode. */
+export async function buildMarginReconcileReport(
+  client: DhanClient,
+  portfolio: PortfolioSource,
+): Promise<MarginReconcileReport> {
+  const mode = process.env.TRADING_MODE || 'live';
+  const [fundsRes, brokerPositions, paperWallet, paperPositions] = await Promise.all([
+    client.funds.getLimit().catch(() => ({})),
+    portfolio.getPositions(),
+    getPaperWallet(),
+    listPaperPositions(),
+  ]);
+  const usedMargin = Number((fundsRes as any)?.utilizedAmount ?? 0);
+  const availableMargin = Number((fundsRes as any)?.availabelBalance ?? 0);
+  const totalBalance = usedMargin + availableMargin;
+  const unrealized = brokerPositions.reduce((s, p) => s + p.unrealizedProfit, 0);
+  const pendingOrders = await listPendingBrokerOrders(client);
+
+  const brokerSyms = openSymbols(brokerPositions);
+  const paperSyms = openSymbols(paperPositions);
+  const brokerVsPaperUsed = Number((usedMargin - paperWallet.usedMargin).toFixed(2));
+
+  const notes: string[] = [];
+  if (pendingOrders.length > 0) {
+    notes.push(`${pendingOrders.length} pending order(s) may still block margin at the broker`);
+  }
+  if (brokerVsPaperUsed > 100) {
+    notes.push(`Broker utilizedAmount exceeds local paper ledger by ₹${brokerVsPaperUsed.toLocaleString('en-IN')}`);
+  }
+  const brokerOnly = symDiff(brokerSyms, paperSyms);
+  const paperOnly = symDiff(paperSyms, brokerSyms);
+  if (brokerOnly.length) notes.push(`Open at broker but not in local book: ${brokerOnly.join(', ')}`);
+  if (paperOnly.length) notes.push(`Open in local book but not at broker: ${paperOnly.join(', ')}`);
+
+  const healthy = notes.length === 0;
+  return {
+    mode,
+    healthy,
+    notes,
+    broker: {
+      usedMargin, availableMargin, totalBalance,
+      equity: Number((totalBalance + unrealized).toFixed(2)),
+    },
+    paperLedger: {
+      usedMargin: paperWallet.usedMargin,
+      availableMargin: paperWallet.availableMargin,
+      openCount: paperSyms.size,
+    },
+    positions: {
+      brokerOpen: brokerSyms.size,
+      paperOpen: paperSyms.size,
+      brokerOnly,
+      paperOnly,
+    },
+    pendingOrders,
+    drift: { brokerVsPaperUsed },
+  };
+}
+
+export async function buildPaperMarginReconcileReport(): Promise<MarginReconcileReport> {
+  const wallet = await getPaperWallet();
+  const positions = await listPaperPositions();
+  const open = positions.filter((p) => p.netQty !== 0);
+  return {
+    mode: 'paper',
+    healthy: true,
+    notes: ['Paper mode: margin is derived from open-position margin_blocked sums'],
+    broker: {
+      usedMargin: wallet.usedMargin,
+      availableMargin: wallet.availableMargin,
+      totalBalance: wallet.totalBalance,
+      equity: wallet.equity,
+    },
+    paperLedger: {
+      usedMargin: wallet.usedMargin,
+      availableMargin: wallet.availableMargin,
+      openCount: open.length,
+    },
+    positions: {
+      brokerOpen: open.length,
+      paperOpen: open.length,
+      brokerOnly: [],
+      paperOnly: [],
+    },
+    pendingOrders: [],
+    drift: { brokerVsPaperUsed: 0 },
+  };
 }

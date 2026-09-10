@@ -4,8 +4,10 @@ import type { RiskEngine } from '../services/riskEngine';
 import type { AutonomyEngine } from '../services/autonomy';
 import type { AgentOrchestrator } from '../services/agent';
 import type { MarketDataService } from '../services/marketData';
+import { crossCheckJournalOnBoot } from '../core';
 import { eventBus } from '../services/eventBus';
 import { journal } from '../services/journal';
+import { getSystemState, setSystemState } from '../services/systemState';
 import { listAlerts, pushAlert } from '../db';
 import { evaluateStrategyBacktest } from '../services/strategyConstructor';
 import { analyzeOptionsBehavior } from './market';
@@ -25,6 +27,7 @@ export function controlRoutes(
   autonomy: AutonomyEngine,
   agent: AgentOrchestrator,
   market: MarketDataService,
+  sandboxClient?: DhanClient,
 ): Router {
   const router = Router();
 
@@ -33,6 +36,7 @@ export function controlRoutes(
     const [alerts, agentEvents] = await Promise.all([listAlerts(50), agent.events(50)]);
     res.json({
       mode: process.env.TRADING_MODE || 'paper',
+      systemState: getSystemState(),
       risk: risk.snapshot(),
       autonomy: autonomy.stats(),
       agent: agent.status(),
@@ -88,6 +92,22 @@ export function controlRoutes(
     res.json({ status: 'ok', stats: autonomy.stats() });
   });
 
+  router.get('/adaptive-supertrend', async (_req, res) => {
+    const scanner = autonomy.getScanner();
+    if (!scanner) return res.status(503).json({ error: 'Adaptive Supertrend scanner not armed' });
+    res.json(await scanner.probe());
+  });
+
+  router.post('/reconcile-boot', async (_req, res) => {
+    try {
+      await crossCheckJournalOnBoot(journal.readTodayEntries(), risk, client, sandboxClient);
+      journal.append('control_command', { route: 'POST /reconcile-boot', systemState: getSystemState() });
+      res.json({ status: 'ok', systemState: getSystemState() });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ── long-option peak-profit policy ─────────────────────────────────
   router.get('/long-option-policy', (_req, res) => {
     res.json({ enabled: autonomy.longOptionManager.isEnabled(), positions: autonomy.longOptionManager.snapshot() });
@@ -123,7 +143,7 @@ export function controlRoutes(
     if (patch.perStrategyLossLimit != null) clean.perStrategyLossLimit = Math.max(500, Number(patch.perStrategyLossLimit));
     if (patch.maxConsecutiveLosses != null) clean.maxConsecutiveLosses = Math.max(1, Number(patch.maxConsecutiveLosses));
     if (patch.maxRejectionRatePct != null) clean.maxRejectionRatePct = Math.max(1, Number(patch.maxRejectionRatePct));
-    if (patch.staleTickSec != null) clean.staleTickSec = Math.max(3, Number(patch.staleTickSec));
+    if (patch.staleTickSec != null) clean.staleTickSec = Math.max(5, Math.min(120, Number(patch.staleTickSec)));
     const updated = await risk.setLimits(clean);
     journal.append('control_command', { route: 'POST /risk-limits', patch: clean, updated });
     res.json(updated);
@@ -140,13 +160,20 @@ export function controlRoutes(
       journal.append('control_command', { route: 'POST /agent/run', objective: objective.trim(), result });
       res.json(result);
     } catch (e: any) {
-      res.status(e.message?.includes('already in progress') ? 409 : 500).json({ error: e.message });
+      res.status(e.message?.includes('in progress') ? 409 : 500).json({ error: e.message });
     }
   });
 
   router.get('/agent/status', async (_req, res) => {
     const llmOnline = await agent.refreshLlm();
     res.json({ ...agent.status(), llmOnline });
+  });
+
+  // Per-Ollama-Cloud-key health (which numbered OLLAMA_API_KEY_N is
+  // currently cooling down after a failure, e.g. a rate limit) — read-only,
+  // reports the SDK's own circuit-breaker state, makes no new LLM calls.
+  router.get('/agent/ollama-keys', (_req, res) => {
+    res.json(agent.ollamaKeyStatus());
   });
 
   router.get('/agent/events', async (req, res) => {

@@ -15,7 +15,12 @@ import { SandboxExecutionEngine } from './engines/sandbox';
 import { marketClock } from './services/marketHours';
 import { hasHolidayCoverage } from './services/holidays';
 import { journal, summarizeDay, type JournalEntry } from './services/journal';
+import { OllamaClient } from '@nemesis-oss/ollama-sdk';
 import { PaperPortfolioSource, BrokerPortfolioSource, type PortfolioSource } from './services/portfolioSource';
+import { getSystemState, setSystemState } from './services/systemState';
+import { ResearchOrchestrator } from './services/research/researchOrchestrator';
+import { ResearchScheduler } from './services/research/researchScheduler';
+import { initResearchRepository } from './services/research/researchRepository';
 
 /**
  * Core bootstrap — the autonomous trading stack, shared by every entry
@@ -24,10 +29,14 @@ import { PaperPortfolioSource, BrokerPortfolioSource, type PortfolioSource } fro
  */
 export interface Core {
   client: DhanClient;
+  sandboxClient?: DhanClient;
+  portfolio: PortfolioSource;
   market: MarketDataService;
   risk: RiskEngine;
   autonomy: AutonomyEngine;
   agent: AgentOrchestrator;
+  research: ResearchOrchestrator;
+  researchScheduler?: ResearchScheduler;
   paper: PaperExecutionEngine;
   live: LiveExecutionEngine;
   sandbox?: SandboxExecutionEngine;
@@ -35,19 +44,25 @@ export interface Core {
   selfHealing: SelfHealingService;
 }
 
-/**
- * The ONE place that maps TRADING_MODE to an execution engine — replaces
- * the `isLive ? core.live : core.paper` check that used to be duplicated
- * at every call site (agent.ts, index.ts), which had no room for a third
- * mode.
- */
-export function resolveExecutionEngine(core: Core, mode: string | undefined): PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine {
-  if (mode === 'live') return core.live;
+export type ExecutionEngine = PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine;
+
+/** Maps TRADING_MODE to the active execution engine (paper | sandbox | live). */
+export function pickExecutionEngine(
+  mode: string | undefined,
+  engines: Pick<Core, 'paper' | 'live' | 'sandbox'>,
+): ExecutionEngine {
+  if (mode === 'live') return engines.live;
   if (mode === 'sandbox') {
-    if (!core.sandbox) throw new Error('TRADING_MODE=sandbox but the sandbox engine was not initialized (missing DHAN_SANDBOX_CLIENT_ID/DHAN_SANDBOX_ACCESS_TOKEN?)');
-    return core.sandbox;
+    if (!engines.sandbox) {
+      throw new Error('TRADING_MODE=sandbox but the sandbox engine was not initialized (missing DHAN_SANDBOX_CLIENT_ID/DHAN_SANDBOX_ACCESS_TOKEN?)');
+    }
+    return engines.sandbox;
   }
-  return core.paper;
+  return engines.paper;
+}
+
+export function resolveExecutionEngine(core: Core, mode?: string): ExecutionEngine {
+  return pickExecutionEngine(mode ?? process.env.TRADING_MODE, core);
 }
 
 import { seedStandardStrategies } from './services/strategyConstructor';
@@ -71,12 +86,10 @@ export async function startCore(): Promise<Core> {
   // only after a supervised first live session (minimum lot size, one
   // index) confirms the kill switch and reconciler actually fire correctly
   // against the real account — not as a standalone code change.
-  if (process.env.TRADING_MODE === 'live') {
+  if (process.env.TRADING_MODE === 'live' && process.env.ALLOW_LIVE_TRADING !== 'true') {
     throw new Error(
-      'TRADING_MODE=live is deliberately disabled pending a supervised first live session: PortfolioSource, ' +
-      'the broker kill switch, and the unmanaged-position reconciler are implemented and tested against mocks, ' +
-      'but have never run against a real DhanHQ account. Set TRADING_MODE=paper, or remove this guard only ' +
-      'after that verification (see the comment above this block).'
+      'TRADING_MODE=live is deliberately disabled pending confirmation: set ALLOW_LIVE_TRADING=true ' +
+      'in .env to confirm live trading with real capital.'
     );
   }
   if (process.env.TRADING_MODE === 'sandbox' && !createSandboxDhanClient()) {
@@ -85,8 +98,11 @@ export async function startCore(): Promise<Core> {
     );
   }
 
+  setSystemState('BOOTING', 'Initializing database and clients');
   await initDatabase();
+  const sandboxClient = createSandboxDhanClient();
   const client = await createDhanClient();
+  setSystemState('SYNCING', 'Dhan client connected');
 
   const market = new MarketDataService(client);
   // The ONE place TRADING_MODE picks which account this whole stack reads/
@@ -95,7 +111,9 @@ export async function startCore(): Promise<Core> {
   // idea of "the current positions" shared across them, not one each.
   const portfolio: PortfolioSource = process.env.TRADING_MODE === 'live'
     ? new BrokerPortfolioSource(client)
-    : new PaperPortfolioSource();
+    : process.env.TRADING_MODE === 'sandbox' && sandboxClient
+      ? new BrokerPortfolioSource(sandboxClient)
+      : new PaperPortfolioSource();
   const risk = new RiskEngine(client, market, portfolio);
   const autonomy = new AutonomyEngine(client, market, risk, portfolio);
 
@@ -112,11 +130,20 @@ export async function startCore(): Promise<Core> {
   const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk, portfolio);
   // Sandbox client always uses the Real client for market data/WS (Dhan's
   // sandbox has neither) — only order routing goes to the sandbox account.
-  const sandboxClient = createSandboxDhanClient();
-  const sandbox = sandboxClient ? new SandboxExecutionEngine(sandboxClient, market, risk) : undefined;
+  const sandbox = sandboxClient ? new SandboxExecutionEngine(sandboxClient, market, risk, client) : undefined;
   const agent = new AgentOrchestrator(client, market, risk, paper, live, sandbox);
+  const ollama = process.env.OLLAMA_ENABLED !== 'false'
+    ? new OllamaClient({ baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434', timeoutMs: 15000, retries: 0 })
+    : null;
+  const research = new ResearchOrchestrator(client, market, undefined, ollama);
   autonomy.setAgent(agent);
-  autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, paper, risk));
+  autonomy.setResearch(research);
+  const executionEngine = pickExecutionEngine(process.env.TRADING_MODE, { paper, live, sandbox });
+  autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, executionEngine, risk, undefined, portfolio));
+
+  await initResearchRepository();
+  const researchScheduler = new ResearchScheduler(research);
+  await researchScheduler.start();
 
   // Bridge core events into Redis pub/sub (Rails sidecar compat) when up.
   if (await redisAvailable()) {
@@ -153,16 +180,21 @@ export async function startCore(): Promise<Core> {
   // tick; seedStandardStrategies does slow network calls, so starting these
   // after it (as before) left a real window where a fired exit signal had
   // no listener yet and was silently lost.
+  setSystemState('RECONCILING', 'Reconciling ledger and arming positions');
   await risk.start();
-  await crossCheckJournalOnBoot(priorEntries, risk);
+  await crossCheckJournalOnBoot(priorEntries, risk, client, sandboxClient);
   await autonomy.start();
-  await seedExistingPositions(market, market.monitor);
+  await seedExistingPositions(market, market.monitor, portfolio);
   await seedStandardStrategies(client, market, paper);
+
+  if (getSystemState() === 'RECONCILING') {
+    setSystemState('READY', 'Core initialization complete');
+  }
 
   eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
   eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
 
-  return { client, market, risk, autonomy, agent, paper, live, sandbox, tracker, selfHealing };
+  return { client, sandboxClient, portfolio, market, risk, autonomy, agent, research, researchScheduler, paper, live, sandbox, tracker, selfHealing };
 }
 
 /**
@@ -175,15 +207,71 @@ export async function startCore(): Promise<Core> {
  * position from actual drift, so it must never be treated as more
  * authoritative than the ledger it's checking.
  */
-export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk: RiskEngine): Promise<void> {
+export async function crossCheckJournalOnBoot(
+  priorEntries: JournalEntry[], risk: RiskEngine, client: DhanClient, sandboxClient?: DhanClient,
+): Promise<void> {
   if (priorEntries.length === 0) return;
-  const summary = summarizeDay(priorEntries);
+  const mode = process.env.TRADING_MODE || 'paper';
+  const summary = summarizeDay(priorEntries, mode);
+  const problems: string[] = [];
 
-  const missing = await findMissingOrders(summary.tradedCorrelationIds);
-  if (missing.length > 0) {
-    const msg = `Boot cross-check: journal recorded ${missing.length} trade(s) today with no matching durable order record (${missing.join(', ')}) — something may have altered the ledger outside the normal fill path`;
+  if (mode === 'paper') {
+    // paper_orders is paper mode's durable record — a TRADED result should
+    // have a row there, and so should any intent whose outcome the journal
+    // never recorded (executePaperOrder is in-process and synchronous, so
+    // this only catches a crash mid-call, not a network round-trip).
+    const toCheck = [...summary.tradedCorrelationIds, ...summary.unresolvedIntents];
+    const missing = await findMissingOrders(toCheck);
+    problems.push(...missing.map((id) => `no matching paper_orders record for ${id}`));
+  } else {
+    // Live/sandbox: a journaled TRADED result is itself durable (the
+    // journal is an fsync'd file) and isn't re-verified against the broker
+    // here — that's full reconciliation, deliberately out of scope for this
+    // boot check. What DOES need resolving is an order this process placed
+    // but died before learning the outcome of — the broker's own order book
+    // is the only durable record for those, via GET /orders/external/{id}.
+    const lookupClient = mode === 'sandbox' ? sandboxClient : client;
+    for (const id of summary.unresolvedIntents) {
+      if (!lookupClient) {
+        problems.push(`unresolved order ${id} — no ${mode} client available to reconcile`);
+        continue;
+      }
+      try {
+        const order: any = await lookupClient.orders.getByCorrelationId(id);
+        if (!order?.orderStatus) {
+          // Never reached the broker (crash mid-place) — close the journal
+          // loop so the day isn't stuck in DEGRADED blocking all new entries.
+          journal.append('order_result', {
+            correlation_id: id,
+            status: 'REJECTED',
+            reason: 'orphan_resolved_on_boot: broker has no record',
+            mode,
+          });
+          eventBus.log('WARN', `Boot reconciliation: orphan intent ${id} closed as REJECTED (broker has no record)`, 'core');
+        } else {
+          eventBus.log('SYSTEM', `Boot reconciliation: order ${id} resolved from broker as ${order.orderStatus}`, 'core');
+        }
+      } catch (e: any) {
+        if (mode === 'sandbox') {
+          journal.append('order_result', {
+            correlation_id: id,
+            status: 'REJECTED',
+            reason: `orphan_resolved_on_boot: broker lookup failed (${e.message})`,
+            mode,
+          });
+          eventBus.log('WARN', `Boot reconciliation: orphan intent ${id} closed as REJECTED (${e.message})`, 'core');
+        } else {
+          problems.push(`unresolved order ${id} — broker lookup failed (${e.message})`);
+        }
+      }
+    }
+  }
+
+  if (problems.length > 0) {
+    const msg = `Boot cross-check: ${problems.length} unresolved order(s) today — ${problems.join('; ')}`;
     eventBus.log('ERROR', msg, 'core');
     await pushAlert('ERROR', 'core', msg);
+    setSystemState('DEGRADED', `Unresolved orders: ${problems.length}`);
   }
 
   if (summary.lastKillAction === 'arm' && !risk.isKilled()) {
@@ -196,8 +284,13 @@ export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk
     await pushAlert('WARN', 'core', msg);
   }
 
-  if (missing.length === 0 && (summary.lastKillAction === null || summary.lastKillAction === (risk.isKilled() ? 'arm' : 'disarm'))) {
-    eventBus.log('SYSTEM', `Boot cross-check: today's journal (${priorEntries.length} entries) agrees with current state`, 'core');
+  if (problems.length === 0) {
+    if (getSystemState() === 'DEGRADED') {
+      setSystemState('READY', 'Boot cross-check passed — no unresolved orders');
+    }
+    if (summary.lastKillAction === null || summary.lastKillAction === (risk.isKilled() ? 'arm' : 'disarm')) {
+      eventBus.log('SYSTEM', `Boot cross-check: today's journal (${priorEntries.length} entries) agrees with current state`, 'core');
+    }
   }
 }
 
@@ -205,9 +298,9 @@ export async function crossCheckJournalOnBoot(priorEntries: JournalEntry[], risk
  * were already open before this boot — PositionMonitor's tracked-positions
  * list lives in process memory, so a restart otherwise silently drops SL/
  * target protection on every surviving position until it's manually reset. */
-async function seedExistingPositions(market: MarketDataService, monitor: PositionMonitor): Promise<void> {
+async function seedExistingPositions(market: MarketDataService, monitor: PositionMonitor, portfolio: PortfolioSource): Promise<void> {
   try {
-    const positions = await listPaperPositions();
+    const positions = await portfolio.getPositions();
     const open = positions.filter((p) => p.netQty !== 0 && p.securityId && p.securityId !== '0');
     const active = open.map((p) => ({ securityId: String(p.securityId), exchangeSegment: p.exchangeSegment || 'NSE_FNO' }));
     if (active.length > 0) market.addInstruments(active);

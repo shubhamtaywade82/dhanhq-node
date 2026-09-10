@@ -1,4 +1,5 @@
 import { createWriteStream, existsSync, mkdirSync, readFileSync, type WriteStream } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { moduleLogger } from '../lib/logger';
 import { marketClock } from './marketHours';
@@ -53,7 +54,12 @@ export interface JournalEntry<T = any> {
 // reloaded, which a cached `const DIR = process.env.JOURNAL_DIR ...`
 // evaluated once at import time would silently ignore.
 function journalDir(): string {
-  return process.env.JOURNAL_DIR || join(process.cwd(), '.journal');
+  if (process.env.JOURNAL_DIR) return process.env.JOURNAL_DIR;
+  // Prevent tests from accidentally appending to the runtime journal when JOURNAL_DIR is unset.
+  if (process.env.NODE_ENV === 'test') {
+    return join(tmpdir(), 'dhanhq-node-test-journal');
+  }
+  return join(process.cwd(), '.journal');
 }
 
 export class Journal {
@@ -139,6 +145,21 @@ export class Journal {
     return this.sessionDate;
   }
 
+  /** Re-reads today's journal file from disk — used by boot reconcile
+   * without disturbing the open append stream. */
+  readTodayEntries(sessionDate: string = marketClock().istDate): JournalEntry[] {
+    const file = join(journalDir(), `${sessionDate}.ndjson`);
+    if (!existsSync(file)) return [];
+    const entries: JournalEntry[] = [];
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        entries.push(JSON.parse(line) as JournalEntry);
+      } catch { /* torn final line */ }
+    }
+    return entries;
+  }
+
   /** Resolves once the stream has actually finished flushing to disk —
    * WriteStream.end() only SCHEDULES the flush. A caller that exits the
    * process right after calling close() (server.ts's shutdown handler)
@@ -169,6 +190,12 @@ export interface DayReplaySummary {
    * candidate against both columns, so this list doesn't need to
    * distinguish which kind it is. */
   tradedCorrelationIds: string[];
+  /** correlation_id of every order_intent seen today with NO matching
+   * order_result (any status) later in the journal — an order this process
+   * placed but died before learning the outcome of. Needs resolving on
+   * boot: against paper_orders for paper mode, or the broker's own order
+   * book (GET /orders/external/{id}) for live/sandbox. */
+  unresolvedIntents: string[];
   /** The last kill-switch action recorded today, or null if none. */
   lastKillAction: 'arm' | 'disarm' | null;
 }
@@ -183,16 +210,34 @@ export interface DayReplaySummary {
  * drift. Order-existence and kill-state are the two things a single day's
  * journal can check without that ambiguity.
  */
-export function summarizeDay(entries: JournalEntry[]): DayReplaySummary {
+function matchesMode(e: JournalEntry, mode?: string): boolean {
+  if (!mode) return true;
+  const entryMode = e.payload?.mode;
+  if (entryMode) return entryMode === mode;
+  // Legacy rows written before every engine stamped `mode` on results.
+  if (mode === 'paper') return e.payload?.is_paper !== false;
+  return e.payload?.is_paper === false;
+}
+
+export function summarizeDay(entries: JournalEntry[], mode?: string): DayReplaySummary {
   const tradedCorrelationIds: string[] = [];
+  const intentIds = new Set<string>();
+  const resolvedIds = new Set<string>();
   let lastKillAction: 'arm' | 'disarm' | null = null;
   for (const e of entries) {
-    if (e.kind === 'order_result' && e.payload?.status === 'TRADED' && e.payload?.correlation_id) {
-      tradedCorrelationIds.push(String(e.payload.correlation_id));
+    if (e.kind === 'order_intent' && e.payload?.correlation_id) {
+      if (matchesMode(e, mode)) intentIds.add(String(e.payload.correlation_id));
+    }
+    if (e.kind === 'order_result' && e.payload?.correlation_id) {
+      if (matchesMode(e, mode)) {
+        resolvedIds.add(String(e.payload.correlation_id));
+        if (e.payload?.status === 'TRADED') tradedCorrelationIds.push(String(e.payload.correlation_id));
+      }
     }
     if (e.kind === 'kill' && (e.payload?.action === 'arm' || e.payload?.action === 'disarm')) {
       lastKillAction = e.payload.action;
     }
   }
-  return { tradedCorrelationIds, lastKillAction };
+  const unresolvedIntents = [...intentIds].filter((id) => !resolvedIds.has(id));
+  return { tradedCorrelationIds, unresolvedIntents, lastKillAction };
 }

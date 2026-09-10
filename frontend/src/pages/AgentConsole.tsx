@@ -32,9 +32,10 @@ export function AgentConsole() {
   const { state, setState, showToast, addSystemLog } = useApp();
   const [input, setInput] = useState('');
   const [llmMode, setLlmMode] = useState<string>('…');
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [userExecuting, setUserExecuting] = useState<boolean>(false);
 
   // Live agent status (personas, LLM mode) from the backend on mount.
-  // Real-time steps and state stream live over the WS telemetry channel.
   useEffect(() => {
     let alive = true;
     const loadStatus = async () => {
@@ -51,31 +52,36 @@ export function AgentConsole() {
 
   const runObjective = async (objective: string) => {
     try {
+      setUserExecuting(true);
       const result = await api.runAgent(objective);
+      setActiveRunId(result.runId);
       addSystemLog('INFO', `Agent run ${result.runId} dispatched to backend orchestrator`, 'agent');
       showToast(`Agent run ${result.runId} started (${llmMode} mode) — steps stream live below`, 'success');
-      // Steps arrive over the WS telemetry channel and land in
-      // state.telemetryEvents via AppContext.
     } catch (e: any) {
       showToast(`Agent run failed: ${e.message}`, 'error');
       addSystemLog('ERROR', `Agent run rejected: ${e.message}`, 'agent');
     } finally {
-      setState((prev) => ({ ...prev, agentRunning: false }));
+      setUserExecuting(false);
     }
   };
 
   const execute = () => {
-    if (!input.trim() || state.agentRunning) return;
-    setState((prev) => ({ ...prev, agentRunning: true, agentStartTime: Date.now(), telemetryEvents: [] }));
+    if (!input.trim() || userExecuting) return;
+    setUserExecuting(true);
     addSystemLog('INFO', `Agent objective submitted: ${input}`, 'agent');
     const obj = input;
     setInput('');
     runObjective(obj);
   };
 
-  const events = state.eventFilter === 'all'
-    ? state.telemetryEvents
-    : state.telemetryEvents.filter((e) => e.type === state.eventFilter);
+  // Filter events to prioritize the user's interactive session and exclude background autonomous scan noise
+  const events = state.telemetryEvents.filter((e) => {
+    if (state.eventFilter !== 'all' && e.type !== state.eventFilter) return false;
+    if (activeRunId) return e.runId === activeRunId;
+    return e.triggeredBy !== 'autonomous_scanner';
+  });
+
+  const isBackgroundScanning = state.agentRunning && !userExecuting;
 
   return (
     <div className="flex flex-col h-[calc(100vh-100px)] space-y-3">
@@ -91,7 +97,23 @@ export function AgentConsole() {
             </div>
           </div>
         </div>
+
         <div className="flex items-center gap-3 flex-wrap text-[10px] font-mono">
+          {isBackgroundScanning && (
+            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-surface-200 border border-border text-muted">
+              <StatusDot status="live" pulse />
+              <span>Background scan active</span>
+            </div>
+          )}
+          {activeRunId && (
+            <Button
+              variant="ghost"
+              className="text-[10px] py-0.5 h-6 text-muted hover:text-white"
+              onClick={() => setActiveRunId(null)}
+            >
+              Clear Session
+            </Button>
+          )}
           {Object.entries(AGENT_PERSONAS).map(([k, a]) => {
             const s = state.agentStatus[k] || { status: 'idle', steps: 0 };
             return (
@@ -117,32 +139,46 @@ export function AgentConsole() {
               DhanHQ market data; every step streams here in real time.
             </div>
             <div className="flex justify-center gap-2 flex-wrap text-[10.5px]">
+              <Button variant="ghost" onClick={() => setInput('What is the lot size of options for BANKNIFTY currently')}>BANKNIFTY Lot Size</Button>
+              <Button variant="ghost" onClick={() => setInput('What is the lot size of options for SENSEX currently')}>SENSEX Lot Size</Button>
+              <Button variant="ghost" onClick={() => setInput('Search instrument RELIANCE')}>Search RELIANCE</Button>
+              <Button variant="ghost" onClick={() => setInput('What are the upcoming option expiries for NIFTY?')}>NIFTY Expiries</Button>
+              <Button variant="ghost" onClick={() => setInput('What is my available margin and open positions?')}>Margin & Positions</Button>
               <Button variant="ghost" onClick={() => setInput('Analyze NIFTY option chain and find highest probability trade')}>Analyze NIFTY Chain</Button>
-              <Button variant="ghost" onClick={() => setInput('Audit portfolio Greek risk exposure and short gamma')}>Audit Greeks Risk</Button>
-              <Button variant="ghost" onClick={() => setInput('Review market bias and recommend a defined-risk trade')}>Market Bias Review</Button>
             </div>
           </div>
         )}
 
         {events.map((ev) => {
           const a = AGENT_PERSONAS[ev.agent] || AGENT_PERSONAS.planner;
+          const isAnswer = ev.summary?.startsWith('Answer:');
           return (
-            <div key={ev.id} className="card p-3 slide-in border-l-2 text-xs font-mono" style={{ borderLeftColor: a.color }}>
+            <div
+              key={ev.id}
+              className={`card p-3 slide-in border-l-2 text-xs font-mono ${
+                isAnswer ? 'border-l-emerald-400 bg-emerald-950/20 border-emerald-500/30 shadow-md shadow-emerald-950/20' : ''
+              }`}
+              style={{ borderLeftColor: isAnswer ? '#34d399' : a.color }}
+            >
               <div className="flex items-center justify-between pb-1 mb-1 border-b border-border text-[9.5px]">
                 <div className="flex items-center gap-1.5">
-                  <StatusDot status="live" />
-                  <span style={{ color: a.color }} className="font-bold">{a.name}</span>
+                  <StatusDot status={isAnswer ? 'live' : 'live'} />
+                  <span style={{ color: isAnswer ? '#34d399' : a.color }} className="font-bold">
+                    {isAnswer ? 'Analyst Resolution' : a.name}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2 text-muted">
                   <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold
-                    ${ev.type === 'THINK' ? 'bg-sky/12 text-sky' : ev.type === 'ACT' ? 'bg-accent/12 text-accent' : ev.type === 'CRITIQUE' ? 'bg-pink/12 text-pink' : ev.type === 'ERROR' ? 'bg-danger/12 text-danger' : 'bg-gold/12 text-gold'}`}>
-                    {ev.type}
+                    ${isAnswer ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : ev.type === 'THINK' ? 'bg-sky/12 text-sky' : ev.type === 'ACT' ? 'bg-accent/12 text-accent' : ev.type === 'CRITIQUE' ? 'bg-pink/12 text-pink' : ev.type === 'ERROR' ? 'bg-danger/12 text-danger' : 'bg-gold/12 text-gold'}`}>
+                    {isAnswer ? 'ANSWER' : ev.type}
                   </span>
                   <span>{ev.time}</span>
                   {ev.duration != null && <span>{ev.duration}ms</span>}
                 </div>
               </div>
-              <div className="text-white/80 whitespace-pre-wrap">{ev.summary}</div>
+              <div className={`${isAnswer ? 'text-emerald-100 font-medium text-[12.5px] leading-relaxed' : 'text-white/80'} whitespace-pre-wrap`}>
+                {ev.summary}
+              </div>
               {ev.tool && <div className="code-blk mt-1.5 text-sky">{escapeHtml(ev.tool)}</div>}
               {ev.response && <div className="code-blk mt-1 text-muted whitespace-pre-wrap break-all">{escapeHtml(ev.response)}</div>}
             </div>
@@ -161,8 +197,8 @@ export function AgentConsole() {
             onKeyDown={(e) => { if (e.key === 'Enter') execute(); }}
           />
         </div>
-        <Button onClick={execute} disabled={state.agentRunning}>
-          <Play size={12} /> {state.agentRunning ? 'Running…' : 'Run Objective'}
+        <Button onClick={execute} disabled={userExecuting}>
+          <Play size={12} /> {userExecuting ? 'Running…' : 'Run Objective'}
         </Button>
       </Card>
     </div>

@@ -187,6 +187,53 @@ describe('summarizeDay', () => {
   });
 
   it('handles an empty day', () => {
-    expect(summarizeDay([])).toEqual({ tradedCorrelationIds: [], lastKillAction: null });
+    expect(summarizeDay([])).toEqual({ tradedCorrelationIds: [], unresolvedIntents: [], lastKillAction: null });
+  });
+
+  it('collects an intent with no later result as unresolved, regardless of the result status of others', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'resolved' }),
+      entry(2, 'order_result', { correlation_id: 'resolved', status: 'TRADED' }),
+      entry(3, 'order_intent', { correlation_id: 'died_before_result' }),
+    ];
+    expect(summarizeDay(entries).unresolvedIntents).toEqual(['died_before_result']);
+  });
+
+  it('treats a REJECTED result as resolved, not unresolved', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'a' }),
+      entry(2, 'order_result', { correlation_id: 'a', status: 'REJECTED', reason: 'no LTP' }),
+    ];
+    expect(summarizeDay(entries).unresolvedIntents).toEqual([]);
+  });
+
+  it('filters orders by trading mode when mode is provided', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'paper_1', mode: 'paper' }),
+      entry(2, 'order_result', { correlation_id: 'paper_1', status: 'TRADED', is_paper: true }),
+      entry(3, 'order_intent', { correlation_id: 'live_1', mode: 'live' }),
+      entry(4, 'order_result', { correlation_id: 'live_1', status: 'TRADED', is_paper: false, mode: 'live' }),
+      entry(5, 'order_intent', { correlation_id: 'unresolved_paper', mode: 'paper' }),
+      entry(6, 'order_intent', { correlation_id: 'unresolved_live', mode: 'live' }),
+    ];
+    const paperSummary = summarizeDay(entries, 'paper');
+    expect(paperSummary.tradedCorrelationIds).toEqual(['paper_1']);
+    expect(paperSummary.unresolvedIntents).toEqual(['unresolved_paper']);
+
+    const liveSummary = summarizeDay(entries, 'live');
+    expect(liveSummary.tradedCorrelationIds).toEqual(['live_1']);
+    expect(liveSummary.unresolvedIntents).toEqual(['unresolved_live']);
+  });
+
+  it('filters sandbox journal rows by explicit mode tag', () => {
+    const entries: JournalEntry[] = [
+      entry(1, 'order_intent', { correlation_id: 'sbx_1', mode: 'sandbox' }),
+      entry(2, 'order_result', { correlation_id: 'sbx_1', status: 'TRADED', mode: 'sandbox', is_paper: false }),
+      entry(3, 'order_intent', { correlation_id: 'paper_1', mode: 'paper' }),
+      entry(4, 'order_result', { correlation_id: 'paper_1', status: 'TRADED', mode: 'paper', is_paper: true }),
+    ];
+    const sandboxSummary = summarizeDay(entries, 'sandbox');
+    expect(sandboxSummary.tradedCorrelationIds).toEqual(['sbx_1']);
+    expect(summarizeDay(entries, 'paper').tradedCorrelationIds).toEqual(['paper_1']);
   });
 });

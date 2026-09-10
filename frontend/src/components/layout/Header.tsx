@@ -1,10 +1,9 @@
 import { useState, useEffect } from "react";
 import { useApp } from "../../store/AppContext";
-import { fmt, fmtINR, pnlClass } from "../../utils/formatters";
+import { fmtINR, pnlClass } from "../../utils/formatters";
 import { Button } from "../ui/Button";
 import { StatusDot } from "../ui/StatusDot";
 import { Bolt, Power } from "lucide-react";
-import { useLerpNumber } from "../../hooks/useLerpNumber";
 import { LerpNumber } from "../ui/LerpNumber";
 
 interface HeaderProps {
@@ -20,18 +19,17 @@ interface TickerData {
 }
 
 function Ticker({ label, data, valueClass = "text-white" }: { label: string; data: TickerData | null; valueClass?: string }) {
-  const lerpLtp = useLerpNumber(data?.ltp ?? null, 0.18, 0.05);
-  const lerpPct = useLerpNumber(data?.pct ?? null, 0.18, 0.01);
-
   return (
     <div className="flex items-center gap-1.5 tabular-nums">
       <span className="text-muted text-[10px]">{label}</span>
       {data ? (
         <>
-          <span className={`${valueClass} font-semibold`}>{fmt(lerpLtp)}</span>
+          <span className={`${valueClass} font-semibold`}>
+            <LerpNumber value={data.ltp} decimals={2} />
+          </span>
           <span className={`text-[10px] ${data.change >= 0 ? "text-accent" : "text-danger"}`}>
             {data.change >= 0 ? "+" : ""}
-            {fmt(lerpPct)}%
+            <LerpNumber value={data.pct} decimals={2} suffix="%" />
           </span>
         </>
       ) : (
@@ -63,10 +61,12 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
 
   // Real-time Day P&L and Total Equity calculation from live state
   const realizedPnl = Number(state.funds.realizedPnl || 0);
-  const unrealizedPnl = state.positions.reduce((acc, p) => {
-    const un = p.unrealizedProfit ?? p.unrealizedPnl ?? (Number(p.pnl || 0) - Number(p.realizedProfit || p.realized_pnl || 0));
-    return acc + Number(un || 0);
-  }, 0);
+  const unrealizedPnl = state.positions
+    .filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0)
+    .reduce((acc, p) => {
+      const un = p.unrealizedProfit ?? p.unrealizedPnl ?? (Number(p.pnl || 0) - Number(p.realizedProfit || p.realized_pnl || 0));
+      return acc + Number(un || 0);
+    }, 0);
   const totalPnl = realizedPnl + unrealizedPnl;
   const avail = Number(state.funds.availableMargin || 100000);
   const used = Number(state.funds.usedMargin || 0);
@@ -114,7 +114,7 @@ export function Header({ pageTitle, pageSubtitle, onKillSwitch }: HeaderProps) {
         <div className="flex items-center justify-between w-[250px] shrink-0 px-3 py-1.5 rounded-lg bg-surface-50 border border-border/80 font-mono shadow-sm tabular-nums">
           <div className="flex flex-col w-[95px] shrink-0">
             <span className="text-[8.5px] font-mono text-muted uppercase tracking-wider leading-none">
-              Equity
+              {state.tradingMode === 'paper' ? 'Equity' : 'Net Worth'}
             </span>
             <span className="text-xs font-bold text-white leading-tight truncate">
               <LerpNumber value={totalEquity} decimals={0} prefix="₹" />

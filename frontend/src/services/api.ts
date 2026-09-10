@@ -1,7 +1,6 @@
 import { log } from './logger';
 
-const defaultHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
-const API_BASE = import.meta.env.VITE_API_URL || `http://${defaultHost}:3003`;
+const API_BASE = import.meta.env.VITE_API_URL || '';
 
 /**
  * Central API client.
@@ -89,6 +88,7 @@ export const api = {
   executeStrategy: (id: string) => request<any>('/api/portfolio/paper/strategy/execute', { method: 'POST', body: JSON.stringify({ id }) }),
   closeStrategy: (id: string) => request<any>('/api/portfolio/paper/strategy/close', { method: 'POST', body: JSON.stringify({ id }) }),
   calculateMargin: (items: any[]) => request<any>('/api/portfolio/margin/calculate', { method: 'POST', body: JSON.stringify({ items }) }),
+  marginReconcile: () => request<any>('/api/portfolio/margin/reconcile'),
 
   placePaperOrder: (order: { symbol: string; quantity: number; transactionType: 'BUY' | 'SELL'; price?: number; orderType?: string; productType?: string; securityId?: string }) =>
     request<any>('/api/portfolio/paper/order', {
@@ -96,11 +96,20 @@ export const api = {
       body: JSON.stringify(order),
     }),
 
-  closePaperPosition: (symbol: string, ltp?: number) =>
+  closePaperPosition: (key: { securityId: string; exchangeSegment: string }, ltp?: number) =>
     request<any>('/api/portfolio/paper/positions/close', {
       method: 'POST',
-      body: JSON.stringify({ symbol, ltp }),
+      body: JSON.stringify({ ...key, ltp }),
     }),
+
+  closePosition: (key: { securityId: string; exchangeSegment: string }, ltp?: number) =>
+    request<any>('/api/portfolio/positions/close', {
+      method: 'POST',
+      body: JSON.stringify({ ...key, ltp }),
+    }),
+
+  closeAllPositions: () =>
+    request<any>('/api/portfolio/positions/close-all', { method: 'POST', body: JSON.stringify({}) }),
 
   resetPaperWallet: (initialBalance = 100000) =>
     request<any>('/api/portfolio/paper/wallet/reset', {
@@ -142,6 +151,9 @@ export const api = {
 
   agentEvents: (limit = 100) => request<any[]>(`/api/control/agent/events?limit=${limit}`),
 
+  agentOllamaKeys: () =>
+    request<Array<{ name: string; isCoolingDown: boolean; failureCount: number; lastFailureAt: string | null; activeRequests: number }>>('/api/control/agent/ollama-keys'),
+
   agentTools: () => request<any[]>('/api/control/agent/tools'),
 
   alerts: (limit = 100) => request<any[]>(`/api/control/alerts?limit=${limit}`),
@@ -162,4 +174,24 @@ export const api = {
 
   ollamaHealth: () => request<{ status: string }>('/api/ollama/health'),
   ollamaModels: () => request<any>('/api/ollama/models'),
+
+  // ── research ───────────────────────────────────────────────────────
+  researchAnalyze: (symbol: string, exchange?: string) =>
+    request<any>('/api/research/analyze', { method: 'POST', body: JSON.stringify({ symbol, exchange }) }),
+  researchRuns: (limit = 20) => request<{ count: number; runs: any[] }>(`/api/research/runs?limit=${limit}`),
+  researchRun: (runId: string) => request<any>(`/api/research/${runId}`),
+  researchEvidence: (runId: string) => request<{ runId: string; count: number; evidence: any[] }>(`/api/research/${runId}/evidence`),
+  researchSignal: (symbol: string) => request<any>(`/api/research/signal/${symbol}`),
+  researchUniverses: (exchange = 'NSE') =>
+    request<{ exchange: string; universes: any[] }>(`/api/research/universes?exchange=${exchange}`),
+  researchScreen: (universe: string, preset: string, exchange = 'NSE') =>
+    request<any>('/api/research/screen', { method: 'POST', body: JSON.stringify({ universe, preset, exchange }) }),
+  researchScreenAndAnalyze: (universe: string, preset: string, topN = 3, exchange = 'NSE') =>
+    request<any>('/api/research/screen-and-analyze', { method: 'POST', body: JSON.stringify({ universe, preset, topN, exchange }) }),
+  researchWatchlist: () => request<{ count: number; watchlist: any[] }>('/api/research/watchlist'),
+  researchWatchlistRefresh: (universe?: string, preset?: string, exchange = 'NSE') =>
+    request<{ count: number; watchlist: any[] }>('/api/research/watchlist/refresh', { method: 'POST', body: JSON.stringify({ universe, preset, exchange }) }),
+  researchSchedulerStatus: () => request<any>('/api/research/scheduler/status'),
+  researchSchedulerTrigger: (phase: string) =>
+    request<any>('/api/research/scheduler/trigger', { method: 'POST', body: JSON.stringify({ phase }) }),
 };

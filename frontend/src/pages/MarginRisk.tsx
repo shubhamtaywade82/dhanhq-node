@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useApp } from '../store/AppContext';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -34,12 +34,21 @@ export function MarginRisk() {
   const { state, showToast, addSystemLog, refreshPortfolio } = useApp();
   const [activeTab, setActiveTab] = useState('single');
   const [calcResult, setCalcResult] = useState<{ totalMargin: number; spanMargin: number; exposureMargin: number } | null>(null);
+  const [reconcile, setReconcile] = useState<any>(null);
+  const mode = state.tradingMode || 'paper';
+  const isBroker = mode === 'sandbox' || mode === 'live';
 
   const avail = Number(state.funds.availableMargin || 100000);
   const used = Number(state.funds.usedMargin || 0);
   const total = Number(state.funds.totalBalance || (avail + used));
+  const equity = Number(state.funds.equity ?? total);
   const realized = Number(state.funds.realizedPnl || 0);
   const utilPct = total > 0 ? (used / total) * 100 : 0;
+
+  useEffect(() => {
+    if (!isBroker) return;
+    api.marginReconcile().then(setReconcile).catch(() => setReconcile(null));
+  }, [isBroker, state.positions.length, state.orders.length]);
 
   const handleResetWallet = async () => {
     try {
@@ -82,11 +91,17 @@ export function MarginRisk() {
       <div className="flex items-center justify-between">
         <div>
           <div className="text-xs font-mono text-muted uppercase tracking-widest font-semibold">Margin & Risk Management</div>
-          <div className="text-xs text-muted mt-0.5">Real-time PostgreSQL demo account balance and margin governor</div>
+          <div className="text-xs text-muted mt-0.5">
+            {isBroker
+              ? `${mode === 'sandbox' ? 'Sandbox' : 'Live'} broker margin — net worth includes blocked collateral`
+              : 'Real-time PostgreSQL demo account balance and margin governor'}
+          </div>
         </div>
-        <Button variant="danger" onClick={handleResetWallet}>
-          <RotateCcw size={12} className="mr-1" /> Reset Demo Account (₹1L)
-        </Button>
+        {mode === 'paper' && (
+          <Button variant="danger" onClick={handleResetWallet}>
+            <RotateCcw size={12} className="mr-1" /> Reset Demo Account (₹1L)
+          </Button>
+        )}
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -164,6 +179,34 @@ export function MarginRisk() {
           </div>
         )}
       </Card>
+
+      {isBroker && reconcile && (
+        <Card className="p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest font-semibold">Margin Reconcile Diagnostic</div>
+            <span className={`text-[10px] font-mono font-semibold ${reconcile.healthy ? 'text-accent' : 'text-gold'}`}>
+              {reconcile.healthy ? 'IN SYNC' : 'REVIEW NEEDED'}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 font-mono text-xs mb-3">
+            <div><span className="text-muted block text-[9px] uppercase">Net Worth</span><span className="text-gold font-bold">{fmtINR(reconcile.broker?.equity ?? equity)}</span></div>
+            <div><span className="text-muted block text-[9px] uppercase">Available Cash</span><span className="text-accent font-bold">{fmtINR(reconcile.broker?.availableMargin ?? avail)}</span></div>
+            <div><span className="text-muted block text-[9px] uppercase">Broker Margin Used</span><span className="text-white font-bold">{fmtINR(reconcile.broker?.usedMargin ?? used)}</span></div>
+            <div><span className="text-muted block text-[9px] uppercase">Local Ledger Used</span><span className="text-white font-bold">{fmtINR(reconcile.paperLedger?.usedMargin ?? 0)}</span></div>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 font-mono text-xs mb-3">
+            <div><span className="text-muted block text-[9px] uppercase">Open @ Broker</span><span className="text-white">{reconcile.positions?.brokerOpen ?? 0}</span></div>
+            <div><span className="text-muted block text-[9px] uppercase">Open @ Local</span><span className="text-white">{reconcile.positions?.paperOpen ?? 0}</span></div>
+            <div><span className="text-muted block text-[9px] uppercase">Pending Orders</span><span className="text-white">{reconcile.pendingOrders?.length ?? 0}</span></div>
+            <div><span className="text-muted block text-[9px] uppercase">Broker − Local Drift</span><span className={Number(reconcile.drift?.brokerVsPaperUsed) > 100 ? 'text-gold' : 'text-white'}>{fmtINR(reconcile.drift?.brokerVsPaperUsed ?? 0)}</span></div>
+          </div>
+          {reconcile.notes?.length > 0 && (
+            <ul className="text-[10px] font-mono text-muted space-y-1 list-disc pl-4">
+              {reconcile.notes.map((note: string, i: number) => <li key={i}>{note}</li>)}
+            </ul>
+          )}
+        </Card>
+      )}
 
       <Card className="p-4 overflow-x-auto">
         <div className="text-[9.5px] font-mono text-muted uppercase tracking-widest mb-3 font-semibold">Live Circuit Breakers & Risk Governance Rules</div>

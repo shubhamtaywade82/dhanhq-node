@@ -116,7 +116,7 @@ function applyEnvelope(prev: AppState, env: Envelope): AppState {
     }
     case 'alert': {
       const p = env.payload || {};
-      const alert = { id: env.ts + prev.alertIdCounter, time: new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', msg: p.msg || p.message || '', read: false };
+      const alert = { id: env.ts + prev.alertIdCounter, time: new Date().toLocaleTimeString('en-GB', { hour12: false }), level: p.level || 'INFO', msg: p.msg || p.message || '', read: false, source: p.source || 'system' };
       const alerts = [...prev.alerts, alert];
       return { ...prev, alerts: alerts.length > 200 ? alerts.slice(-200) : alerts, alertIdCounter: prev.alertIdCounter + 1 };
     }
@@ -126,8 +126,11 @@ function applyEnvelope(prev: AppState, env: Envelope): AppState {
         ...prev,
         telemetryEvents: [...prev.telemetryEvents.slice(-399), {
           id: p.id || `ev_${env.ts}`,
+          runId: p.runId,
+          triggeredBy: p.triggeredBy,
           agent: p.agent || 'planner',
           type: p.type || 'ACT',
+          engine: p.engine,
           time: p.time || new Date().toLocaleTimeString('en-GB', { hour12: false }),
           summary: p.summary,
           tool: p.tool,
@@ -292,6 +295,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
           killed: !!health.killed,
           live: !health.killed,
           uptimeSeconds: Math.floor(health.uptime || 0),
+          tradingMode: (health.mode as AppState['tradingMode']) || 'paper',
+          persistence: health.persistence || prev.persistence,
         }));
       } catch {
         if (mounted) setConnected(false);
@@ -322,8 +327,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const uptimeInterval = setInterval(async () => {
       if (!mounted) return;
       setState((prev) => {
+        const realized = Number(prev.funds.sessionRealizedPnl ?? prev.funds.realizedPnl ?? 0);
         const unrealized = prev.positions.reduce((acc, p) => acc + (p.unrealizedProfit || p.unrealizedPnl || 0), 0);
-        const totalPnl = (prev.funds.realizedPnl || 0) + unrealized;
+        const totalPnl = realized + unrealized;
         const pnlHistory = [...prev.pnlHistory, { t: Date.now(), v: Math.round(totalPnl) }];
         // 1 point/sec for a full NSE session (09:15-15:30) — chart shows the
         // actual intraday curve, not a rolling few-minute window.

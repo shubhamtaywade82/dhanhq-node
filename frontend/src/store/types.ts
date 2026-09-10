@@ -1,3 +1,9 @@
+/** Canonical instrument identity for order/position actions. */
+export interface InstrumentKey {
+  securityId: string;
+  exchangeSegment: string;
+}
+
 export interface IndexData {
   ltp: number;
   change: number;
@@ -77,6 +83,7 @@ export interface Alert {
   level: 'INFO' | 'WARN' | 'ERROR';
   msg: string;
   read: boolean;
+  source?: string;
 }
 
 export interface SidekiqWorker {
@@ -118,10 +125,14 @@ export interface AgentStatus {
 
 export interface TelemetryEvent {
   id: string;
+  runId?: string;
+  triggeredBy?: string;
   agent: string;
   type: string;
   time: string;
   summary?: string;
+  /** Whether the backend step was deterministic or LLM-driven. */
+  engine?: 'DETERMINISTIC' | 'AI' | 'AI_FALLBACK';
   tool?: string;
   response?: string;
   duration?: number;
@@ -186,6 +197,7 @@ export interface AppState {
   marketTickAgeSec: number | null;
   llmMode: string;
   persistence: string;
+  tradingMode: 'paper' | 'sandbox' | 'live';
 }
 
 export type ToastType = 'success' | 'error' | 'warning';

@@ -18,6 +18,7 @@ import { SidekiqInfra } from "./pages/SidekiqInfra";
 import { Alerts } from "./pages/Alerts";
 import { Logs } from "./pages/Logs";
 import { Config } from "./pages/Config";
+import { ResearchConsole } from "./pages/ResearchConsole";
 import { api } from "./services/api";
 import { openDeployStrategyModal } from "./pages/DeployModal";
 
@@ -29,6 +30,7 @@ const PAGE_TITLES: Record<string, [string, string]> = {
   positions: ["Positions", "OPTIMISTIC LOCKING (AR)"],
   orders: ["Order Book", "FULL AUDIT TRAIL"],
   "agent-console": ["Agent Console", "REACT MULTI-AGENT LOOP"],
+  "research-console": ["Research Console", "INSTITUTIONAL EQUITY INTELLIGENCE"],
   "agent-monitor": ["Ops Telemetry", "AGENT INTERNAL METRICS"],
   "agent-tools-memory": ["Tools & Memory", "PILLARS 2 & 3"],
   "greeks-analytics": ["Greeks & Volatility", "ANALYTICS & IV SURFACE"],
@@ -174,6 +176,8 @@ function AppInner() {
         return <Orders />;
       case "agent-console":
         return <AgentConsole />;
+      case "research-console":
+        return <ResearchConsole />;
       case "agent-monitor":
         return <AgentMonitor />;
       case "agent-tools-memory":

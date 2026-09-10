@@ -1,4 +1,4 @@
-import { marketClock, nearestIndexExpiry } from '../services/marketHours';
+import { marketClock, nearestIndexExpiry, isWsMarketWindowOpen, getWsMarketWindow, msUntilNextWsWindow } from '../services/marketHours';
 import { isTradingHoliday, hasHolidayCoverage } from '../services/holidays';
 
 describe('holiday calendar', () => {
@@ -65,5 +65,61 @@ describe('nearestIndexExpiry', () => {
     // spot-check that the resolved date is never itself a holiday.
     const expiry = nearestIndexExpiry('BANKNIFTY', new Date('2026-03-01T05:00:00Z'));
     expect(isTradingHoliday(expiry)).toBe(false);
+  });
+});
+
+describe('WebSocket market hours gating', () => {
+  it('allows NSE WebSocket connections starting 5m before market open (09:10 IST)', () => {
+    // 2026-01-06 (Tuesday, trading day)
+    // 09:09 IST = 03:39 UTC -> closed
+    expect(isWsMarketWindowOpen(false, new Date('2026-01-06T03:39:00Z'))).toBe(false);
+    // 09:10 IST = 03:40 UTC -> open
+    expect(isWsMarketWindowOpen(false, new Date('2026-01-06T03:40:00Z'))).toBe(true);
+    // 12:00 IST = 06:30 UTC -> open
+    expect(isWsMarketWindowOpen(false, new Date('2026-01-06T06:30:00Z'))).toBe(true);
+    // 15:35 IST = 10:05 UTC -> open (cutoff boundary)
+    expect(isWsMarketWindowOpen(false, new Date('2026-01-06T10:05:00Z'))).toBe(true);
+    // 15:36 IST = 10:06 UTC -> closed
+    expect(isWsMarketWindowOpen(false, new Date('2026-01-06T10:06:00Z'))).toBe(false);
+  });
+
+  it('extends WebSocket hours for MCX until 23:35 IST', () => {
+    // 2026-01-06 08:54 IST = 03:24 UTC -> closed
+    expect(isWsMarketWindowOpen(true, new Date('2026-01-06T03:24:00Z'))).toBe(false);
+    // 08:55 IST = 03:25 UTC -> open
+    expect(isWsMarketWindowOpen(true, new Date('2026-01-06T03:25:00Z'))).toBe(true);
+    // 18:00 IST = 12:30 UTC -> open (NSE closed, but MCX open)
+    expect(isWsMarketWindowOpen(false, new Date('2026-01-06T12:30:00Z'))).toBe(false);
+    expect(isWsMarketWindowOpen(true, new Date('2026-01-06T12:30:00Z'))).toBe(true);
+    // 23:35 IST = 18:05 UTC -> open (cutoff boundary)
+    expect(isWsMarketWindowOpen(true, new Date('2026-01-06T18:05:00Z'))).toBe(true);
+    // 23:36 IST = 18:06 UTC -> closed
+    expect(isWsMarketWindowOpen(true, new Date('2026-01-06T18:06:00Z'))).toBe(false);
+  });
+
+  it('keeps WebSocket closed on weekends and trading holidays', () => {
+    // Weekend: Saturday 2026-01-10 10:00 IST = 04:30 UTC
+    expect(isWsMarketWindowOpen(false, new Date('2026-01-10T04:30:00Z'))).toBe(false);
+    expect(isWsMarketWindowOpen(true, new Date('2026-01-10T04:30:00Z'))).toBe(false);
+    // Trading holiday: 2026-03-31 10:00 IST = 04:30 UTC
+    expect(isWsMarketWindowOpen(false, new Date('2026-03-31T04:30:00Z'))).toBe(false);
+    expect(isWsMarketWindowOpen(true, new Date('2026-03-31T04:30:00Z'))).toBe(false);
+  });
+
+  it('calculates ms until next WS market window accurately', () => {
+    // Tuesday 08:00 IST -> opens today at 09:10 IST (70 mins = 4,200,000 ms)
+    const ms = msUntilNextWsWindow(false, new Date('2026-01-06T02:30:00Z'));
+    expect(ms).toBe(70 * 60 * 1000);
+
+    // Tuesday 16:00 IST -> opens Wednesday at 09:10 IST (17h 10m = 61,800,000 ms)
+    const msNextDay = msUntilNextWsWindow(false, new Date('2026-01-06T10:30:00Z'));
+    expect(msNextDay).toBe(17 * 60 * 60 * 1000 + 10 * 60 * 1000);
+  });
+
+  it('returns window metadata via getWsMarketWindow', () => {
+    const meta = getWsMarketWindow(false, new Date('2026-01-06T05:00:00Z'));
+    expect(meta.isOpen).toBe(true);
+    expect(meta.openTimeStr).toBe('09:10');
+    expect(meta.closeTimeStr).toBe('15:35');
   });
 });

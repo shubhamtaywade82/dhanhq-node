@@ -71,7 +71,7 @@ export class PaperExecutionEngine {
     if (!gate.allowed) {
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${gate.reason}`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
-      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason, mode: 'paper' });
       return { status: 'REJECTED', reason: gate.reason };
     }
 
@@ -91,7 +91,7 @@ export class PaperExecutionEngine {
         const reason = `LIMIT price ${price} not marketable vs LTP ${liveLtp}`;
         eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${reason}`, 'paper_engine');
         eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason });
-        journal.append('order_result', { correlation_id, status: 'REJECTED', reason });
+        journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'paper' });
         return { status: 'REJECTED', reason };
       }
       referencePrice = transaction_type === 'BUY' ? Math.min(liveLtp, price) : Math.max(liveLtp, price);
@@ -99,7 +99,7 @@ export class PaperExecutionEngine {
     if (referencePrice == null || referencePrice <= 0) {
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: no live LTP for ${symbol} (security ${security_id})`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: 'No live LTP available for instrument' });
-      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: 'No live LTP available for instrument' });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: 'No live LTP available for instrument', mode: 'paper' });
       return { status: 'REJECTED', reason: 'No live LTP available for instrument' };
     }
 
@@ -135,13 +135,14 @@ export class PaperExecutionEngine {
       // a broker would, not a 500.
       eventBus.log('WARN', `Paper order REJECTED for ${correlation_id}: ${e.message}`, 'paper_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: e.message });
-      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: e.message });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: e.message, mode: 'paper' });
       return { status: 'REJECTED', reason: e.message };
     }
 
     const fillPayload = {
       intent_id,
       correlation_id,
+      mode: 'paper' as const,
       is_paper: true,
       fill_price: result.fillPrice,
       quantity,

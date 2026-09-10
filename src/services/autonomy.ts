@@ -7,10 +7,11 @@ import { toTrailConfig } from './marketData';
 import type { RiskEngine } from './riskEngine';
 import type { AgentOrchestrator } from './agent';
 import type { AdaptiveSupertrendScanner } from './adaptiveSupertrendScanner';
+import type { ResearchOrchestrator } from './research/researchOrchestrator';
 import { LongOptionPositionManager } from './longOptionPositionManager';
 import {
   listPaperStrategies, updatePaperStrategyStatus, pushAlert,
-  reconcileLedger, correctLedgerFromPostgres,
+  reconcileLedger, correctLedgerFromPostgres, closeParentStrategyIfFlat,
 } from '../db';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 
@@ -33,6 +34,7 @@ export class AutonomyEngine {
   private risk: RiskEngine;
   private portfolio: PortfolioSource;
   private agent: AgentOrchestrator | null = null;
+  private research: ResearchOrchestrator | null = null;
   private scanner: AdaptiveSupertrendScanner | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private enabled = true;
@@ -41,6 +43,7 @@ export class AutonomyEngine {
   private lastCycleAt = 0;
   private lastScanAt = 0;
   private lastLedgerCheckAt = 0;
+  private lastStaleWarnAt = 0;
   private cycles = 0;
   private eodDone = false;
   private eodDate = '';
@@ -54,16 +57,25 @@ export class AutonomyEngine {
     this.market = market;
     this.risk = risk;
     this.portfolio = portfolio;
-    this.longOptionManager = new LongOptionPositionManager(market);
+    this.longOptionManager = new LongOptionPositionManager(market, portfolio);
   }
 
   setAgent(agent: AgentOrchestrator): void {
     this.agent = agent;
   }
 
+  setResearch(research: ResearchOrchestrator): void {
+    this.research = research;
+  }
+
+  getScanner(): AdaptiveSupertrendScanner | null {
+    return this.scanner;
+  }
+
   setScanner(scanner: AdaptiveSupertrendScanner): void {
     this.scanner = scanner;
     eventBus.log('SYSTEM', 'Adaptive Supertrend scanner armed (1m/5m, naked ATM CE/PE)', 'adaptive_supertrend');
+    void scanner.warmup();
   }
 
   setScanEnabled(on: boolean): void {
@@ -139,13 +151,14 @@ export class AutonomyEngine {
 
       if (this.enabled) {
         const mark = await this.portfolio.markToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
-        if (clock.isMarketOpen && mark.staleCount > 0) {
+        if (clock.isMarketOpen && mark.staleCount > 0 && Date.now() - this.lastStaleWarnAt > 60_000) {
+          this.lastStaleWarnAt = Date.now();
           eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
         }
+        await this.longOptionManager.evaluate(clock.squareOffWindow);
         await this.reconcileMonitor();
         await this.reconcileUnmanagedLivePositions();
         await this.reconcileLedgerAgainstPostgres();
-        await this.longOptionManager.evaluate(clock.squareOffWindow);
         await this.publishPortfolioSnapshot();
         await this.enforceStrategyLimits();
 
@@ -170,15 +183,17 @@ export class AutonomyEngine {
 
   private async evaluateAutonomousScan(clock: ReturnType<typeof marketClock>): Promise<void> {
     if (!this.scanEnabled || !this.agent || !clock.isMarketOpen || clock.squareOffWindow) return;
-    if (Date.now() - this.lastScanAt < 60_000) return; // 60s scan cooldown
+    const cooldown = Number(process.env.AUTONOMOUS_SCAN_INTERVAL_MS) || 180_000;
+    if (Date.now() - this.lastScanAt < cooldown) return;
 
     const gate = this.risk.canTrade();
     if (!gate.allowed) return;
 
-    // Portfolio-abstraction-aware — a direct listPaperPositions() call here
-    // would check the paper ledger even in broker mode (always near-empty,
-    // since real positions live at the broker), silently disabling this
-    // cap for live trading instead of enforcing it.
+    // Skip heavy multi-index option chain pulls if circuit breakers are in error state
+    const breakers = this.risk.snapshot().breakers || [];
+    if (breakers.some((b) => b.state === 'ERROR')) return;
+
+    // Portfolio-abstraction-aware — check real open position cap
     const positions = await this.portfolio.getPositions();
     if (positions.filter((p) => p.netQty !== 0).length >= MAX_CONCURRENT_POSITIONS) return;
 
@@ -204,27 +219,14 @@ export class AutonomyEngine {
         // adverse move that fired it — priced with extra slippage vs. a
         // target hit or a manual close, which fill more like a resting order.
         const kind = p.reason === 'stop_loss' || p.reason === 'trailing_stop' ? 'STOP' : 'EXIT';
-        const res = await this.portfolio.closePosition(pos.tradingSymbol, ltp, kind);
+        const res = await this.portfolio.closePosition({ securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment }, ltp, kind);
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         eventBus.log('TRADE', `Auto-exit ${pos.tradingSymbol}: ${res.status} @ ₹${ltp} (${p.reason})`, 'autonomy');
-        await this.closeParentStrategyIfFlat(pos.tradingSymbol);
+        await closeParentStrategyIfFlat(pos.tradingSymbol, await this.portfolio.getPositions());
       }
     } catch (e: any) {
       eventBus.log('ERROR', `Auto-exit failed: ${e.message}`, 'autonomy');
     }
-  }
-
-  /** A leg closing via SL/target/trailing (not the strategy-level loss-limit
-   * path below) never told the parent strategy — it stayed RUNNING forever
-   * with a stale PnL once all its legs were flat. */
-  private async closeParentStrategyIfFlat(tradingSymbol: string): Promise<void> {
-    const strategies = await listPaperStrategies();
-    const strat = strategies.find((s: any) => s.status === 'RUNNING' && (s.legs || []).some((l: any) => l.instrument === tradingSymbol));
-    if (!strat) return;
-    const positions = await this.portfolio.getPositions();
-    const posMap = new Map(positions.map((p) => [p.tradingSymbol, p]));
-    const stillOpen = (strat.legs || []).some((l: any) => Number(posMap.get(l.instrument)?.netQty || 0) !== 0);
-    if (!stillOpen) await updatePaperStrategyStatus(strat.id, 'STOPPED');
   }
 
   /**
@@ -329,6 +331,7 @@ export class AutonomyEngine {
       if (p.netQty === 0 || !p.securityId || p.securityId === '0') continue;
       const key = `${p.exchangeSegment || 'NSE_FNO'}:${p.securityId}`;
       if (trackedKeys.has(key)) continue;
+      if (this.longOptionManager.isEnabled() && this.longOptionManager.getState(p.tradingSymbol)) continue;
 
       const msg = `UNMANAGED LIVE POSITION: ${p.tradingSymbol} (${key}, netQty=${p.netQty}) is open at the broker with no stop-loss/target/trailing-stop tracked by this process. Flattening immediately and halting autonomous trading.`;
       eventBus.log('ERROR', msg, 'autonomy');
@@ -338,7 +341,7 @@ export class AutonomyEngine {
         threshold: 'every open broker position must be tracked by PositionMonitor', action: 'Squared off and armed kill switch',
       });
 
-      const closeResult = await this.portfolio.closePosition(p.tradingSymbol).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
+      const closeResult = await this.portfolio.closePosition({ securityId: String(p.securityId), exchangeSegment: p.exchangeSegment }).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
       eventBus.log(
         closeResult.status === 'TRADED' ? 'TRADE' : 'ERROR',
         `Unmanaged position square-off ${p.tradingSymbol}: ${closeResult.status}${closeResult.reason ? ` (${closeResult.reason})` : ''}`,
@@ -442,7 +445,7 @@ export class AutonomyEngine {
       const pos = positions.find((p) => p.tradingSymbol === leg.instrument);
       if (pos && pos.netQty !== 0) {
         const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
-        await this.portfolio.closePosition(leg.instrument, ltp).catch(() => {});
+        await this.portfolio.closePosition({ securityId: String(leg.securityId || pos.securityId), exchangeSegment: leg.exchangeSegment || pos.exchangeSegment }, ltp).catch(() => {});
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       }
     }
@@ -455,7 +458,7 @@ export class AutonomyEngine {
     for (const pos of positions) {
       if (pos.netQty === 0) continue;
       const ltp = this.market.getFillablePrice(String(pos.securityId), { allowClosed: true }) ?? this.market.getLtp(String(pos.securityId)) ?? pos.ltp;
-      await this.portfolio.closePosition(pos.tradingSymbol, ltp).catch(() => {});
+      await this.portfolio.closePosition({ securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment }, ltp).catch(() => {});
       this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       closed++;
     }

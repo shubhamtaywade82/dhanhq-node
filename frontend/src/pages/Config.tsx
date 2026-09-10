@@ -20,6 +20,7 @@ export function Config() {
   const [meta, setMeta] = useState<any>(null);
   const [limits, setLimits] = useState<any>({ dailyLossLimit: 50000, maxMarginUtilPct: 70, perStrategyLossLimit: 20000, maxConsecutiveLosses: 5 });
   const [ollama, setOllama] = useState<{ status: string; error?: string } | null>(null);
+  const [ollamaKeys, setOllamaKeys] = useState<Array<{ name: string; isCoolingDown: boolean; failureCount: number; lastFailureAt: string | null; activeRequests: number }>>([]);
   const [brokerStatus, setBrokerStatus] = useState<string>('');
   const [autonomyOn, setAutonomyOn] = useState<boolean | null>(null);
   const [longOptionPolicyOn, setLongOptionPolicyOn] = useState<boolean | null>(null);
@@ -38,6 +39,9 @@ export function Config() {
     try {
       setOllama(await api.ollamaHealth());
     } catch { setOllama({ status: 'unreachable' }); }
+    try {
+      setOllamaKeys(await api.agentOllamaKeys());
+    } catch { setOllamaKeys([]); }
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -204,6 +208,23 @@ export function Config() {
             <div className="text-[9.5px] font-mono text-muted">
               Start Ollama (<code>ollama serve</code>) to enable LLM reasoning. Agent runs still execute with real DhanHQ
               tools in deterministic mode — never fabricated output.
+            </div>
+          )}
+          {ollamaKeys.some((k) => k.name.startsWith('credential:')) && (
+            <div className="space-y-1 pt-1">
+              <div className="text-[9px] font-mono text-muted uppercase">Ollama Cloud Keys</div>
+              {ollamaKeys.map((k) => (
+                <div key={k.name} className="flex items-center justify-between text-[10px] font-mono border-b border-border/40 pb-1">
+                  <span className="text-white">{k.name.replace('credential:', '')}</span>
+                  <span className="flex items-center gap-2">
+                    {k.failureCount > 0 && <span className="text-muted">{k.failureCount} failure{k.failureCount === 1 ? '' : 's'}</span>}
+                    <span className={k.isCoolingDown ? 'text-danger font-bold' : 'text-accent'}>{k.isCoolingDown ? 'COOLING DOWN' : 'ACTIVE'}</span>
+                  </span>
+                </div>
+              ))}
+              <div className="text-[9px] font-mono text-muted pt-0.5">
+                A key cools down after repeated failures (e.g. a weekly quota hit) and is skipped until it recovers — the SDK falls over to the next one automatically either way.
+              </div>
             </div>
           )}
         </Card>

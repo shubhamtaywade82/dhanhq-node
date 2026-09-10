@@ -1,7 +1,8 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { PositionMonitor, OrderUpdateWS, RateLimitError } from '@nemesis-oss/dhanhq-sdk';
+import { hasTotpCredentials, hasExternalAuthProvider } from '../auth';
 import { eventBus } from './eventBus';
-import { marketClock, istNow } from './marketHours';
+import { marketClock, istNow, isWsMarketWindowOpen, msUntilNextWsWindow } from './marketHours';
 
 /**
  * Always-on market data service.
@@ -142,11 +143,41 @@ export class MarketDataService {
     eventBus.log('SYSTEM', `Market data service started (ws=${this.wsStarted ? 'attempting' : 'unavailable'}, rest fallback armed)`, 'market_data');
   }
 
-  private tryStartWs(): void {
-    // Only bring up the DhanHQ binary WS when a token is actually resolvable
-    const tokenResolvable = !!(process.env.DHAN_ACCESS_TOKEN && process.env.DHAN_ACCESS_TOKEN !== 'your_access_token')
-      || !!(process.env.DHAN_PIN && process.env.DHAN_TOTP_SECRET)
-      || !!(process.env.DHAN_AUTH_PROVIDER_URL && process.env.DHAN_AUTH_PROVIDER_TOKEN);
+  private hasMcxSubscription(): boolean {
+    if (process.env.MCX_ENABLED === 'true') return true;
+    for (const key of this.extraSubscriptions) {
+      if (key.startsWith('MCX_COMM:')) return true;
+    }
+    return false;
+  }
+
+  private disconnectWs(): void {
+    this.wsConnecting = false;
+    this.wsStarted = false;
+    if (this.wsRetryTimer) {
+      clearTimeout(this.wsRetryTimer);
+      this.wsRetryTimer = null;
+    }
+    if (this.wsSilenceWatch) {
+      clearInterval(this.wsSilenceWatch);
+      this.wsSilenceWatch = null;
+    }
+    const ws: any = (this.client as any).ws;
+    try { ws?.market?.disconnect?.(); } catch { /* noop */ }
+    try { ws?.orders?.disconnect?.(); } catch { /* noop */ }
+  }
+
+  private tryStartWs(force = false): void {
+    if (!force && !isWsMarketWindowOpen(this.hasMcxSubscription())) {
+      const nextMs = msUntilNextWsWindow(this.hasMcxSubscription());
+      const nextMin = Math.round(nextMs / 60_000);
+      eventBus.log('INFO', `Outside WebSocket market hours (window: 09:10–15:35 IST) — connection deferred (${nextMin}m until open)`, 'market_data');
+      if (this.wsStarted) this.disconnectWs();
+      return;
+    }
+
+    // Only bring up the DhanHQ binary WS when credentials can resolve a token
+    const tokenResolvable = hasTotpCredentials() || hasExternalAuthProvider();
     if (!tokenResolvable) {
       eventBus.log('WARN', 'No DhanHQ credentials configured — binary WS disabled, REST polling will serve market data when a token appears', 'market_data');
       return;
@@ -166,7 +197,7 @@ export class MarketDataService {
       this.wsConnecting = false;
     }
     if (Date.now() - this.lastWs429At < 60_000) {
-      this.scheduleWsRetry(60_000 - (Date.now() - this.lastWs429At));
+      this.scheduleWsRetry(60_000 - (Date.now() - this.lastWs429At), force);
       return;
     }
 
@@ -203,13 +234,14 @@ export class MarketDataService {
           this.source = 'ws';
           this.ingestTick(tick);
         });
-        ws.market?.on?.('close', (code: number) => {
+        ws.market?.on?.('close', () => {
           this.wsConnecting = false;
           if (!this.wsStarted) return;
           this.wsStarted = false;
-          eventBus.log('WARN', `Market WS closed (code=${code}) — reconnecting`, 'market_data');
+          // SDK BaseWS emits "close" with no args — the underlying ws code/reason are not forwarded.
+          eventBus.log('WARN', 'Market WS closed — reconnecting', 'market_data');
           eventBus.emit('system', { type: 'feed_degraded', source: 'rest' });
-          this.scheduleWsRetry();
+          this.scheduleWsRetry(undefined, force);
         });
         ws.market?.on?.('error', (e: any) => {
           const msg = e?.message || String(e);
@@ -223,7 +255,7 @@ export class MarketDataService {
             this.wsStarted = false;
             try { ws.market?.disconnect?.(); } catch { /* noop */ }
             this.requestRestRefresh();
-            this.scheduleWsRetry(60_000);
+            this.scheduleWsRetry(60_000, force);
             return;
           }
           eventBus.log('WARN', `Market WS error: ${msg}`, 'market_data');
@@ -242,8 +274,8 @@ export class MarketDataService {
             eventBus.log('WARN', `Orders WS error: ${msg}`, 'market_data');
           }
         });
-        ws.orders?.on?.('close', (code: number) => {
-          eventBus.log('INFO', `Orders WS closed (code=${code})`, 'market_data');
+        ws.orders?.on?.('close', () => {
+          eventBus.log('INFO', 'Orders WS closed', 'market_data');
         });
       }
 
@@ -256,27 +288,18 @@ export class MarketDataService {
           if (msg.includes('429')) {
             this.lastWs429At = Date.now();
             this.requestRestRefresh();
-            this.scheduleWsRetry(60_000);
+            this.scheduleWsRetry(60_000, force);
           }
         });
       } else if (!this.wsStarted) {
-        // isConnected can lag reality: the SDK only flips it to false
-        // inside the underlying transport's own async 'close' event, not
-        // synchronously when we call disconnect() (armSilenceWatch, the
-        // 429 handler) — so a retry landing in that window sees a
-        // stale-true isConnected and skips connect() above entirely.
-        // Nothing else in this function schedules a retry for that case,
-        // so without this the reconnect loop would die permanently here:
-        // wsStarted stays false, isConnected stays stale-true, and nothing
-        // ever calls connect() again.
-        this.scheduleWsRetry();
+        this.scheduleWsRetry(undefined, force);
       }
       if (!ws.orders?.isConnected) {
         ws.orders?.connect?.().catch(() => {});
       }
     } catch (e: any) {
       eventBus.log('WARN', `DhanHQ WebSocket start failed (${e?.message || e}) — REST polling only`, 'market_data');
-      this.scheduleWsRetry();
+      this.scheduleWsRetry(undefined, force);
     }
   }
 
@@ -296,13 +319,14 @@ export class MarketDataService {
   }
 
   // Capped exponential backoff with custom override for 429 rate limits
-  private scheduleWsRetry(customDelay?: number): void {
+  private scheduleWsRetry(customDelay?: number, force = false): void {
     if (this.wsRetryTimer) return;
+    if (!force && !isWsMarketWindowOpen(this.hasMcxSubscription())) return;
     this.wsRetryAttempts++;
     const delay = customDelay || Math.min(15_000 * 2 ** (this.wsRetryAttempts - 1), 5 * 60_000);
     this.wsRetryTimer = setTimeout(() => {
       this.wsRetryTimer = null;
-      this.tryStartWs();
+      this.tryStartWs(force);
     }, delay);
   }
 
@@ -313,14 +337,21 @@ export class MarketDataService {
   private schedulePolling(): void {
     const tick = async () => {
       const clock = marketClock();
-      const wsFresh = this.wsTickCount > 0 && Date.now() - this.lastWsTickAt < 10_000;
+      const wsWindowOpen = isWsMarketWindowOpen(this.hasMcxSubscription());
+
+      if (wsWindowOpen && !this.wsStarted && !this.wsConnecting) {
+        this.tryStartWs();
+      } else if (!wsWindowOpen && (this.wsStarted || this.wsConnecting || (this.client as any).ws?.market?.isConnected)) {
+        eventBus.log('INFO', 'Market hours ended (15:35 IST) — cleanly disconnecting DhanHQ WebSocket feed', 'market_data');
+        this.disconnectWs();
+      }
+
+      const wsFresh = this.wsTickCount > 0 && Date.now() - this.lastWsTickAt < 15_000;
       const backoffRemaining = this.rateLimitedUntil - Date.now();
-      // wsFresh's own window is 10s — RiskEngine's stale-tick alarm trips at
-      // the same 10s (staleTickSec). Polling at 15s here let a real gap
-      // between WS ticks (WS pushes on price change, not a heartbeat) run
-      // past the alarm before REST ever refreshed lastTickAt. Must stay
-      // under 10s so REST always closes the gap before the alarm can fire.
-      const interval = backoffRemaining > 0 ? backoffRemaining : wsFresh ? 8_000 : clock.isMarketOpen ? 3_000 : 30_000;
+      // When WS is active, REST heartbeat polls at 12s to preserve API quota while staying
+      // well under the 15s WARN and 30s ERROR boundaries. If WS drops or pauses, REST polls
+      // at 4s during market hours to ensure continuous fresh price feeds.
+      const interval = backoffRemaining > 0 ? backoffRemaining : wsFresh ? 12_000 : clock.isMarketOpen ? 4_000 : 30_000;
       if (this.pollTimer) clearTimeout(this.pollTimer);
       this.pollTimer = setTimeout(tick, interval);
       if (backoffRemaining <= 0) {
@@ -601,10 +632,8 @@ export class MarketDataService {
 
   stop(): void {
     if (this.pollTimer) clearTimeout(this.pollTimer);
-    if (this.wsRetryTimer) clearTimeout(this.wsRetryTimer);
-    if (this.wsSilenceWatch) clearInterval(this.wsSilenceWatch);
     this.unsubEventBus?.();
-    try { (this.client as any).ws?.disconnect?.(); } catch { /* noop */ }
+    this.disconnectWs();
   }
 }
 
@@ -634,6 +663,49 @@ export function patchOrderWsSafety(): void {
         this.on('error', () => { /* prevent unhandled EventEmitter throw */ });
       }
       return origConnect.apply(this, arguments as any);
+    };
+  }
+
+  // ws fires 'open' during setSocket while readyState is still CONNECTING;
+  // SDK onOpen (sync + async) calls send() immediately and throws, which
+  // kills the reconnect loop and blanks the UI control plane.
+  if (baseProto && !Object.prototype.hasOwnProperty.call(baseProto, '__sendSafetyPatched')) {
+    baseProto.__sendSafetyPatched = true;
+    const origSend = baseProto.send;
+    const WS_OPEN = 1;
+    const WS_CONNECTING = 0;
+    baseProto.send = function (this: any, payload: unknown) {
+      const conn = this.connection;
+      if (!conn) return;
+      if (conn.readyState === WS_OPEN) {
+        try { origSend.call(this, payload); } catch { /* socket died mid-send */ }
+        return;
+      }
+      if (conn.readyState !== WS_CONNECTING) return;
+      setImmediate(() => {
+        try {
+          if (this.connection?.readyState === WS_OPEN) origSend.call(this, payload);
+        } catch { /* closed before deferred send */ }
+      });
+    };
+  }
+
+  // DhanHQ servers use WebSocket transport-level pings, not client-side JSON {"type":"ping"}.
+  // The SDK default BaseWS.startHeartbeat sets a 10s pongTimeout that forcibly closes the
+  // connection when no JSON pong is returned, causing a reconnect storm every 30 seconds.
+  if (baseProto && !Object.prototype.hasOwnProperty.call(baseProto, '__heartbeatSafetyPatched')) {
+    baseProto.__heartbeatSafetyPatched = true;
+    baseProto.startHeartbeat = function (this: any) {
+      if (this.pingInterval) clearInterval(this.pingInterval);
+      if (this.pongTimeout) clearTimeout(this.pongTimeout);
+      this.pingInterval = setInterval(() => {
+        try {
+          if (this.connection?.readyState === 1 && typeof this.connection.ping === 'function') {
+            this.connection.ping();
+          }
+        } catch { /* connection dropped mid-ping */ }
+      }, this.pingIntervalMs || 30_000);
+      this.pingInterval.unref?.();
     };
   }
 
@@ -675,3 +747,7 @@ export function patchOrderWsSafety(): void {
     }
   };
 }
+
+// Apply before any DhanHQ WS connect() — tryStartWs also calls this, but
+// module-load guarantees OrderUpdateWS.onOpen cannot race ahead on import.
+patchOrderWsSafety();

@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import type { InstrumentKey } from './lib/instrumentKey';
 import { moduleLogger } from './lib/logger';
 import { marketClock } from './services/marketHours';
 import { eventBus } from './services/eventBus';
@@ -29,7 +30,14 @@ export const pool = new Pool({
   idleTimeoutMillis: 30000,
 });
 
-let mode: 'postgres' | 'memory' = 'postgres';
+// Defaults to memory under test, NOT postgres: initDatabase() applies the
+// same rule, but a test that writes without calling it first would otherwise
+// hit the real dev database. Found live — research_watchlist/screener_runs in
+// the dev DB were entirely jest fixtures from researchScheduler.test.ts and
+// researchRepository.test.ts, rewritten on every `npx jest` run, because
+// neither calls initDatabase().
+let mode: 'postgres' | 'memory' =
+  process.env.NODE_ENV === 'test' && !process.env.TEST_DATABASE_URL ? 'memory' : 'postgres';
 export function dbMode(): 'postgres' | 'memory' {
   return mode;
 }
@@ -46,6 +54,8 @@ const mem = {
   riskState: null as any,
   errorPatterns: new Map<string, any>(),
   systemRules: [] as any[],
+  researchRuns: new Map<string, any>(),
+  researchEvidence: new Map<string, any[]>(),
   autoid: 0,
 };
 
@@ -106,6 +116,19 @@ const SCHEMA_SQL = `
     id SERIAL PRIMARY KEY, rule TEXT NOT NULL, pattern TEXT NOT NULL UNIQUE,
     hit_count INTEGER NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS research_runs (
+    id VARCHAR(64) PRIMARY KEY, symbol VARCHAR(32) NOT NULL,
+    exchange VARCHAR(16) NOT NULL DEFAULT 'NSE', status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+    quality_score NUMERIC(5, 2), valuation_score NUMERIC(5, 2), verdict VARCHAR(16),
+    data JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS research_evidence (
+    id VARCHAR(64) PRIMARY KEY, run_id VARCHAR(64) NOT NULL,
+    category VARCHAR(32) NOT NULL, claim TEXT NOT NULL,
+    metric VARCHAR(64), value NUMERIC(16, 4), source VARCHAR(64) NOT NULL,
+    confidence NUMERIC(4, 2) NOT NULL DEFAULT 1.0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
   INSERT INTO paper_wallet (id, initial_balance, available_margin, used_margin, realized_pnl)
   VALUES ('default', 100000.00, 100000.00, 0.00, 0.00)
@@ -413,6 +436,31 @@ export async function updatePaperStrategyStatus(id: string, status: string) {
   return { id, status };
 }
 
+/** A leg closing via ANY exit path (SL/target/trailing, the long-option
+ * giveback policy, a manual close) never tells the parent strategy on its
+ * own — it stays RUNNING forever, with stale PnL, once all its legs are
+ * flat. Shared so every exit path reconciles the same way instead of each
+ * needing to remember to (found live: LongOptionPositionManager.sell()
+ * didn't, leaving a fully-closed single-leg strategy stuck RUNNING).
+ * `openPositions` is caller-supplied (paper ledger or the live/broker
+ * PortfolioSource — whichever this exit path actually reads) rather than
+ * fetched here, so this stays agnostic to which one applies. */
+export async function closeParentStrategyIfFlat(tradingSymbol: string, openPositions: Array<{ tradingSymbol: string; netQty: number; securityId?: string }>): Promise<void> {
+  const strategies = await listPaperStrategies();
+  const secMap = new Map(openPositions.filter((p) => p.securityId).map((p) => [String(p.securityId), p]));
+  const posMap = new Map(openPositions.map((p) => [p.tradingSymbol, p]));
+  const strat = strategies.find((s: any) =>
+    s.status === 'RUNNING' &&
+    (s.legs || []).some((l: any) => l.instrument === tradingSymbol || (l.securityId && secMap.get(String(l.securityId))?.tradingSymbol === tradingSymbol)),
+  );
+  if (!strat) return;
+  const stillOpen = (strat.legs || []).some((l: any) => {
+    const p = posMap.get(l.instrument) || (l.securityId ? secMap.get(String(l.securityId)) : undefined);
+    return Number(p?.netQty || 0) !== 0;
+  });
+  if (!stillOpen) await updatePaperStrategyStatus(strat.id, 'STOPPED');
+}
+
 export async function deletePaperStrategy(id: string) {
   if (mode === 'postgres') {
     await pool.query('DELETE FROM paper_strategies WHERE id = $1', [id]);
@@ -443,6 +491,51 @@ async function ensureWalletSessionRolled(): Promise<void> {
   }
 }
 
+/**
+ * True required margin RIGHT NOW, derived from ground truth rather than the
+ * incrementally-tracked wallet columns: SUM(margin_blocked) over open
+ * positions is provably correct (each position's own row is set directly
+ * from a real margin-resolver call on that fill, never touched by anything
+ * else) minus any hedge-margin credit still outstanding on a RUNNING
+ * multi-leg strategy (the combined SPAN requirement is less than the sum of
+ * each leg's standalone margin — see adjustWalletMargin/createPaperStrategy).
+ *
+ * The wallet's own used_margin/available_margin columns are still written
+ * incrementally on every fill (adjustWalletMargin, executePaperOrder's
+ * marginDelta) but are no longer READ for anything — found live, quantified
+ * via direct DB query: used_margin had drifted ₹134,062 negative vs. this
+ * derived value, because the credit given at multi-leg deploy time is only
+ * reliably reversed if updatePaperStrategyStatus('STOPPED') fires for that
+ * exact strategy — closeParentStrategyIfFlat's leg lookup is a plain string
+ * match (autonomy.ts) that can silently miss, permanently leaking the
+ * credit into the wallet total when it does. Deriving here instead of
+ * fixing every possible way that reversal can be missed makes the SERVED
+ * number correct regardless — self-healing, not one more special case.
+ *
+ * A strategy's `status` column can ALSO be stuck stale at 'RUNNING' (the
+ * exact same missed-reversal bug) even after every one of its legs is
+ * actually flat — trusting status alone would keep subtracting a credit for
+ * a structure that's fully closed. So a credit only counts when the
+ * strategy is RUNNING *and* at least one of its own legs still has a real
+ * open position — cross-checked against live position state, not the
+ * possibly-stale status flag.
+ */
+function computeDerivedMargin(): { usedMargin: number; availableMargin: number } {
+  let usedMargin = 0;
+  for (const pos of mem.positions.values()) {
+    if (Number(pos.net_qty) !== 0) usedMargin += Number(pos.margin_blocked || 0);
+  }
+  for (const strat of mem.strategies) {
+    if (strat.status !== 'RUNNING' || !Number(strat.margin_hedge_credit || 0)) continue;
+    const legs: any[] = strat.legs || [];
+    const stillOpen = legs.some((l) => Number(mem.positions.get(String(l.instrument).toUpperCase())?.net_qty || 0) !== 0);
+    if (stillOpen) usedMargin -= Number(strat.margin_hedge_credit || 0);
+  }
+  const w = mem.wallet as any;
+  const availableMargin = Number(w.initial_balance) + Number(w.realized_pnl) - usedMargin - Number(w.total_charges || 0);
+  return { usedMargin: Number(usedMargin.toFixed(2)), availableMargin: Number(availableMargin.toFixed(2)) };
+}
+
 // ── wallet ──────────────────────────────────────────────────────────────
 // Reads always come from `mem` (see header) — Postgres is written to on every
 // fill but never read back on the hot path.
@@ -452,8 +545,7 @@ export async function getPaperWallet() {
     return { availableMargin: 100000, usedMargin: 0, realizedPnl: 0, sessionRealizedPnl: 0, unrealizedPnl: 0, totalCharges: 0, netRealizedPnl: 0, totalBalance: 100000, equity: 100000, spanMargin: 0, exposureMargin: 0 };
   }
   await ensureWalletSessionRolled();
-  const availableMargin = Number(w.available_margin);
-  const usedMargin = Number(w.used_margin);
+  const { usedMargin, availableMargin } = computeDerivedMargin();
   const realizedPnl = Number(w.realized_pnl);
   const sessionRealizedPnl = realizedPnl - Number(w.session_realized_base || 0);
   const totalCharges = Number(w.total_charges || 0);
@@ -738,7 +830,7 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
   // reducing a position always goes through (even if the account is
   // already over-margined) so a position is never un-closeable.
   if (marginDelta > 0) {
-    const availableMargin = Number(mem.wallet.available_margin);
+    const availableMargin = computeDerivedMargin().availableMargin;
     const projectedAvailable = availableMargin + u.realized - marginDelta - charges;
     if (projectedAvailable < 0) {
       throw new Error(`Insufficient margin: need ₹${marginDelta.toFixed(2)} more, ₹${availableMargin.toFixed(2)} available`);
@@ -811,10 +903,21 @@ export async function executePaperOrder(input: PaperOrderInput, marginResolver: 
  * adverse-crossing cost a real stop pays; callers that don't care default
  * to the plain exit cost.
  */
-export async function closePaperPosition(symbol: string, currentLtp?: number, marginResolver?: MarginResolver, kind: FillKind = 'EXIT') {
-  const sym = symbol.toUpperCase();
-  const pos = mem.positions.get(sym);
+function findPaperPosition(target: InstrumentKey | string): any | undefined {
+  if (typeof target === 'string') return mem.positions.get(target.toUpperCase());
+  for (const pos of mem.positions.values()) {
+    if (Number(pos.net_qty) === 0) continue;
+    if (String(pos.security_id) === String(target.securityId) && String(pos.exchange_segment) === target.exchangeSegment) {
+      return pos;
+    }
+  }
+  return undefined;
+}
+
+export async function closePaperPosition(target: InstrumentKey | string, currentLtp?: number, marginResolver?: MarginResolver, kind: FillKind = 'EXIT') {
+  const pos = findPaperPosition(target);
   if (!pos || Number(pos.net_qty) === 0) return { status: 'noop', message: 'No open position found' };
+  const sym = String(pos.symbol).toUpperCase();
   const netQty = Number(pos.net_qty);
   const transactionType: 'BUY' | 'SELL' = netQty > 0 ? 'SELL' : 'BUY';
   const referencePrice = currentLtp || Number(pos.ltp || (netQty > 0 ? pos.buy_avg : pos.sell_avg));
@@ -907,7 +1010,7 @@ export async function closeAllPaperPositions(ltpResolver: (securityId: string, s
   for (const p of await listPaperPositions()) {
     if (p.netQty === 0) continue;
     const ltp = ltpResolver(String(p.securityId), p.tradingSymbol) || p.ltp;
-    results.push(await closePaperPosition(p.tradingSymbol, ltp));
+    results.push(await closePaperPosition({ securityId: String(p.securityId), exchangeSegment: p.exchangeSegment }, ltp));
   }
   return results;
 }
@@ -1070,3 +1173,83 @@ export async function findMissingOrders(ids: string[]): Promise<string[]> {
   }
   return [...remaining];
 }
+
+export async function saveResearchRun(run: {
+  id: string; symbol: string; exchange?: string; status?: string;
+  quality_score?: number; valuation_score?: number; verdict?: string; data: any;
+}): Promise<void> {
+  const row = {
+    id: run.id, symbol: run.symbol, exchange: run.exchange || 'NSE', status: run.status || 'COMPLETED',
+    quality_score: run.quality_score ?? null, valuation_score: run.valuation_score ?? null,
+    verdict: run.verdict ?? null, data: run.data, created_at: new Date(), updated_at: new Date(),
+  };
+  mem.researchRuns.set(run.id, row);
+  if (mode === 'postgres') {
+    const q = `
+      INSERT INTO research_runs (id, symbol, exchange, status, quality_score, valuation_score, verdict, data, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      ON CONFLICT (id) DO UPDATE SET
+        status = EXCLUDED.status, quality_score = EXCLUDED.quality_score,
+        valuation_score = EXCLUDED.valuation_score, verdict = EXCLUDED.verdict,
+        data = EXCLUDED.data, updated_at = NOW();
+    `;
+    await pool.query(q, [row.id, row.symbol, row.exchange, row.status, row.quality_score, row.valuation_score, row.verdict, JSON.stringify(row.data)]).catch((e: any) => {
+      log.warn({ err: { message: e.message } }, 'saveResearchRun failed');
+    });
+  }
+}
+
+export async function getResearchRun(id: string): Promise<any | null> {
+  if (mem.researchRuns.has(id)) return mem.researchRuns.get(id);
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT * FROM research_runs WHERE id = $1', [id]);
+      if (res.rows[0]) {
+        mem.researchRuns.set(id, res.rows[0]);
+        return res.rows[0];
+      }
+    } catch { /* return null */ }
+  }
+  return null;
+}
+
+export async function listResearchRuns(limit = 20): Promise<any[]> {
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT id, symbol, exchange, status, quality_score, valuation_score, verdict, created_at FROM research_runs ORDER BY created_at DESC LIMIT $1', [limit]);
+      return res.rows;
+    } catch { /* fallback to mem */ }
+  }
+  return Array.from(mem.researchRuns.values()).slice(-limit).reverse();
+}
+
+export async function saveResearchEvidence(items: any[]): Promise<void> {
+  if (items.length === 0) return;
+  const runId = items[0].runId;
+  const existing = mem.researchEvidence.get(runId) || [];
+  mem.researchEvidence.set(runId, [...existing, ...items]);
+
+  if (mode === 'postgres') {
+    for (const item of items) {
+      const q = `
+        INSERT INTO research_evidence (id, run_id, category, claim, metric, value, source, confidence)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (id) DO NOTHING;
+      `;
+      await pool.query(q, [item.id, item.runId, item.category, item.claim, item.metric || null, item.value ?? null, item.source, item.confidence]).catch(() => {});
+    }
+  }
+}
+
+export async function getResearchEvidenceByRun(runId: string): Promise<any[]> {
+  if (mem.researchEvidence.has(runId)) return mem.researchEvidence.get(runId)!;
+  if (mode === 'postgres') {
+    try {
+      const res = await pool.query('SELECT * FROM research_evidence WHERE run_id = $1 ORDER BY id ASC', [runId]);
+      mem.researchEvidence.set(runId, res.rows);
+      return res.rows;
+    } catch { /* fallback */ }
+  }
+  return [];
+}
+

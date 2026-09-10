@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
-import dotenv from 'dotenv';
+import './lib/env';
 import { startCore } from './core';
 import { marketRoutes } from './routes/market';
 import { portfolioRoutes } from './routes/portfolio';
@@ -17,8 +17,8 @@ import { moduleLogger, logError } from './lib/logger';
 import { requestLogger, errorHandler, notFoundHandler } from './lib/requestLogger';
 import { attachBusLoggerBridge } from './lib/busLoggerBridge';
 import { clientLogsRoutes } from './routes/clientLogs';
+import { researchRoutes } from './routes/research';
 
-dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3003;
 const HOST = process.env.CONTROL_PLANE_HOST || '127.0.0.1';
@@ -65,7 +65,17 @@ async function main() {
     log.warn('CONTROL_PLANE_TOKEN not set — order/kill-switch endpoints are unauthenticated (CORS-origin-restricted only). Set it to require a bearer token.');
   }
   const app = express();
-  app.use(cors({ origin: ALLOWED_ORIGIN, credentials: true }));
+  const allowedOrigins = [ALLOWED_ORIGIN, 'http://localhost:5175', 'http://127.0.0.1:5175', 'http://localhost:5173', 'http://127.0.0.1:5173'];
+  app.use(cors({
+    origin: (origin, cb) => {
+      if (!origin || allowedOrigins.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) {
+        cb(null, true);
+      } else {
+        cb(new Error(`Origin ${origin} not allowed by CORS`));
+      }
+    },
+    credentials: true,
+  }));
   app.use(express.json());
   app.use(requestLogger); // access logs + req.log child (requestId/traceId)
   app.use((req, res, next) => {
@@ -79,11 +89,12 @@ async function main() {
   streamManager.attach(); // bind hub to the central event bus
 
   app.use('/api/market', marketRoutes(core.client, core.market));
-  app.use('/api/portfolio', portfolioRoutes(core.client, core.market, core.risk, core.paper, core.agent));
+  app.use('/api/portfolio', portfolioRoutes(core.client, core.market, core.risk, core.paper, core.agent, core.portfolio, core.sandboxClient));
   app.use('/api/ollama', ollamaRoutes());
   app.use('/api/infra', infraRoutes(streamManager, { market: core.market, risk: core.risk, autonomy: core.autonomy, agent: core.agent, stream: streamManager }));
-  app.use('/api/control', controlRoutes(core.client, core.risk, core.autonomy, core.agent, core.market));
+  app.use('/api/control', controlRoutes(core.client, core.risk, core.autonomy, core.agent, core.market, core.sandboxClient));
   app.use('/api/client-logs', clientLogsRoutes());
+  app.use('/api/research', researchRoutes(core.research, core.researchScheduler));
 
   app.get('/api/health', (_req, res) => {
     res.json({

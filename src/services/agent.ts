@@ -1,23 +1,42 @@
 import { AgentToolRegistry, Policy, type DhanClient } from '@nemesis-oss/dhanhq-sdk';
-import { OllamaClient } from '@nemesis-oss/ollama-sdk';
+import { OllamaClient, type Logger as OllamaLogger } from '@nemesis-oss/ollama-sdk';
+import { moduleLogger } from '../lib/logger';
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
-import { pushAgentEvent, listAgentEvents, createPaperStrategy, getActiveRules } from '../db';
+import { pushAgentEvent, listAgentEvents, createPaperStrategy, listPaperStrategies, getActiveRules } from '../db';
 import { INDEX_INSTRUMENTS } from './marketData';
+import { marketClock } from './marketHours';
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { LiveExecutionEngine } from '../engines/live';
-import type { SandboxExecutionEngine } from '../engines/sandbox';
+import { SandboxExecutionEngine } from '../engines/sandbox';
 import { analyzeOptionChain, recordIvSample, getIvRank, selectStrikeByDelta } from './optionsAnalytics';
 import {
   buildIronCondor, buildIronButterfly, buildCreditSpread, buildDebitSpread,
   buildStraddle, buildStrangle, buildOrbBuyingStrategy, buildOrb30mStrategy,
   buildVwapPullbackStrategy, evaluateStrategyBacktest, calculateCapitalAllocationLots, getLotSize,
-  resolveNearestExpiry, type ConstructedStrategy
+  resolveNearestExpiry, type ConstructedStrategy, type StrategyLeg
 } from './strategyConstructor';
 import { analyzeOptionsBehavior } from '../routes/market';
 
 export type AgentKey = 'planner' | 'analyst' | 'strategy' | 'execution' | 'risk' | 'critic';
+
+export interface TradeProposal {
+  proposalId: string;
+  target: string;
+  strategy: ConstructedStrategy;
+  regime: string;
+  score: number;
+  backtest: {
+    winRate: number;
+    profitFactor: number;
+    totalDays: number;
+    passedValidation: boolean;
+  };
+  thesis: string;
+  confidence: number;
+  createdAt: string;
+}
 
 export interface AgentStep {
   id: string;
@@ -30,6 +49,7 @@ export interface AgentStep {
   response?: string;
   duration?: number;
   deterministic?: boolean;
+  triggeredBy?: string;
 }
 
 export interface AgentRunStatus {
@@ -41,6 +61,7 @@ export interface AgentRunStatus {
   toolCalls: number;
   llm: 'ollama' | 'deterministic';
   personas: Record<AgentKey, { status: 'idle' | 'active'; steps: number }>;
+  triggeredBy?: string | null;
 }
 
 const ALL_PERSONAS: AgentKey[] = ['planner', 'analyst', 'strategy', 'execution', 'risk', 'critic'];
@@ -86,6 +107,233 @@ export function classifyDispatchRegime(analyticsRegime: string | undefined, vix:
   return 'TRENDING_DRIFT';
 }
 
+export type AgentObjectiveIntent = 'QUERY' | 'TRADE';
+
+/**
+ * Classifies an objective into an informational query vs a trade directive.
+ * Informational queries bypass option-chain pulling and strategy construction
+ * to avoid rate limits (429) and false risk alarms.
+ */
+export function classifyObjectiveIntent(objective: string): AgentObjectiveIntent {
+  const clean = objective.trim().toLowerCase();
+
+  // Diagnostic inquiries and alert remediation bypass trade pipeline
+  if (/\b(diagnose|troubleshoot|remediate|investigate|alert)\b/i.test(clean)) return 'QUERY';
+
+  // Explicit query prefixes or inquiry keywords
+  const isQuestion = /^(what|why|how|when|where|who|which|is|are|can|show|list|tell|check|explain|describe|search|find|lookup|fetch|get)\b/i.test(clean)
+    || clean.endsWith('?')
+    || /\b(lot\s*size|lotsize|contract\s*size|margin\s*balance|open\s*positions?)\b/i.test(clean);
+
+  // Imperative trade execution verbs
+  const hasTradeVerb = /\b(buy|sell|trade|deploy|execute|enter|place order|short|long|scalp|run scan|scan and trade|find highest probability trade)\b/i.test(clean);
+
+  // If it's an inquiry and lacks an imperative trade verb, it's a QUERY
+  if (isQuestion && !hasTradeVerb) return 'QUERY';
+  if (hasTradeVerb) return 'TRADE';
+
+  // Strategy names without question phrasing imply trade setup intent
+  const strategyNames = /\b(straddle|strangle|condor|butterfly|spread|orb|vwap)\b/i;
+  if (strategyNames.test(clean)) return 'TRADE';
+
+  return isQuestion ? 'QUERY' : 'TRADE';
+}
+
+export function matchIndexSymbol(text: string): string | null {
+  const upper = text.toUpperCase();
+  if (/BANK[\s\-_]?NIFTY|\bBNF\b/.test(upper)) return 'BANKNIFTY';
+  if (/FIN[\s\-_]?NIFTY/.test(upper)) return 'FINNIFTY';
+  if (/MIDC[AP]+[\s\-_]?NIFTY|\bMIDCPNIFTY\b|\bMIDCAP\b/.test(upper)) return 'MIDCPNIFTY';
+  if (/\bSENSEX\b/.test(upper)) return 'SENSEX';
+  if (/INDIA[\s\-_]?VIX|\bVIX\b/.test(upper)) return 'INDIAVIX';
+  if (/\bNIFTY\b|\bNIFTY[\s\-_]?50\b/.test(upper)) return 'NIFTY';
+  return null;
+}
+
+function resolveSpecFact(obj: string): { answer: string; symbol?: string } | null {
+  const upper = obj.toUpperCase();
+  const isLotSizeQuery = /LOT\s*SIZE|LOTSIZE|\bLOT\b|CONTRACT\s*SIZE/.test(upper);
+  if (!isLotSizeQuery) return null;
+
+  const matched = matchIndexSymbol(upper);
+  if (matched && matched !== 'INDIAVIX') {
+    const lotSize = getLotSize(matched);
+    const exchange = matched === 'SENSEX' ? 'BSE' : 'NSE';
+    const segment = matched === 'SENSEX' ? 'BSE_FNO' : 'NSE_FNO';
+    return {
+      symbol: matched,
+      answer: `The current lot size for ${exchange} ${matched} options contracts (${segment}) is ${lotSize} units per lot.`,
+    };
+  }
+
+  const symbols = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY'];
+  const allSizes = symbols.map((s) => `${s}: ${getLotSize(s)}`).join(', ');
+  return { answer: `Current index options lot sizes on Indian exchanges: ${allSizes}.` };
+}
+
+async function resolvePortfolioFact(risk: RiskEngine, obj: string): Promise<string | null> {
+  const lower = obj.toLowerCase();
+  if (/\b(margin|fund|balance|capital|cash)\b/.test(lower)) {
+    const wallet = await risk.getPortfolio().getWallet();
+    const avail = Number(wallet.availableMargin || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    const used = Number(wallet.usedMargin || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    const equity = Number(wallet.totalBalance || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    return `Portfolio Margin Status: Available Margin: ₹${avail}, Used Margin: ₹${used}, Total Equity: ₹${equity}.`;
+  }
+  if (/\b(positions?|holdings?)\b/.test(lower)) {
+    const positions = await risk.getPortfolio().getPositions();
+    const open = positions.filter((p: any) => Number(p.netQty ?? p.positionQty ?? 0) !== 0);
+    if (open.length === 0) return 'Portfolio Positions: You currently have 0 open positions.';
+    const details = open.map((p: any) => `${p.tradingSymbol || p.symbol}: Qty ${p.netQty || p.positionQty}, Unrealized PnL: ₹${Number(p.unrealizedPnl || 0).toFixed(2)}`).join('; ');
+    return `Open Positions (${open.length}): ${details}.`;
+  }
+  return null;
+}
+
+function resolveMarketFact(market: MarketDataService, obj: string): string | null {
+  const lower = obj.toLowerCase();
+  if (/\b(market status|is market open|trading hours|market open)\b/.test(lower)) {
+    const clock = marketClock();
+    const status = clock.isMarketOpen ? 'OPEN' : 'CLOSED';
+    return `Exchange Market Status: Regular trading session is currently ${status} (${clock.istTime} IST). Normal NSE/BSE equity & F&O hours are 09:15 to 15:30 IST.`;
+  }
+  const matched = matchIndexSymbol(obj);
+  if (matched && /\b(spot|price|ltp|quote|vix)\b/.test(lower)) {
+    const inst = INDEX_INSTRUMENTS[matched];
+    if (inst) {
+      const price = market.getLtp(inst.securityId);
+      if (price) return `Current spot price for ${inst.label} (${matched}) is ₹${price.toLocaleString('en-IN', { maximumFractionDigits: 2 })}.`;
+    }
+  }
+  return null;
+}
+
+async function auditStrategyConcurrency(risk: RiskEngine) {
+  const [strategies, positions] = await Promise.all([
+    listPaperStrategies().catch(() => []),
+    risk.getPortfolio().getPositions().catch(() => []),
+  ]);
+  const running = strategies.filter((s: any) => s.status === 'RUNNING');
+  const flat = running.filter((s: any) => !(s.legs || []).some((leg: any) =>
+    positions.some((p: any) => (p.tradingSymbol === leg.instrument || p.symbol === leg.instrument) && Number(p.netQty ?? p.positionQty ?? 0) !== 0)
+  ));
+  return { running, flat, positions };
+}
+
+type ExecutionEngine = PaperExecutionEngine | LiveExecutionEngine | SandboxExecutionEngine;
+
+/**
+ * Places every leg of a multi-leg strategy through ONE engine (paper, live,
+ * or sandbox — all share the same `placeOrder(intent)` shape) and unwinds
+ * on a partial fill. Previously duplicated: PaperExecutionEngine had its
+ * own copy (deployStrategy/unwindPartialLegs), live/sandbox had a second,
+ * hand-maintained copy inline here — a fix to one never reached the other.
+ */
+async function deployMultiLeg(
+  engine: ExecutionEngine, strat: ConstructedStrategy, runId: string,
+  market: MarketDataService, risk: RiskEngine,
+): Promise<{ status: 'TRADED' | 'FAILED'; legsFilled?: number; reason?: string }> {
+  const filledLegs: StrategyLeg[] = [];
+  for (const leg of strat.legs) {
+    const res = await engine.placeOrder({
+      correlation_id: `${strat.id}_${leg.securityId}`,
+      intent_id: `${runId}_${leg.securityId}`,
+      params: {
+        security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
+        transaction_type: leg.side, order_type: 'MARKET', exchange_segment: leg.exchangeSegment || 'NSE_FNO',
+        product_type: 'INTRADAY', price: leg.price,
+        underlying: strat.symbol, strike: leg.strike, option_type: leg.optionType,
+      },
+      risk_limits: { stop_loss: leg.stopLoss, target: leg.target, trailing_stop: leg.trailingStop },
+    });
+    if (res && (res.status === 'TRADED' || res.orderId)) filledLegs.push(leg);
+    else break;
+  }
+
+  if (filledLegs.length > 0 && filledLegs.length < strat.legs.length) {
+    await unwindLegs(engine, strat.id, filledLegs, market, risk);
+    return { status: 'FAILED', reason: 'partial_fill_unwound' };
+  }
+  if (filledLegs.length === strat.legs.length && filledLegs.length > 0) {
+    return { status: 'TRADED', legsFilled: filledLegs.length };
+  }
+  return { status: 'FAILED', reason: 'all_legs_rejected' };
+}
+
+/**
+ * Closes each already-filled leg after a partial multi-leg fill. Deliberately
+ * bypasses risk.canTrade() (an exit must work even when the entry gate is
+ * blocked — kill switch, system not READY) — same as EOD square-off and the
+ * kill switch's own closeAll().
+ *
+ * Sandbox is the odd one out: a sandbox fill lives only at the real Dhan
+ * Sandbox account, never in PortfolioSource (which — for a non-'live' mode —
+ * is the LOCAL PAPER ledger). Closing it through portfolio.closePosition()
+ * would silently "close" a paper position that was never opened while the
+ * real sandbox leg stays live — so sandbox unwinds through the engine's own
+ * closeLeg() (a real reversing order), not PortfolioSource.
+ */
+async function unwindLegs(engine: ExecutionEngine, stratId: string, filledLegs: StrategyLeg[], market: MarketDataService, risk: RiskEngine): Promise<void> {
+  const portfolio = risk.getPortfolio();
+  for (const leg of filledLegs) {
+    const unwindPrice = market.getFillablePrice(leg.securityId, { allowClosed: true }) ?? leg.price;
+    const result = engine instanceof SandboxExecutionEngine
+      // Deterministic (strat.id + securityId), not Date.now()-suffixed —
+      // an unwind that dies before its result is journaled needs a stable
+      // id to be resolvable via getByCorrelationId() on the next boot,
+      // same as an entry leg's correlation_id.
+      ? await engine.closeLeg({ securityId: leg.securityId, exchangeSegment: leg.exchangeSegment, qty: leg.qty, side: leg.side, instrument: leg.instrument }, unwindPrice, `unwind_${stratId}_${leg.securityId}`).catch((e: any) => ({ status: 'REJECTED', reason: e.message }))
+      : await portfolio.closePosition({ securityId: String(leg.securityId), exchangeSegment: leg.exchangeSegment || 'NSE_FNO' }, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
+
+    if (result.status === 'TRADED' || result.status === 'noop') {
+      // 'noop' ("no open position found") means something else — the
+      // long-option giveback policy, a stop-loss/target hit — already
+      // closed this leg before the unwind got here. That's the SAME end
+      // state a successful unwind reaches (flat, no exposure), just via a
+      // different path — not a failure. Untracking is safe either way:
+      // a no-op if PositionMonitor was never (re-)armed for it.
+      market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
+      if (result.status === 'noop') {
+        eventBus.log('INFO', `Unwind for leg ${leg.instrument}: already flat (closed by another exit path first)`, 'agent');
+      }
+    } else {
+      // Untracking on a genuinely failed unwind would leave an unhedged
+      // position without stop-loss protection.
+      eventBus.log('ERROR', `Unwind FAILED for leg ${leg.instrument}: ${result.status}${(result as any).reason ? ` (${(result as any).reason})` : ''}`, 'agent');
+    }
+  }
+  eventBus.log('ERROR', `Multi-leg deploy partially filled (${filledLegs.length}) — unwound`, 'agent');
+}
+
+/** Reads OLLAMA_API_KEY_1, _2, _3, ... — open-ended, not capped at 3 — so
+ * adding a 4th Ollama Cloud account is an env var, not a code change. Stops
+ * at the first gap (matches how numbered env vars are conventionally read
+ * elsewhere in this codebase, e.g. DHAN_SANDBOX_*): a key set at _1 and _3
+ * with _2 missing only picks up _1. */
+export function readOllamaCloudKeys(): string[] {
+  const keys: string[] = [];
+  for (let i = 1; ; i++) {
+    const key = process.env[`OLLAMA_API_KEY_${i}`];
+    if (!key) break;
+    keys.push(key);
+  }
+  return keys;
+}
+
+const ollamaCloudLog = moduleLogger('ollama_cloud');
+/** Adapts this app's structured logger to the SDK's Logger interface so its
+ * internal per-credential attempt/failure lines ("Executing on endpoint
+ * cloud-2", "Failed on cloud-1: rate_limited") reach real logs instead of
+ * being silently dropped (the SDK defaults to a no-op logger) — this is how
+ * an operator sees WHICH numbered key is rate-limited/dead, not just that
+ * the whole call eventually succeeded or failed. */
+const ollamaSdkLogger: OllamaLogger = {
+  debug: (msg, ctx) => ollamaCloudLog.debug(ctx || {}, msg),
+  info: (msg, ctx) => ollamaCloudLog.info(ctx || {}, msg),
+  warn: (msg, ctx) => ollamaCloudLog.warn(ctx || {}, msg),
+  error: (msg, ctx) => ollamaCloudLog.error(ctx || {}, msg),
+};
+
 export class AgentOrchestrator {
   private client: DhanClient;
   private market: MarketDataService;
@@ -99,6 +347,8 @@ export class AgentOrchestrator {
   private llmAvailable = false;
   private running = false;
   private currentRun: AgentRunStatus | null = null;
+  private currentRunTriggeredBy: string | null = null;
+  private activeRunTriggers = new Map<string, string>();
   private llmProbed = false;
 
   constructor(client: DhanClient, market: MarketDataService, risk: RiskEngine, paper: PaperExecutionEngine, live: LiveExecutionEngine, sandbox?: SandboxExecutionEngine) {
@@ -108,15 +358,45 @@ export class AgentOrchestrator {
     this.paper = paper;
     this.live = live;
     this.sandbox = sandbox;
-    this.llmModel = process.env.OLLAMA_MODEL || 'qwen2.5:0.5b';
     this.tools = new AgentToolRegistry({ client, policy: Policy.fromEnv() });
 
+    // Ollama Cloud, when API keys are configured (same env var names as the
+    // paper-broker app — OLLAMA_API_KEY_1, _2, _3, ... — so the same keys
+    // work here unchanged, and any further ones just need adding to .env,
+    // not this code): all keys bound to one cloud model via the SDK's
+    // native credential/failover routing (rate_limited is in its default
+    // failover code list), so a rate-limited or dead key falls through to
+    // the next one automatically — verified for real: one of three test
+    // keys hit its weekly quota (429) and the SDK moved on. No local
+    // baseUrl fallback in this mode — a local Ollama daemon almost
+    // certainly doesn't have the cloud-only model pulled, so a "fallback"
+    // request would just fail with a model-not-found error instead of a
+    // useful retry. Total cloud failure already degrades to deterministic
+    // mode via reason()'s catch, same as local-Ollama-unreachable does today.
+    const cloudKeys = readOllamaCloudKeys();
+    // gemma4:31b, not gemma4:cloud: verified against the account's own
+    // ollama.com/settings usage page — gemma4:31b is on the confirmed free
+    // model list (alongside gpt-oss:120b/20b, nemotron-3-*); gemma4:cloud
+    // also returns a real completion but isn't on that list, so it's not
+    // confirmed to draw from the same free quota.
+    const cloudModel = process.env.OLLAMA_CLOUD_MODEL || 'gemma4:31b';
+    this.llmModel = cloudKeys.length > 0 ? cloudModel : (process.env.OLLAMA_MODEL || 'qwen2.5:0.5b');
+
     if (process.env.OLLAMA_ENABLED !== 'false') {
-      this.ollama = new OllamaClient({
-        baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
-        timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS) || 15000,
-        retries: 0,
-      });
+      this.ollama = cloudKeys.length > 0
+        ? new OllamaClient({
+            baseUrl: process.env.OLLAMA_CLOUD_BASE_URL || 'https://ollama.com',
+            credentials: Object.fromEntries(cloudKeys.map((apiKey, i) => [`cloud-${i + 1}`, { apiKey }])),
+            modelBindings: { [cloudModel]: cloudKeys.map((_, i) => `cloud-${i + 1}`) },
+            logger: ollamaSdkLogger,
+            timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS) || 15000,
+            retries: 0,
+          })
+        : new OllamaClient({
+            baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
+            timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS) || 15000,
+            retries: 0,
+          });
       void this.probeLlm();
     }
   }
@@ -135,9 +415,9 @@ export class AgentOrchestrator {
   }
 
   status(): AgentRunStatus {
-    return this.currentRun || {
+    return this.currentRun ? { ...this.currentRun, triggeredBy: this.currentRunTriggeredBy } : {
       running: false, runId: null, objective: null, startedAt: null, steps: 0, toolCalls: 0,
-      llm: this.llmAvailable ? 'ollama' : 'deterministic', personas: idlePersonas(),
+      llm: this.llmAvailable ? 'ollama' : 'deterministic', personas: idlePersonas(), triggeredBy: null,
     };
   }
 
@@ -156,32 +436,79 @@ export class AgentOrchestrator {
     return this.llmAvailable;
   }
 
-  async run(objective: string, triggeredBy = 'control_plane'): Promise<{ runId: string; status: string }> {
-    if (this.running) throw new Error('An agent run is already in progress');
+  /** Per-Ollama-Cloud-credential health, straight from the SDK's own
+   * circuit breaker (EndpointRegistry) — not a new tracking mechanism.
+   * Never exposes the actual API key, only the synthesized credential
+   * name ("credential:cloud-2") — enough to tell WHICH numbered
+   * OLLAMA_API_KEY_N a row is, without leaking the secret. Empty array
+   * when Ollama is disabled or not yet constructed. */
+  ollamaKeyStatus(): Array<{ name: string; isCoolingDown: boolean; failureCount: number; lastFailureAt: string | null; activeRequests: number }> {
+    if (!this.ollama) return [];
+    return this.ollama.endpointStatus().map((h) => ({
+      name: h.endpoint.name,
+      isCoolingDown: h.isCoolingDown,
+      failureCount: h.failureCount,
+      lastFailureAt: h.lastFailureTimestamp ? new Date(h.lastFailureTimestamp).toISOString() : null,
+      activeRequests: h.activeRequests,
+    }));
+  }
+
+  async run(objective: string, triggeredBy = 'control_plane'): Promise<{ runId: string; status: string; triggeredBy: string }> {
     if (this.risk.isKilled()) throw new Error('Kill switch engaged — agent runs disabled');
     await this.probeLlm();
 
+    const intent = classifyObjectiveIntent(objective);
     const runId = `run_${Date.now().toString(36)}`;
+
+    // Read-only queries execute concurrently without exclusive trading mutex
+    if (intent === 'QUERY') {
+      if (/\b(diagnose|troubleshoot|remediate|alert)\b/i.test(objective)) {
+        void this.handleDiagnosticObjective(runId, objective, triggeredBy);
+      } else {
+        void this.handleQueryObjective(runId, objective, triggeredBy);
+      }
+      return { runId, status: 'started', triggeredBy };
+    }
+
+    // Trade execution commands acquire exclusive trading lock
+    if (this.running) {
+      if (triggeredBy === 'control_plane' && this.currentRunTriggeredBy === 'autonomous_scanner') {
+        for (let i = 0; i < 35 && this.running; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      if (this.running) {
+        throw new Error('An agent trading run is currently in progress. Please retry in a moment.');
+      }
+    }
+
     this.running = true;
+    this.currentRunTriggeredBy = triggeredBy;
+    this.activeRunTriggers.set(runId, triggeredBy);
     this.currentRun = {
       running: true, runId, objective, startedAt: Date.now(), steps: 0, toolCalls: 0,
       llm: this.llmAvailable ? 'ollama' : 'deterministic', personas: idlePersonas(),
+      triggeredBy,
     };
 
     void this.executeRun(runId, objective, triggeredBy).finally(() => {
       this.running = false;
+      this.currentRunTriggeredBy = null;
+      this.activeRunTriggers.delete(runId);
       setTimeout(() => { if (this.currentRun?.runId === runId) this.currentRun = null; }, 30_000);
     });
 
-    return { runId, status: 'started' };
+    return { runId, status: 'started', triggeredBy };
   }
 
   private step(runId: string, agent: AgentKey, type: AgentStep['type'], summary: string, extra?: Partial<AgentStep>): void {
+    const triggeredBy = extra?.triggeredBy || this.activeRunTriggers.get(runId) || 'control_plane';
     const ev: AgentStep = {
       id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       runId, agent, type,
       time: new Date().toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Kolkata' }),
-      summary, duration: extra?.duration ?? 30 + Math.floor(Math.random() * 90), ...extra,
+      summary, duration: extra?.duration ?? 30 + Math.floor(Math.random() * 90),
+      triggeredBy, ...extra,
     };
     if (this.currentRun?.runId === runId) {
       this.currentRun.steps++;
@@ -225,106 +552,165 @@ export class AgentOrchestrator {
     return text;
   }
 
+  private async dispatchQueryTool(runId: string, objective: string): Promise<string | null> {
+    const lower = objective.toLowerCase();
+    const matched = matchIndexSymbol(objective);
+
+    if (/\b(expir(y|ies)|expiry\s*dates?)\b/i.test(lower) && matched) {
+      const inst = INDEX_INSTRUMENTS[matched];
+      if (inst) {
+        const res = await this.callTool(runId, 'analyst', 'dhan_option_expiries', {
+          underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I',
+        });
+        const dates: string[] = Array.isArray(res) ? res : res?.data || [];
+        if (dates.length > 0) {
+          return `DhanHQ SDK (dhan_option_expiries): Upcoming option expiries for ${matched}: ${dates.slice(0, 5).join(', ')}.`;
+        }
+      }
+    }
+
+    if (/\b(search|find|lookup|security\s*id)\b/i.test(lower)) {
+      const clean = objective.replace(/\b(what\s+is\s+the|can\s+you|search|for|instrument|stock|symbol|scrip|security\s*id|find|lookup|please)\b/gi, '').replace(/[?.,!]/g, '').trim();
+      if (clean.length >= 2) {
+        const res = await this.callTool(runId, 'analyst', 'dhan_search_instruments', { query: clean, limit: 5 });
+        const items = Array.isArray(res) ? res : res?.data || [];
+        if (items.length > 0) {
+          const desc = items.slice(0, 3).map((x: any) => `${x.symbolName || x.symbol || x.tradingSymbol} (ID: ${x.securityId}, Seg: ${x.segment || x.exchangeSegment})`).join('; ');
+          return `DhanHQ SDK (dhan_search_instruments): Found matching instruments: ${desc}.`;
+        }
+      }
+    }
+
+    if (/\b(kill\s*switch\s*status|is\s*kill\s*switch\s*active)\b/i.test(lower)) {
+      const res = await this.callTool(runId, 'risk', 'dhan_kill_switch_status', {});
+      return `DhanHQ SDK (dhan_kill_switch_status): Broker kill switch status is ${res?.status || res?.killSwitchStatus || 'INACTIVE'}.`;
+    }
+
+    if (/\b(holdings|demat|portfolio\s*holdings)\b/i.test(lower)) {
+      const res = await this.callTool(runId, 'analyst', 'dhan_holdings', {});
+      const items = Array.isArray(res) ? res : res?.data || [];
+      return `DhanHQ SDK (dhan_holdings): Current Demat holdings count is ${items.length}.`;
+    }
+
+    return null;
+  }
+
+  private async resolveDiagnosticFact(runId: string, objective: string): Promise<string | null> {
+    const lower = objective.toLowerCase();
+    if (!/\b(diagnose|troubleshoot|remediate|investigate|alert|stale|error)\b/i.test(lower)) return null;
+
+    const clock = marketClock();
+    const parts: string[] = [`Exchange: ${clock.istTime} IST (${clock.isMarketOpen ? 'OPEN' : 'CLOSED'})`];
+
+    // Diagnose feed/tick latency against market hours to detect benign off-market drift vs real disconnects
+    if (/\b(stale|tick|feed|websocket|socket|market\s*data)\b/i.test(lower)) {
+      const lastTickAt = (this.market as any).lastTickAt;
+      const tickAge = lastTickAt ? Math.round((Date.now() - lastTickAt) / 1000) : null;
+      parts.push(`Feed Age: ${tickAge !== null ? `${tickAge}s` : 'None'}`);
+
+      const probe = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [13] } });
+      const nq = probe?.data?.IDX_I?.['13']?.last_price;
+      if (nq) parts.push(`NIFTY spot: ₹${nq}`);
+
+      if (!clock.isMarketOpen) {
+        parts.push('Analysis: Session closed; off-hours tick staleness is expected and benign.');
+      } else if (tickAge !== null && tickAge <= 10) {
+        parts.push('Status: WebSocket feed has recovered. Ticks are streaming nominally.');
+      } else {
+        parts.push('Action: Feed latency detected. Recommend verifying market feed subscriber connection.');
+      }
+    }
+
+    if (/\b(margin|fund|balance|capital|insufficient)\b/i.test(lower)) {
+      const funds = await this.callTool(runId, 'risk', 'dhan_funds', {});
+      const avail = funds?.availMargin ?? funds?.data?.availMargin;
+      if (avail !== undefined) parts.push(`Available Margin: ₹${Number(avail).toLocaleString('en-IN')}`);
+    }
+
+    parts.push(`Kill Switch: ${this.risk.isKilled() ? 'ENGAGED' : 'ARMED / OK'}`);
+    return `Diagnostic Findings: ${parts.join(' | ')}.`;
+  }
+
+  private async handleQueryObjective(runId: string, objective: string, triggeredBy = 'control_plane'): Promise<void> {
+    this.activeRunTriggers.set(runId, triggeredBy);
+    try {
+      this.step(runId, 'planner', 'THINK', `Query received: "${objective}". Direct resolution activated (bypassing trade execution pipeline).`);
+
+      const specFact = resolveSpecFact(objective);
+      const portFact = !specFact ? await resolvePortfolioFact(this.risk, objective) : null;
+      const marketFact = !specFact && !portFact ? resolveMarketFact(this.market, objective) : null;
+      const toolFact = !specFact && !portFact && !marketFact ? await this.dispatchQueryTool(runId, objective) : null;
+      const diagFact = !specFact && !portFact && !marketFact && !toolFact ? await this.resolveDiagnosticFact(runId, objective) : null;
+      const knownFact = specFact?.answer || portFact || marketFact || toolFact || diagFact;
+
+      const systemPrompt = 'You are an institutional trading assistant for DhanHQ Axis Nexus. Answer the user question directly, accurately, and concisely based on the facts provided. Maximum 3 sentences.';
+      const promptContext = knownFact
+        ? `Objective: "${objective}"\nSystem Facts: ${knownFact}`
+        : `Objective: "${objective}"`;
+
+      const answer = await this.reason(
+        runId,
+        'analyst',
+        systemPrompt,
+        promptContext,
+        () => knownFact || `Analyst: Query processed for "${objective}". No active trading directive required.`
+      );
+
+      this.step(runId, 'analyst', 'OBSERVE', `Answer:\n${answer}`);
+    } catch (e: any) {
+      this.step(runId, 'critic', 'ERROR', `Query resolution error: ${e.message}`);
+    } finally {
+      this.activeRunTriggers.delete(runId);
+      eventBus.emit('system', { type: 'agent_run_complete', runId });
+    }
+  }
+
+  private async handleDiagnosticObjective(runId: string, objective: string, triggeredBy = 'control_plane'): Promise<void> {
+    this.activeRunTriggers.set(runId, triggeredBy);
+    try {
+      this.step(runId, 'planner', 'THINK', `Decomposing alert: 1. Audit circuit breakers & limits. 2. Inspect active strategies & positions. 3. Formulate concrete remediation.`);
+
+      const breakers = await this.risk.evaluate().catch(() => []);
+      const limits = this.risk.getLimits();
+      const tripped = breakers.filter((b: any) => b.state === 'ERROR' || b.state === 'WARN');
+      const breakerDesc = tripped.map((b: any) => `${b.rule}: ${b.state} (${b.current}/${b.threshold})`).join('; ') || 'All breakers nominal';
+      this.step(runId, 'risk', 'ACT', 'Circuit breakers & risk gates evaluated', { response: breakerDesc });
+
+      const { running, flat } = await auditStrategyConcurrency(this.risk);
+      const stratDesc = running.map((s: any) => `${s.name} (${s.id}): ${flat.includes(s) ? 'FLAT/IDLE' : 'ACTIVE'}`).join('; ');
+      this.step(runId, 'strategy', 'ACT', `Audited ${running.length} running strategies (${flat.length} idle/flat without open legs)`, { response: stratDesc });
+      this.step(runId, 'strategy', 'THINK', stratDesc ? `Strategy registry: ${stratDesc}` : 'No active strategies registered.');
+
+      const isConcurrencyIssue = /\b(concurrent|strategies|pile-up)\b/i.test(objective) || tripped.some((b: any) => b.rule === 'Concurrent Strategies');
+      let actionText = '';
+      let tagText = '';
+      if (isConcurrencyIssue && flat.length > 0) {
+        actionText = `Remediation: Stop ${flat.length} idle strategy(ies) (${flat.map((s: any) => s.name).join(', ')}) to reduce concurrency from ${running.length} to ${running.length - flat.length}/${limits.maxConcurrentStrategies}.`;
+        tagText = `\n[REMEDIATION: STOP_STRATEGIES ids=${flat.map((s: any) => s.id).join(',')} count=${flat.length}]`;
+      } else if (isConcurrencyIssue) {
+        actionText = `All ${running.length} running strategies have active legs. Recommend increasing maxConcurrentStrategies or waiting for target exits.`;
+      } else {
+        const diagFact = await this.resolveDiagnosticFact(runId, objective);
+        actionText = diagFact || 'Verify system status and market data feed connectivity.';
+      }
+
+      this.step(runId, 'execution', 'THINK', actionText);
+
+      const answer = `Diagnosis: ${breakerDesc}.\nStrategy Audit: ${running.length} strategies running (${flat.length} idle/flat).\nRemediation: ${actionText}${tagText}`;
+      this.step(runId, 'analyst', 'OBSERVE', `Answer:\n${answer}`);
+    } catch (e: any) {
+      this.step(runId, 'critic', 'ERROR', `Diagnostic triage error: ${e.message}`);
+    } finally {
+      this.activeRunTriggers.delete(runId);
+      eventBus.emit('system', { type: 'agent_run_complete', runId });
+    }
+  }
+
   private async executeRun(runId: string, objective: string, triggeredBy: string): Promise<void> {
     eventBus.log('INFO', `Agent run ${runId} started (${triggeredBy}): "${objective.slice(0, 120)}"`, 'agent');
-    this.step(runId, 'planner', 'THINK', `Objective received: "${objective}"`);
 
     try {
-      // 1. PLANNER
-      const rules = await getActiveRules().catch(() => []);
-      const rulesText = rules.length > 0 ? `\n\nSELF-HEALED RULES (learned from recurring failures — must adhere):\n${rules.map((r) => `- ${r}`).join('\n')}` : '';
-      await this.reason(runId, 'planner', `Decompose objective into concrete steps.${rulesText}`, objective,
-        () => 'Plan: 1. Pull market quotes & chain 2. Analyze IV & PCR 3. Formulate strategy 4. Check risk 5. Execute 6. Critique');
-
-      // 2. ANALYST & MULTI-INDEX WATCHLIST SCANNER
-      const watchlist = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY'];
-      const explicitTarget = watchlist.find((s) => new RegExp(`\\b${s}\\b`, 'i').test(objective) && !objective.toLowerCase().includes('and') && !objective.toLowerCase().includes('across') && !objective.toLowerCase().includes('all'));
-      const targets = explicitTarget ? [explicitTarget] : watchlist;
-
-      // 2b. Capital allocation (30% of total available capital). Reads
-      // through RiskEngine's PortfolioSource rather than branching on
-      // TRADING_MODE itself — a prior version called
-      // (this.client as any).funds?.get?.() directly for live mode, which
-      // doesn't exist on the SDK (the real method is funds.getLimit(), with
-      // response fields availabelBalance/utilizedAmount, not the
-      // availableCash/availMargin guessed here). Because of the optional
-      // chaining, that silently resolved to undefined every time and this
-      // fell through to the hardcoded ₹10L default regardless of the real
-      // account balance — fabricated capital sizing in live mode.
-      let availableCapital = 1_000_000;
-      try {
-        const wallet = await this.risk.getPortfolio().getWallet();
-        availableCapital = Number(wallet.availableMargin || wallet.totalBalance || 1_000_000);
-      } catch { /* default 10L */ }
-
-      const vixRes = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } });
-      const vix = extractLtp(vixRes, INDEX_INSTRUMENTS.INDIAVIX.securityId) || 14;
-
-      interface Candidate {
-        target: string;
-        spot: number;
-        analytics: any;
-        strategy: ConstructedStrategy;
-        bt: any;
-        score: number;
-      }
-      const candidates: Candidate[] = [];
-
-      for (const target of targets) {
-        const inst = INDEX_INSTRUMENTS[target];
-        if (!inst) continue;
-        const expiry = await resolveNearestExpiry(this.client, target);
-        const [ltpRes, chainRes] = await Promise.all([
-          this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
-          this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),
-        ]);
-
-        const spot = extractLtp(ltpRes, inst.securityId) || this.market.getLtp(inst.securityId) || 0;
-        const rows = chainRes?.strikes || chainRes?.data || [];
-        if (rows.length === 0) continue;
-
-        const analytics = analyzeOptionChain(target, rows, spot, expiry, vix);
-        recordIvSample(target, analytics.atmIv);
-        const strat = this.synthesizeStrategy(objective, target, spot, rows, expiry, analytics, availableCapital, vix);
-        if (!strat) continue;
-
-        const bt = await this.backtestCandidate(target, inst.securityId, strat);
-        const score = (bt.winRate || 50) * (bt.profitFactor || 1.2);
-        candidates.push({ target, spot, analytics, strategy: strat, bt, score });
-      }
-
-      candidates.sort((a, b) => b.score - a.score);
-      const best = candidates[0];
-
-      await this.reason(runId, 'analyst', 'Summarize multi-index market conditions.', JSON.stringify(candidates.map((c) => ({ target: c.target, spot: c.spot, regime: c.analytics.regime, score: c.score }))),
-        () => best ? `Analyst: Scanned ${candidates.length} watchlist indices. Top candidate: ${best.strategy.name} on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${best.bt.winRate}%, PF: ${best.bt.profitFactor})` : 'Analyst: No actionable setups across watchlist');
-
-      const strategy = best?.strategy || null;
-      const bt = best?.bt || { winRate: 0, totalDays: 0, totalPnlInr: 0, profitFactor: 0, passedValidation: false };
-      this.step(runId, 'strategy', 'ACT', `Selected Strategy: ${strategy?.name || 'NONE'} (${strategy?.lots || 0} lots) | Backtest: ${bt.winRate}% win rate across ${bt.totalDays}d (PF: ${bt.profitFactor})`, {
-        tool: 'strategy.backtest', response: JSON.stringify({ winRate: bt.winRate, pnl: bt.totalPnlInr, pf: bt.profitFactor, pass: bt.passedValidation }),
-      });
-
-      // 4. RISK
-      const gate = this.risk.canTrade();
-      const breakers = this.risk.snapshot().breakers || [];
-      const tripped = breakers.filter((b) => b.state !== 'OK');
-      // Single source of truth — evaluateStrategyBacktest already encodes the
-      // real win-rate/profit-factor/max-drawdown thresholds. The two escape
-      // hatches this used to have (totalDays===0 auto-passing, and a lower
-      // 0.9 PF bar bypassing the real validation) both let "we don't know"
-      // or "the real check said no" through as ALLOWED. Neither should.
-      const isBacktestPassing = bt.passedValidation;
-      this.step(runId, 'risk', 'ACT', `Risk gate: ${gate.allowed && isBacktestPassing ? 'ALLOWED' : `BLOCKED (${!gate.allowed ? gate.reason : 'statistical edge below threshold'})`}`, {
-        tool: 'risk_engine.evaluate', response: JSON.stringify({ allowed: gate.allowed, tripped: tripped.length, backtestPass: isBacktestPassing }),
-      });
-
-      // 5. EXECUTION
-      const executed = await this.executeStrategy(runId, objective, strategy, gate.allowed && tripped.length === 0 && isBacktestPassing);
-
-      // 6. CRITIC
-      await this.reason(runId, 'critic', 'Review trading run & backtest metrics.', JSON.stringify({ executed: executed.status, backtest: bt }),
-        () => `Critic (deterministic): Execution ${executed.status}. Backtest win rate ${bt.winRate}% (PF: ${bt.profitFactor}). Risk limits respected.`);
+      await this.executeTradePipeline(runId, objective);
     } catch (e: any) {
       this.step(runId, 'critic', 'ERROR', `Run failed: ${e.message}`);
       eventBus.log('ERROR', `Agent run ${runId} error: ${e.message}`, 'agent');
@@ -333,6 +719,118 @@ export class AgentOrchestrator {
       if (this.currentRun?.runId === runId) this.currentRun.running = false;
       eventBus.emit('system', { type: 'agent_run_complete', runId });
     }
+  }
+
+  private async executeTradePipeline(runId: string, objective: string): Promise<void> {
+    this.step(runId, 'planner', 'THINK', `Objective received: "${objective}"`);
+
+    // 1. PLANNER
+    const rules = await getActiveRules().catch(() => []);
+    const rulesText = rules.length > 0 ? `\n\nSELF-HEALED RULES (learned from recurring failures — must adhere):\n${rules.map((r) => `- ${r}`).join('\n')}` : '';
+    await this.reason(runId, 'planner', `Decompose objective into concrete steps.${rulesText}`, objective,
+      () => 'Plan: 1. Pull market quotes & chain 2. Analyze IV & PCR 3. Formulate strategy 4. Check risk 5. Execute 6. Critique');
+
+    // 2. ANALYST & MULTI-INDEX WATCHLIST SCANNER
+    const watchlist = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY'];
+    const matchedSym = matchIndexSymbol(objective);
+    const explicitTarget = (matchedSym && matchedSym !== 'INDIAVIX' && !objective.toLowerCase().includes('and') && !objective.toLowerCase().includes('across') && !objective.toLowerCase().includes('all'))
+      ? matchedSym
+      : null;
+    const targets = explicitTarget ? [explicitTarget] : watchlist;
+
+    // 2b. Capital allocation (30% of total available capital).
+    let availableCapital = 1_000_000;
+    try {
+      const wallet = await this.risk.getPortfolio().getWallet();
+      availableCapital = Number(wallet.availableMargin || wallet.totalBalance || 1_000_000);
+    } catch { /* default 10L */ }
+
+    const vixRes = await this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(INDEX_INSTRUMENTS.INDIAVIX.securityId)] } });
+    const vix = extractLtp(vixRes, INDEX_INSTRUMENTS.INDIAVIX.securityId) || 14;
+
+    interface Candidate {
+      target: string;
+      spot: number;
+      analytics: any;
+      strategy: ConstructedStrategy;
+      bt: any;
+      score: number;
+    }
+    const candidates: Candidate[] = [];
+
+    for (const target of targets) {
+      const inst = INDEX_INSTRUMENTS[target];
+      if (!inst) continue;
+      const expiry = await resolveNearestExpiry(this.client, target);
+      const [ltpRes, chainRes] = await Promise.all([
+        this.callTool(runId, 'analyst', 'dhan_ltp', { instruments: { IDX_I: [Number(inst.securityId)] } }),
+        this.callTool(runId, 'analyst', 'dhan_option_chain', { underlyingScrip: Number(inst.securityId), underlyingSeg: 'IDX_I', expiry }),
+      ]);
+
+      const spot = extractLtp(ltpRes, inst.securityId) || this.market.getLtp(inst.securityId) || 0;
+      const rows = chainRes?.strikes || chainRes?.data || [];
+      if (rows.length === 0) continue;
+
+      const analytics = analyzeOptionChain(target, rows, spot, expiry, vix);
+      recordIvSample(target, analytics.atmIv);
+      const strat = this.synthesizeStrategy(objective, target, spot, rows, expiry, analytics, availableCapital, vix);
+      if (!strat) continue;
+
+      const bt = await this.backtestCandidate(target, inst.securityId, strat);
+      const score = (bt.winRate || 50) * (bt.profitFactor || 1.2);
+      candidates.push({ target, spot, analytics, strategy: strat, bt, score });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+
+    await this.reason(runId, 'analyst', 'Summarize multi-index market conditions.', JSON.stringify(candidates.map((c) => ({ target: c.target, spot: c.spot, regime: c.analytics.regime, score: c.score }))),
+      () => best ? `Analyst: Scanned ${candidates.length} watchlist indices. Top candidate: ${best.strategy.name} on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${best.bt.winRate}%, PF: ${best.bt.profitFactor})` : 'Analyst: No actionable setups across watchlist');
+
+    const strategy = best?.strategy || null;
+    const bt = best?.bt || { winRate: 0, totalDays: 0, totalPnlInr: 0, profitFactor: 0, passedValidation: false };
+
+    const proposal: TradeProposal | null = best && strategy ? {
+      proposalId: `prop_${runId}`,
+      target: best.target,
+      strategy,
+      regime: best.analytics?.regime || 'NEUTRAL',
+      score: best.score,
+      backtest: bt,
+      thesis: `Top candidate on ${best.target} (Score: ${best.score.toFixed(1)}, WinRate: ${bt.winRate}%, PF: ${bt.profitFactor})`,
+      confidence: Number(Math.min(0.95, Math.max(0.1, (best.score / 100))).toFixed(2)),
+      createdAt: new Date().toISOString(),
+    } : null;
+
+    this.step(runId, 'strategy', 'ACT', `Selected Strategy: ${strategy?.name || 'NONE'} (${strategy?.lots || 0} lots) | Backtest: ${bt.winRate}% win rate across ${bt.totalDays}d (PF: ${bt.profitFactor})`, {
+      tool: 'strategy.backtest', response: JSON.stringify({ winRate: bt.winRate, pnl: bt.totalPnlInr, pf: bt.profitFactor, pass: bt.passedValidation }),
+    });
+
+    // 4. RISK
+    const gate = this.risk.canTrade();
+    const breakers = this.risk.snapshot().breakers || [];
+    const tripped = breakers.filter((b) => b.state !== 'OK');
+    const isBacktestPassing = bt.passedValidation;
+    this.step(runId, 'risk', 'ACT', `Risk gate: ${gate.allowed && isBacktestPassing ? 'ALLOWED' : `BLOCKED (${!gate.allowed ? gate.reason : 'statistical edge below threshold'})`}`, {
+      tool: 'risk_engine.evaluate', response: JSON.stringify({ allowed: gate.allowed, tripped: tripped.length, backtestPass: isBacktestPassing }),
+    });
+
+    const approved = gate.allowed && tripped.length === 0 && isBacktestPassing;
+    if (proposal) {
+      eventBus.emit('system', {
+        type: 'trade_proposal',
+        proposal,
+        approved,
+        reason: approved ? undefined : (!gate.allowed ? gate.reason : 'statistical edge below threshold'),
+      });
+    }
+
+    // 5. EXECUTION
+    const executed = await this.executeStrategy(runId, objective, strategy, approved);
+
+    // 6. CRITIC
+    await this.reason(runId, 'critic', 'Review trading run & backtest metrics.', JSON.stringify({ executed: executed.status, backtest: bt }),
+      () => `Critic (deterministic): Execution ${executed.status}. Backtest win rate ${bt.winRate}% (PF: ${bt.profitFactor}). Risk limits respected.`);
   }
 
   private synthesizeStrategy(
@@ -451,66 +949,15 @@ export class AgentOrchestrator {
     this.market.addInstruments(strat.legs.map((l) => ({ securityId: l.securityId, exchangeSegment: l.exchangeSegment || 'NSE_FNO' })));
     const mode = process.env.TRADING_MODE;
     const engine = mode === 'live' ? this.live : mode === 'sandbox' && this.sandbox ? this.sandbox : this.paper;
-    const filledLegs: typeof strat.legs = [];
-    for (const leg of strat.legs) {
-      const res = await engine.placeOrder({
-        correlation_id: `${strat.id}_${leg.optionType}_${leg.strike}`,
-        intent_id: runId,
-        params: {
-          security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
-          transaction_type: leg.side, order_type: 'MARKET', exchange_segment: leg.exchangeSegment || 'NSE_FNO',
-          product_type: 'INTRADAY', price: leg.price,
-        },
-        risk_limits: {
-          stop_loss: leg.stopLoss,
-          target: leg.target,
-          trailing_stop: leg.trailingStop,
-        },
-      });
-      if (res && (res.status === 'TRADED' || res.orderId)) {
-        filledLegs.push(leg);
-      } else {
-        // Stop rather than keep filling — more legs into a broken structure
-        // is more exposure to unwind, not less.
-        break;
-      }
-    }
 
-    if (filledLegs.length > 0 && filledLegs.length < strat.legs.length) {
-      // Partial fill on a multi-leg structure is worse than no fill — e.g. a
-      // short leg filling without its hedge is naked, undefined risk. Unwind
-      // whatever filled rather than leaving it to stand.
-      //
-      // Goes through PortfolioSource.closePosition(), NOT engine.placeOrder()
-      // — placeOrder() re-checks risk.canTrade(), the SAME gate whose
-      // failure typically caused THIS partial fill (a breaker tripping
-      // between legs, or the kill switch arming). A risk-REDUCING close must
-      // never be blocked by the entry gate; closePosition() (paper and
-      // broker alike) doesn't check it.
-      const portfolio = this.risk.getPortfolio();
-      for (const leg of filledLegs) {
-        const unwindPrice = this.market.getFillablePrice(leg.securityId, { allowClosed: true }) ?? leg.price;
-        const result = await portfolio.closePosition(leg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED' as const, reason: e.message }));
-        if (result.status === 'TRADED') {
-          this.market.monitor.untrack(leg.exchangeSegment || 'NSE_FNO', leg.securityId);
-        } else {
-          // Untracking here would strip stop-loss/target from a leg that is
-          // STILL open — the same mistake fixed in RiskEngine.armKillSwitch
-          // for the exact same reason.
-          eventBus.log('ERROR', `Unwind FAILED for leg ${leg.instrument}: ${result.status}${(result as any).reason ? ` (${(result as any).reason})` : ''} — still open, protection left tracked`, 'agent');
-        }
-      }
-      eventBus.log('ERROR', `Multi-leg deploy ${strat.name} partially filled (${filledLegs.length}/${strat.legs.length}) — unwound`, 'agent');
-      this.step(runId, 'execution', 'ACT', `Strategy ${strat.name} partial fill unwound (${filledLegs.length}/${strat.legs.length})`);
-      return { status: 'FAILED', reason: 'partial_fill_unwound' };
-    }
-
-    if (filledLegs.length === strat.legs.length && filledLegs.length > 0) {
+    const deployResult = await deployMultiLeg(engine, strat, runId, this.market, this.risk);
+    if (deployResult.status === 'TRADED') {
       await createPaperStrategy({ id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots, legs: strat.legs });
-      this.step(runId, 'execution', 'ACT', `Strategy deployed: ${strat.name} (${filledLegs.length}/${strat.legs.length} legs filled)`);
-      return { status: 'TRADED', strategyId: strat.id, legsFilled: filledLegs.length };
+      this.step(runId, 'execution', 'ACT', `Strategy deployed: ${strat.name} (${deployResult.legsFilled}/${strat.legs.length} legs filled)`);
+    } else {
+      this.step(runId, 'execution', 'ACT', `Strategy ${strat.name} deployment failed: ${deployResult.reason || 'rejected'}`);
     }
-    return { status: 'FAILED' };
+    return deployResult;
   }
 
   private async backtestCandidate(target: string, secId: string, strat: ConstructedStrategy | null) {

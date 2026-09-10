@@ -106,3 +106,46 @@ table,
 	border-bottom: none;
 }
 
+/* Real-time value flash animations (hardware accelerated, zero-render DOM reflow) */
+@keyframes flash-up {
+	0% {
+		background-color: rgba(0, 229, 160, 0.32);
+		color: #33ffbb;
+	}
+	100% {
+		background-color: transparent;
+	}
+}
+
+@keyframes flash-down {
+	0% {
+		background-color: rgba(255, 59, 92, 0.32);
+		color: #ff6b84;
+	}
+	100% {
+		background-color: transparent;
+	}
+}
+
+@keyframes flash-neutral {
+	0% {
+		background-color: rgba(56, 189, 248, 0.28);
+	}
+	100% {
+		background-color: transparent;
+	}
+}
+
+.animate-flash-up {
+	animation: flash-up 750ms cubic-bezier(0.1, 0.9, 0.2, 1) forwards;
+}
+
+.animate-flash-down {
+	animation: flash-down 750ms cubic-bezier(0.1, 0.9, 0.2, 1) forwards;
+}
+
+.animate-flash-neutral {
+	animation: flash-neutral 750ms cubic-bezier(0.1, 0.9, 0.2, 1) forwards;
+}
+
+

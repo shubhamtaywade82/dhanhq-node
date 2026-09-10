@@ -2,7 +2,7 @@ import { StatusDot } from '../ui/StatusDot';
 import { useApp } from '../../store/AppContext';
 import {
   ChartLine, ChessKnight, Layers, Wallet, Receipt, Brain, Satellite, Database,
-  Calculator, Shield, ListChecks, Bell, Terminal, Settings, TrendingUp,
+  Calculator, Shield, ListChecks, Bell, Terminal, Settings, TrendingUp, BookOpen,
 } from 'lucide-react';
 
 interface NavItem {
@@ -22,6 +22,7 @@ const tradingItems: NavItem[] = [
 
 const agentItems: NavItem[] = [
   { id: 'agent-console', label: 'Agent Console', icon: <Brain size={13} /> },
+  { id: 'research-console', label: 'Research Console', icon: <BookOpen size={13} /> },
   { id: 'agent-monitor', label: 'Ops Telemetry', icon: <Satellite size={13} /> },
   { id: 'agent-tools-memory', label: 'Tools & Memory', icon: <Database size={13} /> },
 ];

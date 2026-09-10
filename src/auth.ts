@@ -1,39 +1,20 @@
-import dotenv from "dotenv";
-dotenv.config();
+import './lib/env';
 import { DhanClient, DhanAuth } from "@nemesis-oss/dhanhq-sdk";
 import Redis from "ioredis";
 import { moduleLogger } from "./lib/logger";
 
 /**
- * DhanHQ client factory.
- *
- * Token resolution order:
- *   1. DHAN_ACCESS_TOKEN (direct)
- *   2. Rails token authority (DHAN_AUTH_PROVIDER_URL + token)
- *   3. Dhan TOTP (DHAN_CLIENT_ID + DHAN_PIN + DHAN_TOTP_SECRET)
- *   4. Redis-held rotating token (dhan:auth:access_token)
- *
- * Redis is OPTIONAL: when unreachable the system still boots and trades
- * with the token from steps 1-3 (pub/sub events become no-ops).
- * NOTE: uses native fetch — axios was never a declared dependency.
+ * DhanHQ client factory — TOTP or external authority only (no DHAN_ACCESS_TOKEN).
+ * RenewToken is web-dashboard only; TOTP tokens must be re-generated via generateAccessToken.
  */
 
-// The SDK calls tokenProvider() (resolveToken below) on EVERY REST request
-// (confirmed against the SDK's AuthResolver — it's not cached internally by
-// the SDK itself), so resolving with zero local cache would mean a Redis
-// round-trip on every single quote/order/position call — real overhead in
-// a system ticking at ~10Hz. But the ONLY other thing that invalidates that
-// cache is a best-effort Redis pub/sub broadcast (dhan:auth:rotated,
-// setupTokenRotationSubscriber below) — fire-and-forget, no delivery
-// guarantee across a dropped connection or a Redis restart. A short window
-// keeps the common case (dozens of calls per second) cheap while still
-// re-checking Redis often enough that a MISSED rotation broadcast
-// self-heals in seconds rather than silently presenting a dead token for
-// up to half a day.
 const IN_MEMORY_TOKEN_TTL_MS = 30_000;
+const DHAN_TOTP_URL = "https://auth.dhan.co/app/generateAccessToken";
+const DHAN_TOTP_COOLDOWN_MS = 120_000;
+const TOTP_FAIL_COOLDOWN_MS = 120_000;
+const MIN_DHAN_TOKEN_LEN = 50;
 
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379/0";
-
 const log = moduleLogger("auth");
 
 function lazyRedis(url: string): Redis {
@@ -43,29 +24,118 @@ function lazyRedis(url: string): Redis {
     retryStrategy: (times) => (times > 5 ? null : Math.min(times * 1000, 10000)),
     enableOfflineQueue: false,
   });
-  r.on('error', (e) => { /* swallow — Redis is optional */ });
+  r.on("error", () => { /* swallow — Redis is optional */ });
   return r;
 }
 
-export const redisPublisher: Pick<Redis, 'publish' | 'set' | 'get' | 'ping' | 'info' | 'ttl' | 'keys'> & { status?: string } = lazyRedis(redisUrl);
+export const redisPublisher: Pick<Redis, "publish" | "set" | "get" | "del" | "ping" | "info" | "ttl" | "keys"> & { status?: string } = lazyRedis(redisUrl);
 export const redisSubscriber = lazyRedis(redisUrl);
+
 export const redisAvailable = async (): Promise<boolean> => {
-  if ((redisPublisher as any).status === 'ready') return true;
-  if ((redisPublisher as any).status === 'connecting') {
+  if ((redisPublisher as any).status === "ready") return true;
+  if ((redisPublisher as any).status === "connecting") {
     await Promise.race([
-      new Promise((resolve) => (redisPublisher as any).once('ready', resolve)),
+      new Promise((resolve) => (redisPublisher as any).once("ready", resolve)),
       new Promise((resolve) => setTimeout(resolve, 500)),
     ]);
-    return (redisPublisher as any).status === 'ready';
+    return (redisPublisher as any).status === "ready";
   }
   return false;
 };
 
-// Fetches a fresh token from the Rails token authority (algo_scalper_api).
+export function isUsableDhanToken(token: string | null | undefined): boolean {
+  if (!token || token.length < MIN_DHAN_TOKEN_LEN) return false;
+  if (token === "your_access_token") return false;
+  return true;
+}
+
+export function resolveDhanClientId(envClientId: string, redisClientId: string | null): string {
+  return envClientId || redisClientId || "";
+}
+
+export function hasTotpCredentials(): boolean {
+  const clientId = process.env.DHAN_CLIENT_ID || process.env.CLIENT_ID || "";
+  return !!(process.env.DHAN_PIN && process.env.DHAN_TOTP_SECRET && clientId);
+}
+
+export function hasExternalAuthProvider(): boolean {
+  const url = process.env.DHAN_AUTH_PROVIDER_URL || process.env.DHAN_TOKEN_ENDPOINT;
+  const token = process.env.DHAN_AUTH_PROVIDER_TOKEN || process.env.DHAN_TOKEN_ACCESS_TOKEN;
+  return !!(url && token);
+}
+
+function parseDhanExpiry(raw: unknown): number | undefined {
+  if (!raw || typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(trimmed);
+  const normalized = hasZone ? trimmed : `${trimmed.replace(" ", "T")}+05:30`;
+  const parsed = Date.parse(normalized);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+let activeToken: string | null = null;
+let activeTokenAt = 0;
+let totpBlockedUntil = 0;
+let totpInFlight: Promise<string> | null = null;
+let lastTotpFailAt = 0;
+
+async function cacheToken(token: string, expiresAt?: number): Promise<void> {
+  activeToken = token;
+  activeTokenAt = Date.now();
+  if (!(await redisAvailable())) return;
+  const ttlSec = expiresAt ? Math.max(60, Math.floor((expiresAt - Date.now()) / 1000)) : 82800;
+  await redisPublisher.set("dhan:auth:access_token", token, "EX", ttlSec).catch(() => {});
+  if (expiresAt) {
+    await redisPublisher.set("dhan:auth:expires_at", String(expiresAt), "EX", ttlSec).catch(() => {});
+  }
+}
+
+async function readRedisCachedToken(): Promise<{ token: string; expiresAt?: number } | null> {
+  if (!(await redisAvailable())) return null;
+  const token = await redisPublisher.get("dhan:auth:access_token").catch(() => null);
+  if (!isUsableDhanToken(token)) return null;
+  const rawExp = await redisPublisher.get("dhan:auth:expires_at").catch(() => null);
+  const expiresAt = rawExp ? Number(rawExp) : undefined;
+  if (expiresAt && Date.now() >= expiresAt) return null;
+  return { token: token!, expiresAt };
+}
+
+export async function generateTokenViaTotp(clientId: string, pin: string, totpSecret: string): Promise<string> {
+  const now = Date.now();
+  if (now < totpBlockedUntil) {
+    const waitSec = Math.ceil((totpBlockedUntil - now) / 1000);
+    throw new Error(`Dhan TOTP rate-limited — retry in ${waitSec}s`);
+  }
+
+  const totp = DhanAuth.generateTotp(totpSecret);
+  const qs = new URLSearchParams({ dhanClientId: clientId, pin, totp });
+  const res = await fetch(`${DHAN_TOTP_URL}?${qs}`, {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(8000),
+  });
+  const data: Record<string, unknown> = await res.json().catch(() => ({}));
+  const token = (data.accessToken ?? data.access_token) as string | undefined;
+
+  if (isUsableDhanToken(token)) {
+    totpBlockedUntil = 0;
+    const expiresAt = parseDhanExpiry(data.expiryTime ?? data.expiry_time);
+    await cacheToken(token!, expiresAt);
+    return token!;
+  }
+
+  const dhanMsg = String(data.message ?? data.Message ?? data.errorMessage ?? "no accessToken in response");
+  if (dhanMsg.toLowerCase().includes("2 minute")) {
+    totpBlockedUntil = Date.now() + DHAN_TOTP_COOLDOWN_MS;
+  }
+  throw new Error(`Dhan TOTP failed: ${dhanMsg}`);
+}
+
 async function fetchTokenFromRails(baseUrl: string, bearerToken?: string): Promise<string> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
-  const res = await fetch(`${baseUrl.replace(/\/$/, '')}/api/dhan_access_token`, {
+  const res = await fetch(`${baseUrl.replace(/\/$/, "")}/api/dhan_access_token`, {
     headers,
     signal: AbortSignal.timeout(3000),
   });
@@ -76,92 +146,90 @@ async function fetchTokenFromRails(baseUrl: string, bearerToken?: string): Promi
   return token;
 }
 
-// Generates an access token via Dhan TOTP authentication (Tier 3 fallback when algo_scalper_api is down).
-export async function generateTokenViaTotp(clientId: string, pin: string, totpSecret: string): Promise<string> {
-  const totp = DhanAuth.generateTotp(totpSecret);
-  const res = await DhanAuth.generateAccessToken({ clientId, pin, totp });
-  const token = res.accessToken;
-  if (!token) throw new Error("[Auth] TOTP response did not contain access token");
-
-  if (await redisAvailable()) {
-    await redisPublisher.set("dhan:auth:access_token", token, "EX", 82800).catch(() => {});
-    await redisPublisher.set("dhan:auth:client_id", clientId).catch(() => {});
-  }
-  return token;
+async function invalidateCachedToken(): Promise<void> {
+  activeToken = null;
+  activeTokenAt = 0;
+  if (!(await redisAvailable())) return;
+  await redisPublisher.del("dhan:auth:access_token", "dhan:auth:expires_at").catch(() => {});
 }
-
-let activeToken: string | null = null;
-let activeTokenAt = 0;
 
 export async function createDhanClient(): Promise<DhanClient> {
   const isRedisReady = await redisAvailable();
-  const clientId = (isRedisReady ? await redisPublisher.get("dhan:auth:client_id").catch(() => null) : null)
-    || process.env.DHAN_CLIENT_ID || process.env.CLIENT_ID || "";
-  const accessToken = process.env.DHAN_ACCESS_TOKEN;
+  const envClientId = process.env.DHAN_CLIENT_ID || process.env.CLIENT_ID || "";
+  const redisClientId = isRedisReady
+    ? await redisPublisher.get("dhan:auth:client_id").catch(() => null)
+    : null;
+  const clientId = resolveDhanClientId(envClientId, redisClientId);
+  if (envClientId && redisClientId && envClientId !== redisClientId) {
+    log.warn("Redis client_id mismatch — using DHAN_CLIENT_ID from .env");
+  }
   const pin = process.env.DHAN_PIN;
   const totpSecret = process.env.DHAN_TOTP_SECRET;
+  const totpReady = !!(pin && totpSecret && clientId);
   const authProviderUrl = process.env.DHAN_AUTH_PROVIDER_URL || process.env.DHAN_TOKEN_ENDPOINT || "http://localhost:3000";
   const authProviderToken = process.env.DHAN_AUTH_PROVIDER_TOKEN || process.env.DHAN_TOKEN_ACCESS_TOKEN;
-
-  if (accessToken && accessToken !== "your_access_token") {
-    activeToken = accessToken;
-    activeTokenAt = Date.now();
-  }
 
   let lastAuthorityFailAt = 0;
 
   const resolveToken = async (): Promise<string> => {
-    // 1. In-memory token if fresh (< IN_MEMORY_TOKEN_TTL_MS) — zero network
-    // overhead for the common case, short enough to still re-validate
-    // against Redis regularly (see the module-level comment on the const).
     if (activeToken && Date.now() - activeTokenAt < IN_MEMORY_TOKEN_TTL_MS) {
       return activeToken;
     }
 
-    // 2. Primary: Read live rotating token from Redis (written by algo_scalper_api or TOTP)
-    if (await redisAvailable()) {
-      try {
-        const rToken = await redisPublisher.get("dhan:auth:access_token").catch(() => null);
-        if (rToken) {
-          activeToken = rToken;
-          activeTokenAt = Date.now();
-          return rToken;
-        }
-      } catch { /* Redis fallback */ }
-    }
-
-    // 3. Secondary: Query algo_scalper_api REST endpoint (with 60s cooldown on failure)
-    if (authProviderUrl && Date.now() - lastAuthorityFailAt > 60_000) {
-      try {
-        const rToken = await fetchTokenFromRails(authProviderUrl, authProviderToken);
-        activeToken = rToken;
+    if (totpReady) {
+      const cached = await readRedisCachedToken();
+      if (cached) {
+        activeToken = cached.token;
         activeTokenAt = Date.now();
-        log.info("DhanHQ access token acquired from algo_scalper_api");
-        if (await redisAvailable()) {
-          await redisPublisher.set("dhan:auth:access_token", rToken, "EX", 82800).catch(() => {});
+        log.info(
+          { source: "redis", expiresInMin: cached.expiresAt ? Math.round((cached.expiresAt - Date.now()) / 60_000) : undefined },
+          "DhanHQ access token reused from cache (no TOTP)",
+        );
+        return cached.token;
+      }
+      if (Date.now() - lastTotpFailAt >= TOTP_FAIL_COOLDOWN_MS && Date.now() >= totpBlockedUntil) {
+        try {
+          if (!totpInFlight) {
+            totpInFlight = generateTokenViaTotp(clientId, pin!, totpSecret!).finally(() => {
+              totpInFlight = null;
+            });
+          }
+          const tToken = await totpInFlight;
+          log.info("DhanHQ token generated via TOTP");
+          return tToken;
+        } catch (e: any) {
+          lastTotpFailAt = Date.now();
+          log.warn({ err: { message: e.message }, tier: "totp" }, "TOTP generation failed");
         }
-        return rToken;
-      } catch (e: any) {
-        lastAuthorityFailAt = Date.now();
-        log.debug({ err: { message: e.message } }, "algo_scalper_api authority endpoint not responding (backing off 60s)");
       }
     }
 
-    // 4. Standalone fallback: Generate via TOTP if credentials provided
-    if (pin && totpSecret) {
+    if (authProviderUrl && Date.now() - lastAuthorityFailAt > 60_000) {
       try {
-        const tToken = await generateTokenViaTotp(clientId, pin, totpSecret);
-        activeToken = tToken;
-        activeTokenAt = Date.now();
-        log.info("DhanHQ token generated via standalone TOTP");
-        return tToken;
+        const rToken = await fetchTokenFromRails(authProviderUrl, authProviderToken);
+        await cacheToken(rToken);
+        log.info("DhanHQ access token acquired from algo_scalper_api");
+        return rToken;
       } catch (e: any) {
-        log.warn({ err: { message: e.message }, tier: "totp" }, "TOTP fallback generation failed");
+        lastAuthorityFailAt = Date.now();
+        log.debug({ err: { message: e.message } }, "algo_scalper_api not responding (backing off 60s)");
+      }
+    }
+
+    if (await redisAvailable()) {
+      const rToken = await redisPublisher.get("dhan:auth:access_token").catch(() => null);
+      if (isUsableDhanToken(rToken)) {
+        await cacheToken(rToken!);
+        return rToken!;
+      }
+      if (rToken) {
+        log.warn({ redisTokenLen: rToken.length }, "Ignoring invalid dhan:auth:access_token in Redis");
+        await redisPublisher.del("dhan:auth:access_token", "dhan:auth:expires_at").catch(() => {});
       }
     }
 
     if (activeToken) return activeToken;
-    throw new Error("[Auth] No active token found from algo_scalper_api, Redis, or TOTP credentials.");
+    throw new Error("[Auth] No active token — configure TOTP, Rails authority, or Redis token.");
   };
 
   const initialToken = await resolveToken().catch(() => "");
@@ -169,9 +237,7 @@ export async function createDhanClient(): Promise<DhanClient> {
     clientId,
     token: initialToken || undefined,
     tokenProvider: resolveToken,
-    // SDK default is 5s for every REST call. Too short for heavier endpoints
-    // (e.g. expiredOptionsData/rollingoption over a full trading day) — those
-    // were failing on a plain timeout and getting misread as "no data".
+    onTokenExpired: () => invalidateCachedToken(),
     timeoutMs: 20000,
   });
 
@@ -179,15 +245,6 @@ export async function createDhanClient(): Promise<DhanClient> {
   return client;
 }
 
-/**
- * Builds a DhanHQ Sandbox client for TRADING_MODE=sandbox — real order
- * routing against Dhan's paper-trading environment (flat ₹100 fills, no
- * WebSocket). Deliberately simpler than createDhanClient(): sandbox tokens
- * don't need the Redis/Rails-authority/TOTP rotation chain the real
- * account's live trading token does, so this just reads two env vars once.
- *
- * Returns undefined when unconfigured, so sandbox mode stays opt-in.
- */
 export function createSandboxDhanClient(): DhanClient | undefined {
   const clientId = process.env.DHAN_SANDBOX_CLIENT_ID;
   const token = process.env.DHAN_SANDBOX_ACCESS_TOKEN;
@@ -204,26 +261,22 @@ export function createSandboxDhanClient(): DhanClient | undefined {
 async function setupTokenRotationSubscriber() {
   if (!(await redisAvailable())) return;
   redisSubscriber.subscribe("dhan:auth:rotated", (err) => {
-    if (err) log.error({ err: { message: err.message }, channel: "dhan:auth:rotated" }, "Failed to subscribe to dhan:auth:rotated");
-    else log.info({ channel: "dhan:auth:rotated" }, "Subscribed to dhan:auth:rotated from algo_scalper_api");
+    if (err) log.error({ err: { message: err.message } }, "Failed to subscribe dhan:auth:rotated");
+    else log.info("Subscribed to dhan:auth:rotated");
   });
-
   redisSubscriber.on("message", (channel, rawMessage) => {
-    if (channel === "dhan:auth:rotated") {
-      try {
-        if (rawMessage) {
-          const payload = JSON.parse(rawMessage);
-          if (payload?.token) {
-            activeToken = payload.token;
-            activeTokenAt = Date.now();
-            log.info({ source: "algo_scalper_api" }, "Live DhanHQ access token refreshed from dhan:auth:rotated broadcast");
-            return;
-          }
-        }
-      } catch { /* ignore malformed broadcast */ }
-      activeToken = null;
-      activeTokenAt = 0;
-      log.info("Token rotation broadcast received — local cache invalidated for fresh fetch");
-    }
+    if (channel !== "dhan:auth:rotated") return;
+    try {
+      const payload = rawMessage ? JSON.parse(rawMessage) : null;
+      if (payload?.token) {
+        activeToken = payload.token;
+        activeTokenAt = Date.now();
+        log.info({ source: "algo_scalper_api" }, "Token refreshed from dhan:auth:rotated");
+        return;
+      }
+    } catch { /* malformed */ }
+    activeToken = null;
+    activeTokenAt = 0;
+    log.info("Token rotation broadcast — cache invalidated");
   });
 }

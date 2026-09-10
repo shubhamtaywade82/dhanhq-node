@@ -44,4 +44,46 @@ describe('patchOrderWsSafety', () => {
     expect(() => (OrderUpdateWS.prototype as any).onMessage.call(ctx, 'PING')).not.toThrow();
     expect(() => (OrderUpdateWS.prototype as any).onMessage.call(ctx, Buffer.from('not json'))).not.toThrow();
   });
+
+  it('defers send while readyState is CONNECTING instead of throwing', () => {
+    patchOrderWsSafety();
+    const baseProto = Object.getPrototypeOf(OrderUpdateWS.prototype);
+    const sent: string[] = [];
+    const conn: any = {
+      readyState: 0,
+      send: (p: string) => { sent.push(p); },
+    };
+    const ctx: any = { connection: conn };
+    expect(() => baseProto.send.call(ctx, '{"login":true}')).not.toThrow();
+    expect(sent).toHaveLength(0);
+    conn.readyState = 1;
+    return new Promise<void>((resolve) => {
+      setImmediate(() => {
+        expect(sent).toEqual(['{"login":true}']);
+        resolve();
+      });
+    });
+  });
+
+  it('patches startHeartbeat to send ws ping frames and avoid false close', () => {
+    patchOrderWsSafety();
+    const baseProto = Object.getPrototypeOf(OrderUpdateWS.prototype);
+    let pingCalls = 0;
+    const conn: any = {
+      readyState: 1,
+      ping: () => { pingCalls++; },
+      close: jest.fn(),
+    };
+    const ctx: any = { connection: conn, pingIntervalMs: 50 };
+    baseProto.startHeartbeat.call(ctx);
+    expect(ctx.pongTimeout).toBeUndefined();
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        clearInterval(ctx.pingInterval);
+        expect(pingCalls).toBeGreaterThan(0);
+        expect(conn.close).not.toHaveBeenCalled();
+        resolve();
+      }, 120);
+    });
+  });
 });

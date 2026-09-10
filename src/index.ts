@@ -1,11 +1,9 @@
-import dotenv from "dotenv";
+import './lib/env';
 import { startCore, resolveExecutionEngine } from "./core";
 import Redis from "ioredis";
 import type { Core } from "./core";
 import { moduleLogger, logError } from "./lib/logger";
 import { attachBusLoggerBridge } from "./lib/busLoggerBridge";
-
-dotenv.config();
 
 const log = moduleLogger("sidecar");
 

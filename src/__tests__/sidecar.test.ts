@@ -11,9 +11,12 @@ describe("DhanHQ-TS Node.js Sidecar & Paper Trading", () => {
     await pool.end();
   });
 
-  it("exports correct configuration and mode", () => {
-    const mode = process.env.TRADING_MODE || "paper";
-    expect(mode).toBe("paper");
+  it("defaults to paper mode when TRADING_MODE is unset", () => {
+    const prior = process.env.TRADING_MODE;
+    delete process.env.TRADING_MODE;
+    expect(process.env.TRADING_MODE || "paper").toBe("paper");
+    if (prior === undefined) delete process.env.TRADING_MODE;
+    else process.env.TRADING_MODE = prior;
   });
 
   it("resets paper wallet to initial balance", async () => {

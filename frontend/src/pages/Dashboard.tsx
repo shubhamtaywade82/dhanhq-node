@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { AppState } from "../store/types";
 import { useApp } from "../store/AppContext";
 import { Card } from "../components/ui/Card";
 import { Badge, StratBadge } from "../components/ui/Badge";
@@ -211,23 +212,22 @@ function MetricsGrid({
   state,
   totalPnl,
 }: {
-  state: {
-    positions: any[];
-    orders: any[];
-    funds: Record<string, any>;
-    strategies: { status: string }[];
-    indices: Record<string, { ltp: number; change: number; pct: number }>;
-  };
+  state: Pick<AppState, 'positions' | 'orders' | 'funds' | 'strategies' | 'indices' | 'tradingMode'>;
   totalPnl: number;
 }) {
+  const mode = state.tradingMode || 'paper';
+  const isPaper = mode === 'paper';
+  const isSandbox = mode === 'sandbox';
   const avail = Number(state.funds.availableMargin || 100000);
   const used = Number(state.funds.usedMargin || 0);
   const total = Number(state.funds.totalBalance || (avail + used));
   const utilPct = total > 0 ? (used / total) * 100 : 0;
   const realized = Number(state.funds.sessionRealizedPnl ?? state.funds.realizedPnl ?? 0);
   const unrealized = totalPnl - realized;
+  const equity = Number(state.funds.equity ?? (total + unrealized));
   const totalOrders = state.orders.length;
   const filledOrders = state.orders.filter((o) => o.status === "TRADED").length;
+  const rejectedOrders = state.orders.filter((o) => o.status === "REJECTED").length;
   const openPositions = state.positions.filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0);
 
   return (
@@ -267,11 +267,18 @@ function MetricsGrid({
       </Card>
       <Card className="p-3.5">
         <div className="text-[9px] font-mono text-muted uppercase tracking-widest mb-1 font-semibold">
-          Demo Wallet
+          {isPaper ? 'Demo Wallet' : isSandbox ? 'Sandbox Net Worth' : 'Live Net Worth'}
         </div>
-        <div className="text-xl font-bold font-mono text-gold">{fmtINR(total)}</div>
+        <div className="text-xl font-bold font-mono text-gold"><LerpNumber value={equity} format={fmtINR} /></div>
         <div className="text-[10px] font-mono text-muted mt-1">
-          Initial: <span className="text-muted">₹1,00,000</span>
+          {isPaper ? (
+            <>Initial: <span className="text-muted">₹1,00,000</span></>
+          ) : (
+            <>
+              Avail: <span className="text-accent"><LerpNumber value={avail} format={fmtINR} /></span>
+              {' · '}Blocked: <span className="text-gold"><LerpNumber value={used} format={fmtINR} /></span>
+            </>
+          )}
         </div>
       </Card>
       <Card className="p-3.5">
@@ -282,7 +289,11 @@ function MetricsGrid({
           {state.strategies.filter((s) => s.status !== "STOPPED").length}
         </div>
         <div className="text-[10px] font-mono text-muted mt-1">
-          Paper Engine: <span className="text-accent">Ready</span>
+          {isPaper ? (
+            <>Paper Engine: <span className="text-accent">Ready</span></>
+          ) : (
+            <span className="text-accent">{isSandbox ? 'Sandbox' : 'Live'} execution</span>
+          )}
         </div>
       </Card>
       <Card className="p-3.5">
@@ -293,8 +304,9 @@ function MetricsGrid({
           {totalOrders}
         </div>
         <div className="text-[10px] font-mono text-muted mt-1">
-          Filled <span className="text-accent">{filledOrders}</span> · Pending{" "}
-          <span className="text-muted">{totalOrders - filledOrders}</span>
+          Filled <span className="text-accent">{filledOrders}</span> · Rejected{" "}
+          <span className="text-danger">{rejectedOrders}</span> · Pending{" "}
+          <span className="text-muted">{totalOrders - filledOrders - rejectedOrders}</span>
         </div>
       </Card>
     </div>

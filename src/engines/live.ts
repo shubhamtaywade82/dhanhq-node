@@ -42,7 +42,7 @@ export class LiveExecutionEngine {
     if (!gate.allowed) {
       eventBus.log('WARN', `Live order BLOCKED for ${correlation_id}: ${gate.reason}`, 'live_engine');
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
-      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason });
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason, mode: 'live' });
       this.portfolio?.recordOrderOutcome({ status: 'REJECTED' });
       return { status: 'REJECTED', reason: gate.reason };
     }
@@ -53,7 +53,7 @@ export class LiveExecutionEngine {
     const settled = this.tracker.waitFor(correlation_id, { timeoutMs: 30000 });
 
     await this.client.orders.place({
-      correlationId: correlation_id,
+      correlationId: correlation_id ? String(correlation_id).slice(0, 25) : undefined,
       securityId: String(security_id),
       exchangeSegment: exchange_segment,
       transactionType: transaction_type,
@@ -75,6 +75,7 @@ export class LiveExecutionEngine {
     const fillPayload = {
       intent_id,
       correlation_id,
+      mode: 'live' as const,
       is_paper: false,
       fill_price: fill.averagePrice || price,
       quantity: fill.filledQuantity || quantity,

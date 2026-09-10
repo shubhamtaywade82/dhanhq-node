@@ -68,6 +68,24 @@ describe('long option exit policy', () => {
     expect(hard.action).toBe('EMERGENCY_EXIT');
   });
 
+  it('holds a brand-new position evaluated at its own entry price instead of exiting on fee drag', () => {
+    // Found live: peakNet starts at 0, so the first tick after entry (bid
+    // still ~entry) nets slightly negative on fees alone. The giveback rules
+    // used to run against that phantom zero peak and emergency-exit
+    // immediately. Nothing has been earned yet — only the hard stop applies.
+    const state = createLongOptionState(200, 25, fees, config);
+    const decision = decideLongOption(state, { bid: 200, timestamp: 1, confirmed: true, isEndOfDay: false }, fees, config);
+    expect(decision.action).toBe('HOLD');
+    expect(netPnl(state, 200, fees)).toBeLessThan(0); // fee drag really is negative — the trigger condition held
+  });
+
+  it('still hard-stops a never-profitable position once it loses a full R', () => {
+    const state = createLongOptionState(200, 25, fees, config);
+    const decision = decideLongOption(state, { bid: 140, timestamp: 1, confirmed: true, isEndOfDay: false }, fees, config);
+    expect(decision.action).toBe('EMERGENCY_EXIT');
+    expect(decision.reason).toBe('hard_stop');
+  });
+
   it('books a partial fill, leaving the remainder marked at the live bid', () => {
     const state = createLongOptionState(100, 75, fees, config);
     const before = netPnl(state, 150, fees);

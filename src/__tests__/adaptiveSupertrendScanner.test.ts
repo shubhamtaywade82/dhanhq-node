@@ -2,8 +2,10 @@ import { DhanClient, type Candle } from '@nemesis-oss/dhanhq-sdk';
 import { MarketDataService } from '../services/marketData';
 import { RiskEngine } from '../services/riskEngine';
 import { PaperExecutionEngine } from '../engines/paper';
+import { SandboxExecutionEngine } from '../engines/sandbox';
 import { AdaptiveSupertrendScanner } from '../services/adaptiveSupertrendScanner';
 import { AdaptiveParameterAI } from '../services/adaptiveSupertrend';
+import * as db from '../db';
 import { initDatabase, resetPaperWallet, listPaperStrategies, listPaperPositions } from '../db';
 
 // Engineered so a bullish 1m Supertrend crossover fires on the very last
@@ -31,6 +33,19 @@ function buildCrossoverSeries(): Candle[] {
   return candles;
 }
 
+/** Bullish 1m/5m aligned with crossover already several bars ago — continuation path. */
+function buildAlignedBullSeries(): Candle[] {
+  const candles = buildCrossoverSeries();
+  let ts = candles[candles.length - 1]!.timestamp + 60;
+  let px = candles[candles.length - 1]!.close;
+  for (let i = 0; i < 8; i++) {
+    px += 0.5;
+    candles.push({ timestamp: ts, open: px, high: px + 0.3, low: px - 0.3, close: px, volume: 0 });
+    ts += 60;
+  }
+  return candles;
+}
+
 function toChartsResponse(candles: Candle[]) {
   return {
     timestamp: candles.map((c) => c.timestamp),
@@ -52,21 +67,31 @@ const sampleChain = [
 // NIFTY's securityId ('13', see INDEX_INSTRUMENTS) gets the engineered
 // crossover series; every other watchlist symbol gets too few candles to
 // signal at all — otherwise all 5 symbols would fire off the same series.
-function fakeClient(): DhanClient {
-  const series = toChartsResponse(buildCrossoverSeries());
+function fakeClient(series?: Candle[]): DhanClient {
+  const oneMin = toChartsResponse(series ?? buildCrossoverSeries());
   const flat = toChartsResponse(buildCrossoverSeries().slice(0, 10));
   return {
     charts: {
       intraday: jest.fn().mockImplementation(({ securityId }: { securityId: string }) =>
-        Promise.resolve(securityId === '13' ? series : flat)),
+        Promise.resolve(securityId === '13' ? oneMin : flat)),
     },
     optionChain: { fetchNormalized: jest.fn().mockResolvedValue({ strikes: sampleChain }) },
   } as unknown as DhanClient;
 }
 
 describe('AdaptiveSupertrendScanner (wired against real db.ts)', () => {
+  const priorMode = process.env.TRADING_MODE;
+
   beforeAll(async () => { await initDatabase(); });
-  beforeEach(async () => { await resetPaperWallet(); });
+  beforeEach(async () => {
+    process.env.TRADING_MODE = 'paper';
+    process.env.ADAPTIVE_SUPERTREND_ENTRY_MODE = 'crossover';
+    await resetPaperWallet();
+  });
+  afterAll(() => {
+    if (priorMode === undefined) delete process.env.TRADING_MODE;
+    else process.env.TRADING_MODE = priorMode;
+  });
 
   it('deploys a BUY leg with no risk_limits, records the strategy, and tracks a pending reward', async () => {
     const client = fakeClient();
@@ -98,6 +123,84 @@ describe('AdaptiveSupertrendScanner (wired against real db.ts)', () => {
     const openLeg: Map<string, string> = (scanner as any).openLeg;
     expect(pendingLearns.has('NIFTY')).toBe(true);
     expect(openLeg.has('NIFTY')).toBe(true);
+  });
+
+  it('routes deploys through the sandbox engine when TRADING_MODE=sandbox', async () => {
+    const priorMode = process.env.TRADING_MODE;
+    process.env.TRADING_MODE = 'sandbox';
+    try {
+      const client = fakeClient();
+      const market = new MarketDataService(client);
+      const risk = new RiskEngine(client, market);
+      const sandbox = new SandboxExecutionEngine(client, market, risk);
+      const placeOrderSpy = jest.spyOn(sandbox, 'placeOrder').mockResolvedValue({
+        status: 'TRADED', fill_price: 100, order_id: 'sbx1',
+      });
+
+      const createStrategySpy = jest.spyOn(db, 'createPaperStrategy');
+      const scanner = new AdaptiveSupertrendScanner(client, market, sandbox, risk, new AdaptiveParameterAI({ epsilon: 0 }));
+      await scanner.evaluate({ isMarketOpen: true, squareOffWindow: false });
+
+      expect(placeOrderSpy).toHaveBeenCalledTimes(1);
+      expect(createStrategySpy).not.toHaveBeenCalled();
+    } finally {
+      if (priorMode === undefined) delete process.env.TRADING_MODE;
+      else process.env.TRADING_MODE = priorMode;
+    }
+  });
+
+  it('enters via continuation when 1m/5m already aligned without a fresh crossover', async () => {
+    process.env.ADAPTIVE_SUPERTREND_ENTRY_MODE = 'continuation';
+    const client = fakeClient(buildAlignedBullSeries());
+    const market = new MarketDataService(client);
+    const risk = new RiskEngine(client, market);
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const placeOrderSpy = jest.spyOn(paper, 'placeOrder');
+
+    const scanner = new AdaptiveSupertrendScanner(client, market, paper, risk, new AdaptiveParameterAI({ epsilon: 0 }));
+    const probe = await scanner.probe();
+    const nifty = probe.symbols.find((s) => s.symbol === 'NIFTY')!;
+    expect(nifty.dir1m).toBe(1);
+    expect(nifty.dir5m).toBe(1);
+    expect(nifty.freshCrossover).toBe(false);
+
+    await scanner.evaluate({ isMarketOpen: true, squareOffWindow: false });
+    expect(placeOrderSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries continuation when deploy fails without marking the alignment episode used', async () => {
+    process.env.ADAPTIVE_SUPERTREND_ENTRY_MODE = 'continuation';
+    const client = fakeClient(buildAlignedBullSeries());
+    const market = new MarketDataService(client);
+    const risk = new RiskEngine(client, market);
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const placeOrderSpy = jest.spyOn(paper, 'placeOrder').mockResolvedValue({ status: 'REJECTED' });
+
+    const scanner = new AdaptiveSupertrendScanner(client, market, paper, risk, new AdaptiveParameterAI({ epsilon: 0 }));
+    await scanner.evaluate({ isMarketOpen: true, squareOffWindow: false });
+    expect(placeOrderSpy).toHaveBeenCalledTimes(1);
+    expect((scanner as any).continuationUsed.has('NIFTY')).toBe(false);
+
+    const probe = await scanner.probe();
+    const nifty = probe.symbols.find((s) => s.symbol === 'NIFTY')!;
+    expect(nifty.stage).toMatch(/ready_OPEN_LONG via continuation|continuation_fuzzy_hold/);
+  });
+
+  it('does not re-enter continuation until 1m breaks alignment with 5m', async () => {
+    process.env.ADAPTIVE_SUPERTREND_ENTRY_MODE = 'both';
+    const client = fakeClient(buildAlignedBullSeries());
+    const market = new MarketDataService(client);
+    const risk = new RiskEngine(client, market);
+    const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
+    const placeOrderSpy = jest.spyOn(paper, 'placeOrder');
+
+    const scanner = new AdaptiveSupertrendScanner(client, market, paper, risk, new AdaptiveParameterAI({ epsilon: 0 }));
+    await scanner.evaluate({ isMarketOpen: true, squareOffWindow: false });
+    expect(placeOrderSpy).toHaveBeenCalledTimes(1);
+
+    // Same bar window — continuation already consumed for this alignment episode.
+    await scanner.evaluate({ isMarketOpen: true, squareOffWindow: false });
+    expect(placeOrderSpy).toHaveBeenCalledTimes(1);
   });
 
   it('does nothing outside market hours', async () => {

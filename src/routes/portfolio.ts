@@ -13,21 +13,164 @@ import { aggregatePortfolioGreeks } from '../services/optionsAnalytics';
 
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { AgentOrchestrator } from '../services/agent';
+import type { InstrumentKey } from '../lib/instrumentKey';
+import { keysMatch, toInstrumentKey } from '../lib/instrumentKey';
+import type { PortfolioSource } from '../services/portfolioSource';
+import { buildMarginReconcileReport, buildPaperMarginReconcileReport } from '../services/portfolioSource';
+import { marketClock } from '../services/marketHours';
+import { journal, type JournalEntry } from '../services/journal';
 
 const log = moduleLogger('portfolio');
 
-export function portfolioRoutes(client: DhanClient, market: MarketDataService, risk?: RiskEngine, paper?: PaperExecutionEngine, agent?: AgentOrchestrator): Router {
+function parseInstrumentKey(body: { securityId?: string; exchangeSegment?: string }): InstrumentKey {
+  if (!body.securityId || !body.exchangeSegment) {
+    throw new Error('securityId and exchangeSegment are required');
+  }
+  return { securityId: String(body.securityId), exchangeSegment: String(body.exchangeSegment) };
+}
+
+async function findPositionByKey(key: InstrumentKey, portfolio?: PortfolioSource) {
+  const positions = portfolio ? await portfolio.getPositions() : await listPaperPositions();
+  return positions.find((p) => keysMatch(toInstrumentKey(p), key));
+}
+
+type OrderRow = ReturnType<typeof normalizeBrokerOrder>;
+
+function mapBrokerStatus(status: string): string {
+  if (status === 'TRANSIT') return 'PENDING';
+  return status;
+}
+
+/** Maps DhanHQ OrderResponse → the same row shape listPaperOrders()
+ * returns, so the frontend order book works in sandbox/live mode. */
+export function normalizeBrokerOrder(r: any) {
+  const timeRaw = r.createTime || r.updateTime;
+  let time = '—';
+  if (timeRaw) {
+    try {
+      const d = new Date(String(timeRaw).replace(' ', 'T') + '+05:30');
+      time = d.toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Kolkata' });
+    } catch {
+      time = String(timeRaw);
+    }
+  }
+  const qty = Number(r.quantity ?? 0);
+  const filled = Number(r.filledQty ?? 0);
+  const avg = Number(r.averageTradedPrice ?? 0);
+  return {
+    id: String(r.orderId ?? ''),
+    corr: String(r.correlationId ?? ''),
+    time,
+    instrument: String(r.tradingSymbol ?? ''),
+    type: String(r.orderType ?? 'MARKET'),
+    side: String(r.transactionType ?? ''),
+    qty,
+    price: Number(r.price ?? 0),
+    filled,
+    avg: avg > 0 ? avg : undefined,
+    charges: 0,
+    leg: String(r.legName || '—'),
+    status: mapBrokerStatus(String(r.orderStatus ?? 'UNKNOWN')),
+    jid: String(r.correlationId || r.orderId || ''),
+    latency: '—',
+    createdAt: timeRaw,
+    exchangeSegment: r.exchangeSegment,
+    reason: String(r.omsErrorDescription || ''),
+    source: 'broker',
+  };
+}
+
+function journalOrderRows(mode: 'sandbox' | 'live'): OrderRow[] {
+  const byCorr = new Map<string, { intent?: JournalEntry; result?: JournalEntry }>();
+  for (const e of journal.readTodayEntries()) {
+    const p = e.payload || {};
+    if (p.mode !== mode) continue;
+    const corr = String(p.correlation_id || '');
+    if (!corr) continue;
+    if (e.kind === 'order_intent') {
+      const row = byCorr.get(corr) || {};
+      row.intent = e;
+      byCorr.set(corr, row);
+    }
+    if (e.kind === 'order_result') {
+      const row = byCorr.get(corr) || {};
+      row.result = e;
+      byCorr.set(corr, row);
+    }
+  }
+
+  const rows: OrderRow[] = [];
+  for (const [corr, pair] of byCorr) {
+    const intent = pair.intent?.payload || {};
+    const result = pair.result?.payload || {};
+    const params = intent.params || {};
+    const ts = pair.result?.ts ?? pair.intent?.ts ?? Date.now();
+    rows.push({
+      id: String(result.order_id || pair.intent?.seq || corr),
+      corr,
+      time: new Date(ts).toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Kolkata' }),
+      instrument: String(result.symbol || params.symbol || params.security_id || '—'),
+      type: String(params.order_type || 'MARKET'),
+      side: String(params.transaction_type || result.transaction_type || ''),
+      qty: Number(params.quantity ?? result.quantity ?? 0),
+      price: Number(params.price ?? result.fill_price ?? 0),
+      filled: Number(result.quantity ?? 0),
+      avg: result.fill_price ? Number(result.fill_price) : undefined,
+      charges: 0,
+      leg: String(intent.intent_id || '—'),
+      status: mapBrokerStatus(String(result.status || 'PENDING')),
+      jid: corr,
+      latency: '—',
+      createdAt: new Date(ts).toISOString(),
+      exchangeSegment: params.exchange_segment,
+      reason: String(result.reason || ''),
+      source: 'journal',
+    });
+  }
+  return rows;
+}
+
+async function listBrokerOrders(client: DhanClient, mode: 'sandbox' | 'live' = 'live'): Promise<OrderRow[]> {
+  const raw = await client.orders.list().catch(() => []);
+  const today = marketClock().istDate;
+  const broker = (Array.isArray(raw) ? raw : [])
+    .filter((r) => !r.createTime || String(r.createTime).startsWith(today))
+    .map(normalizeBrokerOrder);
+
+  const merged = new Map<string, OrderRow>();
+  for (const row of broker) merged.set(row.corr || row.id, row);
+  for (const row of journalOrderRows(mode)) {
+    if (!merged.has(row.corr)) merged.set(row.corr, row);
+  }
+
+  return [...merged.values()].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+}
+
+export function portfolioRoutes(
+  client: DhanClient,
+  market: MarketDataService,
+  risk?: RiskEngine,
+  paper?: PaperExecutionEngine,
+  agent?: AgentOrchestrator,
+  portfolio?: PortfolioSource,
+  sandboxClient?: DhanClient,
+): Router {
   const router = Router();
-  const isPaper = () => process.env.TRADING_MODE !== 'live';
+  const isLocalPaper = () => !portfolio || portfolio.kind === 'paper';
+  const brokerApiClient = () => (
+    (process.env.TRADING_MODE || 'paper') === 'sandbox' && sandboxClient ? sandboxClient : client
+  );
 
   router.get('/summary', async (req, res) => {
     try {
-      const [positions, wallet, strategies, orders] = await Promise.all([
-        listPaperPositions(),
-        getPaperWallet(),
-        listPaperStrategies(),
-        listPaperOrders(),
-      ]);
+      const [positions, wallet, strategies, orders] = isLocalPaper()
+        ? await Promise.all([listPaperPositions(), getPaperWallet(), listPaperStrategies(), listPaperOrders()])
+        : await Promise.all([
+          portfolio!.getPositions(),
+          portfolio!.getWallet(),
+          listPaperStrategies(),
+          listBrokerOrders(brokerApiClient(), (process.env.TRADING_MODE || 'live') as 'sandbox' | 'live'),
+        ]);
       const indices = market.getIndices();
       const spotMap: Record<string, number> = {};
       for (const [sym, data] of Object.entries(indices)) {
@@ -51,10 +194,10 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/positions', async (req, res) => {
     try {
-      if (isPaper() || req.query.mode === 'paper') {
+      if (isLocalPaper() || req.query.mode === 'paper') {
         return res.json(await listPaperPositions());
       }
-      res.json(await client.positions.list());
+      res.json(await portfolio!.getPositions());
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'positions' }, 'Positions fetch failed');
       res.json([]);
@@ -63,10 +206,11 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/orders', async (req, res) => {
     try {
-      if (isPaper() || req.query.mode === 'paper') {
+      if (isLocalPaper() || req.query.mode === 'paper') {
         return res.json(await listPaperOrders());
       }
-      res.json(await client.orders.list());
+      const mode = ((process.env.TRADING_MODE || 'live') === 'sandbox' ? 'sandbox' : 'live') as 'sandbox' | 'live';
+      res.json(await listBrokerOrders(brokerApiClient(), mode));
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'orders' }, 'Orders fetch failed');
       res.json([]);
@@ -75,10 +219,10 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/funds', async (req, res) => {
     try {
-      if (isPaper() || req.query.mode === 'paper') {
+      if (isLocalPaper() || req.query.mode === 'paper') {
         return res.json(await getPaperWallet());
       }
-      res.json(await client.funds.getLimit());
+      res.json(await portfolio!.getWallet());
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'funds' }, 'Funds fetch failed');
       res.json({});
@@ -87,11 +231,12 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/trades', async (req, res) => {
     try {
-      if (isPaper() || req.query.mode === 'paper') {
+      if (isLocalPaper() || req.query.mode === 'paper') {
         const orders = await listPaperOrders();
         return res.json(orders.filter((o) => o.status === 'TRADED'));
       }
-      res.json(await client.orders.listTrades());
+      const trades = await brokerApiClient().orders.listTrades().catch(() => []);
+      res.json((Array.isArray(trades) ? trades : []).map(normalizeBrokerOrder));
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'trades' }, 'Trades fetch failed');
       res.json([]);
@@ -100,7 +245,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/greeks', async (_req, res) => {
     try {
-      const positions = await listPaperPositions();
+      const positions = isLocalPaper() ? await listPaperPositions() : await portfolio!.getPositions();
       const indices = market.getIndices();
       const spotMap: Record<string, number> = {};
       for (const [sym, data] of Object.entries(indices)) {
@@ -154,18 +299,55 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
     }
   });
 
+  router.post('/positions/close', async (req, res) => {
+    try {
+      if (isLocalPaper()) {
+        return res.status(400).json({ error: 'Broker close is not available in paper mode — use /paper/positions/close' });
+      }
+      const key = parseInstrumentKey(req.body);
+      const { ltp } = req.body;
+      const pos = await findPositionByKey(key, portfolio);
+      const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
+      const result = await portfolio!.closePosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
+      if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
+      if (result.status === 'REJECTED') return res.status(422).json({ error: result.reason || 'Close rejected' });
+      res.json(result);
+    } catch (e: any) {
+      res.status(e.message?.includes('required') ? 400 : 500).json({ error: e.message });
+    }
+  });
+
+  router.post('/positions/close-all', async (req, res) => {
+    try {
+      if (isLocalPaper()) {
+        return res.status(400).json({ error: 'Broker close-all is not available in paper mode' });
+      }
+      const results = await portfolio!.closeAll((secId) => market.getLtp(secId));
+      res.json({ results });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   router.post('/paper/positions/close', async (req, res) => {
     try {
-      const { symbol, ltp } = req.body;
-      if (!symbol) return res.status(400).json({ error: 'symbol is required' });
-      const positions = await listPaperPositions();
-      const pos = positions.find((p) => p.tradingSymbol === symbol.toUpperCase());
+      const key = parseInstrumentKey(req.body);
+      const { ltp } = req.body;
+      if (!isLocalPaper() && portfolio) {
+        const pos = await findPositionByKey(key, portfolio);
+        const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
+        const result = await portfolio.closePosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
+        if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
+        if (result.status === 'REJECTED') return res.status(422).json({ error: result.reason || 'Close rejected' });
+        return res.json(result);
+      }
+      const pos = await findPositionByKey(key);
       const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
-      const result = await closePaperPosition(symbol, liveLtp || (ltp ? Number(ltp) : undefined));
+      const result = await closePaperPosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
       if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(e.message?.includes('required') ? 400 : 500).json({ error: e.message });
     }
   });
 
@@ -183,15 +365,19 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
   router.get('/strategies', async (_req, res) => {
     try {
       const strategies = await listPaperStrategies();
-      const positions = await listPaperPositions();
-      const posMap = new Map(positions.map((p) => [p.tradingSymbol, p]));
+      const positions = isLocalPaper()
+        ? await listPaperPositions()
+        : (portfolio ? await portfolio.getPositions() : []);
+      const posBySymbol = new Map(positions.map((p) => [p.tradingSymbol, p]));
+      const posBySecId = new Map(positions.filter((p) => p.securityId).map((p) => [String(p.securityId), p]));
 
       const enriched = strategies.map((s) => {
         let totalPnl = 0;
         const legs = (s.legs || []).map((l: any) => {
-          const p = posMap.get(l.instrument);
-          const ltp = p ? p.ltp : l.ltp || l.price || 0;
-          const pnl = p ? p.pnl : 0;
+          const p = posBySymbol.get(l.instrument) || (l.securityId ? posBySecId.get(String(l.securityId)) : undefined);
+          const liveLtp = l.securityId ? market.getLtp(String(l.securityId)) : 0;
+          const ltp = p?.ltp || liveLtp || l.ltp || l.price || 0;
+          const pnl = p?.pnl ?? 0;
           totalPnl += pnl;
           return { ...l, ltp, pnl };
         });
@@ -296,7 +482,10 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
         // by the entry gate; closePaperPosition() doesn't check it.
         for (const filledLeg of legsWithPx) {
           const unwindPrice = market.getFillablePrice(String(filledLeg.securityId || '0'), { allowClosed: true }) ?? filledLeg.ltp;
-          const result: any = await closePaperPosition(filledLeg.instrument, unwindPrice).catch((e: any) => ({ status: 'REJECTED', message: e.message }));
+          const legKey = { securityId: String(filledLeg.securityId), exchangeSegment: filledLeg.exchangeSegment || 'NSE_FNO' };
+          const result: any = isLocalPaper()
+            ? await closePaperPosition(legKey, unwindPrice).catch((e: any) => ({ status: 'REJECTED', message: e.message }))
+            : await portfolio!.closePosition(legKey, unwindPrice).catch((e: any) => ({ status: 'REJECTED', message: e.message }));
           if (result.status === 'TRADED' && filledLeg.securityId) {
             market.monitor.untrack(filledLeg.exchangeSegment || 'NSE_FNO', String(filledLeg.securityId));
           } else if (result.status !== 'TRADED') {
@@ -396,11 +585,18 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
       if (strat) {
         // updatePaperStrategyStatus('STOPPED') below reverses any
         // hedge-margin credit exactly once — don't duplicate it here.
+        const positions = isLocalPaper()
+          ? await listPaperPositions()
+          : (portfolio ? await portfolio.getPositions() : []);
         for (const leg of strat.legs) {
-          const positions = await listPaperPositions();
-          const pos = positions.find((p) => p.tradingSymbol === leg.instrument);
+          const pos = positions.find((p) => p.tradingSymbol === leg.instrument || (leg.securityId && String(p.securityId) === String(leg.securityId)));
           const ltp = pos ? market.getLtp(String(pos.securityId)) || pos.ltp : undefined;
-          await closePaperPosition(leg.instrument, ltp);
+          const legKey = { securityId: String(leg.securityId || pos?.securityId), exchangeSegment: leg.exchangeSegment || pos?.exchangeSegment || 'NSE_FNO' };
+          if (isLocalPaper()) {
+            await closePaperPosition(legKey, ltp);
+          } else if (portfolio) {
+            await portfolio.closePosition(legKey, ltp);
+          }
           if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         }
         await updatePaperStrategyStatus(id, 'STOPPED');
@@ -450,7 +646,7 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/holdings', async (req, res) => {
     try {
-      const holdings = await client.positions.listHoldings();
+      const holdings = await brokerApiClient().positions.listHoldings();
       res.json(holdings);
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'holdings' }, 'Holdings fetch failed');
@@ -460,12 +656,25 @@ export function portfolioRoutes(client: DhanClient, market: MarketDataService, r
 
   router.get('/profile', async (req, res) => {
     try {
-      const profile = await client.profile.get();
+      const profile = await brokerApiClient().profile.get();
       res.json(profile);
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'profile' }, 'Profile fetch failed');
       // Honest error — no fake trader identity.
       res.status(502).json({ error: `DhanHQ profile unavailable: ${e.message}`, authenticated: false });
+    }
+  });
+
+  router.get('/margin/reconcile', async (req, res) => {
+    try {
+      if (isLocalPaper()) {
+        return res.json(await buildPaperMarginReconcileReport());
+      }
+      if (!portfolio) return res.status(503).json({ error: 'Portfolio source unavailable' });
+      res.json(await buildMarginReconcileReport(brokerApiClient(), portfolio));
+    } catch (e: any) {
+      log.warn({ requestId: req.id, err: { message: e.message }, resource: 'margin_reconcile' }, 'Margin reconcile failed');
+      res.status(500).json({ error: e.message });
     }
   });
 

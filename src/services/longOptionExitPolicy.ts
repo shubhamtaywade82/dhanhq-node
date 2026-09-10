@@ -99,7 +99,7 @@ export function updatePeak(
   if (net > state.peakNet) {
     state.peakNet = net;
     const row = ratchetRow(state.peakNet / state.risk, config);
-    if (row.floorR >= 0) state.floorNet = Math.max(state.floorNet, row.floorR * state.risk);
+    if (row && row.floorR >= 0) state.floorNet = Math.max(state.floorNet, row.floorR * state.risk);
   }
   return net;
 }
@@ -115,7 +115,14 @@ export function decideLongOption(
   if (net <= -state.risk) return { action: 'EMERGENCY_EXIT', reason: 'hard_stop' };
   if (state.floorNet > -state.risk && net <= state.floorNet) return { action: 'EXIT', reason: 'profit_floor' };
   const row = ratchetRow(state.peakNet / state.risk, config);
-  const allowance = Math.max(row.giveback * state.peakNet, state.risk * 0.02);
+  // Below the first ratchet rung there is no banked profit to give back, so
+  // the giveback rules must not fire at all — only the hard stop governs.
+  // Found live: with peakNet still 0 (a position's very first tick, before
+  // any favourable move) the old fallback row collapsed `allowance` to
+  // risk*0.02, and entry+exit fee drag alone already exceeds 1.5x that, so
+  // every freshly opened leg emergency-exited on `giveback_hard` seconds
+  // after entry for a few rupees, never getting a chance to run.
+  const allowance = row ? Math.max(row.giveback * state.peakNet, state.risk * 0.02) : Infinity;
   const giveback = state.peakNet - net;
   const hard = giveback > allowance * 1.5;
   if (hard) return { action: 'EMERGENCY_EXIT', reason: 'giveback_hard' };
@@ -136,9 +143,10 @@ export function decideLongOption(
   return { action: 'HOLD', reason: 'within_policy' };
 }
 
+/** null = peak hasn't reached the lowest configured rung yet. */
 function ratchetRow(peakR: number, config: LongOptionPolicyConfig) {
   const rows = [...config.ratchet].sort((a, b) => b.peakR - a.peakR);
-  return rows.find((row) => peakR >= row.peakR) ?? { peakR: 0, giveback: 1, floorR: -1 };
+  return rows.find((row) => peakR >= row.peakR) ?? null;
 }
 
 function confirmedBreach(state: LongOptionState, timestamp: number, config: LongOptionPolicyConfig): boolean {
