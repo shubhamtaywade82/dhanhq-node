@@ -242,6 +242,7 @@ async function deployMultiLeg(
         security_id: leg.securityId, symbol: leg.instrument, quantity: leg.qty,
         transaction_type: leg.side, order_type: 'MARKET', exchange_segment: leg.exchangeSegment || 'NSE_FNO',
         product_type: 'INTRADAY', price: leg.price,
+        underlying: strat.symbol, strike: leg.strike, option_type: leg.optionType,
       },
       risk_limits: { stop_loss: leg.stopLoss, target: leg.target, trailing_stop: leg.trailingStop },
     });

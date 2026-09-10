@@ -2,6 +2,7 @@ import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { eventBus } from '../services/eventBus';
 import { journal } from '../services/journal';
 import type { MarketDataService } from '../services/marketData';
+import { toTrailConfig } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 import { buildSandboxPlaceRequest, resolveSandboxOptionLeg, roundToTick } from '../services/sandboxInstruments';
 
@@ -33,10 +34,6 @@ export class SandboxExecutionEngine {
   async placeOrder(intent: any): Promise<any> {
     const { correlation_id, intent_id, params, risk_limits } = intent;
     const { security_id, quantity, transaction_type, order_type = 'MARKET', exchange_segment = 'NSE_FNO', price = 0 } = params;
-    // ponytail: risk_limits (SL/target/trailing) aren't tracked here — no
-    // PositionMonitor wired to this engine, since sandbox mode is for
-    // verifying real order routing/rejections, not SL/target management.
-    // Add a monitor param if sandbox trades need live stop management.
     const gate = this.risk.canTrade();
     if (!gate.allowed) {
       eventBus.log('WARN', `Sandbox order REJECTED for ${correlation_id}: ${gate.reason}`, 'sandbox_engine');
@@ -125,11 +122,28 @@ export class SandboxExecutionEngine {
       eventBus.emit('order', { kind: 'fill', ...fillPayload });
       journal.append('order_result', { status: (settled as any).orderStatus || 'TRADED', ...fillPayload });
 
+      this.risk.getPortfolio().recordOrderOutcome({ status: 'TRADED' });
+      this.risk.getPortfolio().invalidate();
+
+      if (risk_limits && (risk_limits.stop_loss || risk_limits.trailing_stop || risk_limits.target)) {
+        const filledQty = (settled as any).filledQty ?? qty;
+        this.market.monitor.track({
+          securityId: secId,
+          exchangeSegment: seg,
+          quantity: transaction_type === 'SELL' ? -filledQty : filledQty,
+          entryPrice: (settled as any).averagePrice ?? limitPrice,
+          stopLoss: risk_limits.stop_loss,
+          target: risk_limits.target,
+          trail: toTrailConfig(risk_limits.trailing_stop),
+        });
+      }
+
       this.market.addInstruments([{ securityId: secId, exchangeSegment: seg }]);
       return { status: (settled as any).orderStatus || 'TRADED', orderId, ...fillPayload };
     } catch (e: any) {
       const detail = dhanErrorDetail(e);
       const reason = detail ? `${e.message} (${detail})` : e.message;
+      this.risk.getPortfolio().recordOrderOutcome({ status: 'REJECTED' });
       eventBus.log('ERROR', `Sandbox order FAILED for ${correlation_id}: ${reason}`, 'sandbox_engine');
       journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
       return { status: 'REJECTED', reason };

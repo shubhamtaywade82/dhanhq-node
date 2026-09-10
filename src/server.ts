@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
-import dotenv from 'dotenv';
+import './lib/env';
 import { startCore } from './core';
 import { marketRoutes } from './routes/market';
 import { portfolioRoutes } from './routes/portfolio';
@@ -19,7 +19,6 @@ import { attachBusLoggerBridge } from './lib/busLoggerBridge';
 import { clientLogsRoutes } from './routes/clientLogs';
 import { researchRoutes } from './routes/research';
 
-dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3003;
 const HOST = process.env.CONTROL_PLANE_HOST || '127.0.0.1';

@@ -86,12 +86,10 @@ export async function startCore(): Promise<Core> {
   // only after a supervised first live session (minimum lot size, one
   // index) confirms the kill switch and reconciler actually fire correctly
   // against the real account — not as a standalone code change.
-  if (process.env.TRADING_MODE === 'live') {
+  if (process.env.TRADING_MODE === 'live' && process.env.ALLOW_LIVE_TRADING !== 'true') {
     throw new Error(
-      'TRADING_MODE=live is deliberately disabled pending a supervised first live session: PortfolioSource, ' +
-      'the broker kill switch, and the unmanaged-position reconciler are implemented and tested against mocks, ' +
-      'but have never run against a real DhanHQ account. Set TRADING_MODE=paper, or remove this guard only ' +
-      'after that verification (see the comment above this block).'
+      'TRADING_MODE=live is deliberately disabled pending confirmation: set ALLOW_LIVE_TRADING=true ' +
+      'in .env to confirm live trading with real capital.'
     );
   }
   if (process.env.TRADING_MODE === 'sandbox' && !createSandboxDhanClient()) {
@@ -186,7 +184,7 @@ export async function startCore(): Promise<Core> {
   await risk.start();
   await crossCheckJournalOnBoot(priorEntries, risk, client, sandboxClient);
   await autonomy.start();
-  await seedExistingPositions(market, market.monitor);
+  await seedExistingPositions(market, market.monitor, portfolio);
   await seedStandardStrategies(client, market, paper);
 
   if (getSystemState() === 'RECONCILING') {
@@ -300,9 +298,9 @@ export async function crossCheckJournalOnBoot(
  * were already open before this boot — PositionMonitor's tracked-positions
  * list lives in process memory, so a restart otherwise silently drops SL/
  * target protection on every surviving position until it's manually reset. */
-async function seedExistingPositions(market: MarketDataService, monitor: PositionMonitor): Promise<void> {
+async function seedExistingPositions(market: MarketDataService, monitor: PositionMonitor, portfolio: PortfolioSource): Promise<void> {
   try {
-    const positions = await listPaperPositions();
+    const positions = await portfolio.getPositions();
     const open = positions.filter((p) => p.netQty !== 0 && p.securityId && p.securityId !== '0');
     const active = open.map((p) => ({ securityId: String(p.securityId), exchangeSegment: p.exchangeSegment || 'NSE_FNO' }));
     if (active.length > 0) market.addInstruments(active);

@@ -6,7 +6,13 @@
   "scripts": {
     "build": "tsc",
     "start": "ts-node src/server.ts",
+    "start:paper": "TRADING_MODE=paper ts-node src/server.ts",
+    "start:sandbox": "TRADING_MODE=sandbox ts-node src/server.ts",
+    "start:live": "TRADING_MODE=live ts-node src/server.ts",
     "start:headless": "ts-node src/index.ts",
+    "start:headless:paper": "TRADING_MODE=paper ts-node src/index.ts",
+    "start:headless:sandbox": "TRADING_MODE=sandbox ts-node src/index.ts",
+    "start:headless:live": "TRADING_MODE=live ts-node src/index.ts",
     "dev": "ts-node-dev --transpile-only --respawn src/index.ts",
     "dev:server": "ts-node-dev --transpile-only --respawn src/server.ts",
     "dev:frontend": "cd frontend && npm run dev",

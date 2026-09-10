@@ -153,10 +153,10 @@ export class AutonomyEngine {
         if (clock.isMarketOpen && mark.staleCount > 0) {
           eventBus.log('WARN', `${mark.staleCount} open position(s) marked from a stale price (no fresh quote in 60s)`, 'autonomy');
         }
+        await this.longOptionManager.evaluate(clock.squareOffWindow);
         await this.reconcileMonitor();
         await this.reconcileUnmanagedLivePositions();
         await this.reconcileLedgerAgainstPostgres();
-        await this.longOptionManager.evaluate(clock.squareOffWindow);
         await this.publishPortfolioSnapshot();
         await this.enforceStrategyLimits();
 
@@ -329,6 +329,7 @@ export class AutonomyEngine {
       if (p.netQty === 0 || !p.securityId || p.securityId === '0') continue;
       const key = `${p.exchangeSegment || 'NSE_FNO'}:${p.securityId}`;
       if (trackedKeys.has(key)) continue;
+      if (this.longOptionManager.isEnabled() && this.longOptionManager.getState(p.tradingSymbol)) continue;
 
       const msg = `UNMANAGED LIVE POSITION: ${p.tradingSymbol} (${key}, netQty=${p.netQty}) is open at the broker with no stop-loss/target/trailing-stop tracked by this process. Flattening immediately and halting autonomous trading.`;
       eventBus.log('ERROR', msg, 'autonomy');

@@ -435,7 +435,8 @@ export class BrokerPortfolioSource implements PortfolioSource {
     });
 
     try {
-      const limitPrice = roundToTick(pos.ltp || 0, 5);
+      const fallbackPrice = pos.costPrice || pos.buyAvg || pos.sellAvg || 100;
+      const limitPrice = roundToTick(pos.ltp > 0 ? pos.ltp : fallbackPrice, 5);
       const placeReq = mode === 'sandbox'
         ? buildSandboxPlaceRequest({
           correlationId, securityId: pos.securityId, exchangeSegment: pos.exchangeSegment,

@@ -17,7 +17,7 @@ describe('SandboxExecutionEngine.placeOrder', () => {
     const risk = new RiskEngine(client, market);
     jest.spyOn(risk, 'canTrade').mockReturnValue({ allowed: true });
     const sandbox = new SandboxExecutionEngine(client, market, risk);
-    return { sandbox, client, risk };
+    return { sandbox, client, risk, market };
   }
 
   afterEach(() => jest.restoreAllMocks());
@@ -73,6 +73,28 @@ describe('SandboxExecutionEngine.placeOrder', () => {
     });
     expect(res.status).toBe('REJECTED');
     expect(client.orders.place).not.toHaveBeenCalled();
+  });
+
+  it('tracks filled position in PositionMonitor and invalidates portfolio when risk_limits provided', async () => {
+    const { sandbox, market, risk } = setup({ orderStatus: 'TRADED', averagePrice: 100, filledQty: 50 });
+    const trackSpy = jest.spyOn(market.monitor, 'track');
+    const invalidateSpy = jest.spyOn(risk.getPortfolio(), 'invalidate');
+    jest.spyOn(sandboxInstruments, 'resolveSandboxOptionLeg').mockResolvedValue({
+      securityId: '11111', quantity: 50, exchangeSegment: 'NSE_FNO', tickSize: 0.05,
+    });
+    const res = await sandbox.placeOrder({
+      correlation_id: 'corr-sl', intent_id: 'i-sl',
+      params: {
+        security_id: '11111', quantity: 50, transaction_type: 'BUY', price: 100,
+        underlying: 'NIFTY', strike: 23600, option_type: 'CE', expiry: '2026-09-15',
+      },
+      risk_limits: { stop_loss: 80, target: 140, trailing_stop: { distance: 10 } },
+    });
+    expect(res.status).toBe('TRADED');
+    expect(trackSpy).toHaveBeenCalledWith(expect.objectContaining({
+      securityId: '11111', quantity: 50, stopLoss: 80, target: 140,
+    }));
+    expect(invalidateSpy).toHaveBeenCalled();
   });
 });
 
