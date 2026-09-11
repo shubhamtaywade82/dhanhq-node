@@ -20,3 +20,12 @@ export function toInstrumentKey(pos: {
 export function keysMatch(a: InstrumentKey, b: InstrumentKey): boolean {
   return String(a.securityId) === String(b.securityId) && a.exchangeSegment === b.exchangeSegment;
 }
+
+export function isValidSecurityId(securityId: string | number | undefined | null): boolean {
+  const id = String(securityId ?? '').trim();
+  return id.length > 0 && id !== '0';
+}
+
+export function instrumentKeyLabel(key: InstrumentKey): string {
+  return `${key.exchangeSegment}:${key.securityId}`;
+}

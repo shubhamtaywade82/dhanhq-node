@@ -1,6 +1,6 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import type { InstrumentKey } from '../lib/instrumentKey';
-import { keysMatch, toInstrumentKey } from '../lib/instrumentKey';
+import { isValidSecurityId, keysMatch, toInstrumentKey } from '../lib/instrumentKey';
 import { eventBus } from './eventBus';
 import { journal } from './journal';
 import type { FillKind } from './fillModel';
@@ -11,6 +11,10 @@ import {
 } from '../db';
 import { marketClock } from './marketHours';
 import { buildSandboxPlaceRequest, roundToTick } from './sandboxInstruments';
+import { INDEX_INSTRUMENTS } from './marketData';
+import { parseOptionSymbol } from './optionsAnalytics';
+import { resolveNearestExpiry } from './strategyConstructor';
+import { shouldEmitKeyedLog } from '../lib/logPolicy';
 
 /**
  * Normalizes RiskEngine's and AutonomyEngine's view of "the account" across
@@ -100,6 +104,54 @@ export interface CloseResult {
 
 export type LtpResolver = (securityId: string, symbol: string) => number | null;
 
+const resolvedSecurityIdBySymbol = new Map<string, string>();
+
+function resolutionCacheKey(pos: Pick<NormalizedPosition, 'tradingSymbol' | 'exchangeSegment'>): string {
+  return `${pos.exchangeSegment}:${String(pos.tradingSymbol).toUpperCase()}`;
+}
+
+/** Resolves a missing/placeholder securityId from strike + option type, using
+ * the live option chain when broker positions only carry a synthesized symbol. */
+export async function resolvePositionSecurityId(
+  client: DhanClient,
+  pos: Pick<NormalizedPosition, 'tradingSymbol' | 'securityId' | 'exchangeSegment' | 'strike' | 'optionType'>,
+  opts: { rateLimited?: () => boolean } = {},
+): Promise<string | null> {
+  if (isValidSecurityId(pos.securityId)) return String(pos.securityId);
+  if (opts.rateLimited?.()) return null;
+
+  const cacheKey = resolutionCacheKey(pos);
+  const cached = resolvedSecurityIdBySymbol.get(cacheKey);
+  if (cached) return cached;
+
+  let underlying: string | null = null;
+  let strike = pos.strike;
+  let optType = pos.optionType;
+  const parsed = parseOptionSymbol(pos.tradingSymbol);
+  if (parsed) {
+    underlying = parsed.underlying;
+    strike ??= parsed.strike;
+    optType ??= parsed.type;
+  }
+  const index = underlying ? INDEX_INSTRUMENTS[underlying] : null;
+  if (!index || strike == null || !optType || !underlying) return null;
+
+  const expiry = await resolveNearestExpiry(client, underlying);
+  const chain = await client.optionChain?.fetchNormalized?.({
+    underlyingScrip: Number(index.securityId),
+    underlyingSeg: 'IDX_I',
+    expiry,
+  }).catch(() => null);
+  const row = chain?.strikes?.find((r: any) => Number(r.strike) === strike);
+  if (!row) return null;
+  const leg = optType === 'CALL' ? (row as any).call ?? (row as any).ce : (row as any).put ?? (row as any).pe;
+  const secId = leg?.securityId;
+  if (!secId) return null;
+  const resolved = String(secId);
+  resolvedSecurityIdBySymbol.set(cacheKey, resolved);
+  return resolved;
+}
+
 export interface OrderFlowStats {
   total: number;
   filled: number;
@@ -126,8 +178,10 @@ export interface PortfolioSource {
    * own unrealizedProfit is already server-computed from real prices, so
    * this just forces a fresh poll rather than doing any local math. */
   markToMarket(ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }>;
-  closePosition(key: InstrumentKey, priceHint?: number, kind?: FillKind, quantity?: number): Promise<CloseResult>;
+  closePosition(key: InstrumentKey, priceHint?: number, kind?: FillKind, quantity?: number, tradingSymbol?: string): Promise<CloseResult>;
   closeAll(ltpResolver: LtpResolver): Promise<CloseResult[]>;
+  /** True when this leg is open on the real broker account (not paper-ledger only). */
+  isOpenOnBroker(pos: Pick<NormalizedPosition, 'tradingSymbol' | 'securityId' | 'exchangeSegment'>): boolean;
   /** Forces the next read to bypass any internal cache. Paper mode's mem
    * reads are always current, so this is a no-op there; BrokerPortfolioSource
    * uses it to force a fresh poll right after a fill changes the account —
@@ -164,12 +218,17 @@ export class PaperPortfolioSource implements PortfolioSource {
     return markPositionsToMarket(ltpResolver);
   }
 
-  async closePosition(key: InstrumentKey, priceHint?: number, kind?: FillKind, _quantity?: number): Promise<CloseResult> {
-    return closePaperPosition(key, priceHint, undefined, kind) as unknown as Promise<CloseResult>;
+  async closePosition(key: InstrumentKey, priceHint?: number, kind?: FillKind, _quantity?: number, tradingSymbol?: string): Promise<CloseResult> {
+    const target = !isValidSecurityId(key.securityId) && tradingSymbol ? tradingSymbol : key;
+    return closePaperPosition(target, priceHint, undefined, kind) as unknown as Promise<CloseResult>;
   }
 
   async closeAll(ltpResolver: LtpResolver): Promise<CloseResult[]> {
     return closeAllPaperPositions(ltpResolver) as unknown as Promise<CloseResult[]>;
+  }
+
+  isOpenOnBroker(_pos: Pick<NormalizedPosition, 'tradingSymbol' | 'securityId' | 'exchangeSegment'>): boolean {
+    return false;
   }
 
   /** No-op: mem is always current, there is no cache to invalidate. */
@@ -263,6 +322,9 @@ export class BrokerPortfolioSource implements PortfolioSource {
   private orderRejected = 0;
   private consecutiveLosses = 0;
   private realizedProfitBySymbol = new Map<string, number>();
+  private closeBlockedUntil = new Map<string, number>();
+  private brokerRateLimitedUntil = 0;
+  private consecutiveBrokerRateLimits = 0;
 
   constructor(client: DhanClient, pollIntervalMs = 3000) {
     this.client = client;
@@ -299,15 +361,53 @@ export class BrokerPortfolioSource implements PortfolioSource {
   }
 
   private async ensureFresh(force = false): Promise<void> {
+    if (this.isBrokerRateLimited()) return;
     // Checked BEFORE the throttle: poll() sets lastAttemptAt synchronously
     // as its very first statement, so a concurrent caller arriving while a
     // poll is already in flight would otherwise see "an attempt just
     // started" and bail out early serving the STALE pre-poll cache, instead
     // of dedup-ing onto the in-flight request like it's supposed to.
     if (this.pollPromise) return this.pollPromise;
-    if (!force && Date.now() - this.lastAttemptAt < this.pollIntervalMs) return;
+    if (!force && Date.now() - this.lastAttemptAt < this.effectivePollIntervalMs()) return;
     this.pollPromise = this.poll().finally(() => { this.pollPromise = null; });
     return this.pollPromise;
+  }
+
+  private effectivePollIntervalMs(): number {
+    if (this.brokerMode() !== 'sandbox') return this.pollIntervalMs;
+    const brokerOpen = this.cachedPositions.filter((p) => p.netQty !== 0);
+    if (brokerOpen.length === 0) return Math.max(this.pollIntervalMs, 30_000);
+    return this.pollIntervalMs;
+  }
+
+  private isBrokerRateLimited(): boolean {
+    return Date.now() < this.brokerRateLimitedUntil;
+  }
+
+  private noteBrokerRateLimit(err?: { message?: string; retryAfterMs?: number }): void {
+    this.consecutiveBrokerRateLimits++;
+    const retryAfter = Number(err?.retryAfterMs ?? 0);
+    const backoffMs = retryAfter > 0
+      ? retryAfter
+      : Math.min(10_000 * 2 ** (this.consecutiveBrokerRateLimits - 1), 120_000);
+    this.brokerRateLimitedUntil = Date.now() + backoffMs;
+    if (shouldEmitKeyedLog('portfolio_source:broker_rate_limit', 30_000)) {
+      eventBus.log(
+        'WARN',
+        `Broker portfolio API rate-limited — pausing polls for ${Math.round(backoffMs / 1000)}s`,
+        'portfolio_source',
+      );
+    }
+  }
+
+  private clearBrokerRateLimit(): void {
+    this.consecutiveBrokerRateLimits = 0;
+    this.brokerRateLimitedUntil = 0;
+  }
+
+  private async maybeRefreshBrokerSnapshot(force = false): Promise<void> {
+    if (this.isBrokerRateLimited()) return;
+    await this.ensureFresh(force);
   }
 
   private async poll(): Promise<void> {
@@ -343,9 +443,15 @@ export class BrokerPortfolioSource implements PortfolioSource {
       };
       this.lastPollAt = Date.now();
       this.degraded = false;
+      this.clearBrokerRateLimit();
     } catch (e: any) {
       this.degraded = true;
-      eventBus.log('WARN', `Broker portfolio poll failed: ${e.message} — serving last-known snapshot`, 'portfolio_source');
+      const msg = String(e?.message || e);
+      if (msg.includes('429') || msg.toLowerCase().includes('rate limit')) {
+        this.noteBrokerRateLimit(e);
+      } else if (shouldEmitKeyedLog('portfolio_source:poll_failed', 60_000)) {
+        eventBus.log('WARN', `Broker portfolio poll failed: ${msg} — serving last-known snapshot`, 'portfolio_source');
+      }
     }
   }
 
@@ -425,10 +531,16 @@ export class BrokerPortfolioSource implements PortfolioSource {
 
   async markToMarket(ltpResolver: LtpResolver): Promise<{ totalUnrealized: number; staleCount: number }> {
     if (this.brokerMode() === 'sandbox') {
-      await this.ensureFresh();
       const mark = await markPositionsToMarket(ltpResolver);
+      await this.maybeRefreshBrokerSnapshot(false);
       if (this.cachedPositions.length === 0) {
         this.cachedPositions = (await listPaperPositions()) as unknown as NormalizedPosition[];
+      }
+      const paperWallet = await getPaperWallet().catch(() => null);
+      if (paperWallet && this.cachedPositions.every((p) => p.netQty === 0)) {
+        this.cachedWallet.usedMargin = Number(paperWallet.usedMargin ?? this.cachedWallet.usedMargin);
+        this.cachedWallet.availableMargin = Number(paperWallet.availableMargin ?? this.cachedWallet.availableMargin);
+        this.cachedWallet.totalBalance = Number(paperWallet.totalBalance ?? this.cachedWallet.totalBalance);
       }
       this.cachedWallet.unrealizedPnl = mark.totalUnrealized;
       this.cachedWallet.equity = Number((this.cachedWallet.totalBalance + mark.totalUnrealized).toFixed(2));
@@ -438,9 +550,51 @@ export class BrokerPortfolioSource implements PortfolioSource {
     return { totalUnrealized: this.cachedWallet.unrealizedPnl, staleCount: this.degraded ? this.cachedPositions.length : 0 };
   }
 
-  private async findOpenPosition(key: InstrumentKey): Promise<NormalizedPosition | undefined> {
+  private async findOpenPosition(key: InstrumentKey, tradingSymbol?: string): Promise<NormalizedPosition | undefined> {
     const positions = await this.getPositions();
-    return positions.find((p) => p.netQty !== 0 && keysMatch(toInstrumentKey(p), key));
+    const byKey = positions.find((p) => p.netQty !== 0 && keysMatch(toInstrumentKey(p), key));
+    if (byKey) return byKey;
+    if (!tradingSymbol) return undefined;
+    const sym = tradingSymbol.toUpperCase();
+    return positions.find((p) => p.netQty !== 0 && p.tradingSymbol.toUpperCase() === sym);
+  }
+
+  isOpenOnBroker(pos: NormalizedPosition): boolean {
+    return this.isBrokerOpen(pos);
+  }
+
+  private isBrokerOpen(pos: NormalizedPosition): boolean {
+    const sym = pos.tradingSymbol.toUpperCase();
+    return this.cachedPositions.some(
+      (p) => p.netQty !== 0 && (
+        keysMatch(toInstrumentKey(p), toInstrumentKey(pos)) || p.tradingSymbol.toUpperCase() === sym
+      ),
+    );
+  }
+
+  private isCloseRateLimited(symbol: string): boolean {
+    return Date.now() < (this.closeBlockedUntil.get(symbol.toUpperCase()) ?? 0);
+  }
+
+  private noteCloseRateLimit(symbol: string): void {
+    this.closeBlockedUntil.set(symbol.toUpperCase(), Date.now() + 60_000);
+  }
+
+  private async closeSandboxPaperOnly(pos: NormalizedPosition, reason: string): Promise<CloseResult> {
+    const fallbackPrice = pos.costPrice || pos.buyAvg || pos.sellAvg || 100;
+    const limitPrice = roundToTick(pos.ltp > 0 ? pos.ltp : fallbackPrice, 5);
+    const paperClose = await closePaperPosition(pos.tradingSymbol, limitPrice, async () => 0, 'EXIT');
+    if (paperClose.status !== 'TRADED') {
+      return { status: 'REJECTED', symbol: pos.tradingSymbol, reason: paperClose.message || 'Paper close failed' };
+    }
+    eventBus.log('TRADE', `Sandbox paper close ${pos.tradingSymbol} (${reason})`, 'portfolio_source');
+    return { status: 'TRADED', symbol: pos.tradingSymbol, fillPrice: paperClose.fillPrice };
+  }
+
+  private async resolvePositionForClose(pos: NormalizedPosition): Promise<NormalizedPosition> {
+    if (isValidSecurityId(pos.securityId)) return pos;
+    const resolved = await resolvePositionSecurityId(this.client, pos, { rateLimited: () => this.isBrokerRateLimited() });
+    return resolved ? { ...pos, securityId: resolved } : pos;
   }
 
   /** Places a REAL reversing MARKET order — no priceHint/kind: a market
@@ -452,10 +606,25 @@ export class BrokerPortfolioSource implements PortfolioSource {
   }
 
   private async reversePosition(pos: NormalizedPosition, reason: string, quantity?: number): Promise<CloseResult> {
+    const mode = this.brokerMode();
+    if (this.isCloseRateLimited(pos.tradingSymbol)) {
+      return { status: 'REJECTED', symbol: pos.tradingSymbol, reason: 'Close cooling down after rate limit — retry shortly' };
+    }
+    if (mode === 'sandbox' && !this.isBrokerOpen(pos)) {
+      return this.closeSandboxPaperOnly(pos, reason);
+    }
+
     const transactionType = pos.netQty > 0 ? 'SELL' : 'BUY';
     const qty = Math.min(quantity ?? Math.abs(pos.netQty), Math.abs(pos.netQty));
+    const fallbackPrice = pos.costPrice || pos.buyAvg || pos.sellAvg || 100;
+    const limitPrice = roundToTick(pos.ltp > 0 ? pos.ltp : fallbackPrice, 5);
+    pos = await this.resolvePositionForClose(pos);
+
+    if (!isValidSecurityId(pos.securityId)) {
+      return { status: 'REJECTED', symbol: pos.tradingSymbol, reason: 'Cannot resolve instrument securityId for close' };
+    }
+
     const correlationId = `c_${pos.securityId || pos.tradingSymbol}_${Date.now().toString(36)}`.slice(0, 25);
-    const mode = this.brokerMode();
 
     journal.append('order_intent', {
       correlation_id: correlationId, mode,
@@ -463,8 +632,6 @@ export class BrokerPortfolioSource implements PortfolioSource {
     });
 
     try {
-      const fallbackPrice = pos.costPrice || pos.buyAvg || pos.sellAvg || 100;
-      const limitPrice = roundToTick(pos.ltp > 0 ? pos.ltp : fallbackPrice, 5);
       const placeReq = mode === 'sandbox'
         ? buildSandboxPlaceRequest({
           correlationId, securityId: pos.securityId, exchangeSegment: pos.exchangeSegment,
@@ -497,22 +664,41 @@ export class BrokerPortfolioSource implements PortfolioSource {
       this.invalidate();
       return { status: 'TRADED', symbol: pos.tradingSymbol, orderId, fillPrice };
     } catch (e: any) {
-      eventBus.log('ERROR', `Broker close FAILED for ${pos.tradingSymbol}: ${e.message}`, 'portfolio_source');
-      journal.append('order_result', { correlation_id: correlationId, status: 'REJECTED', reason: e.message, mode });
-      return { status: 'REJECTED', symbol: pos.tradingSymbol, reason: e.message };
+      const errMsg = String(e.message || 'Close rejected');
+      if (errMsg.includes('429')) {
+        this.noteCloseRateLimit(pos.tradingSymbol);
+        this.noteBrokerRateLimit({ message: errMsg });
+      }
+      const friendly = errMsg.includes('429')
+        ? 'Dhan API rate limit exceeded — wait a few seconds and retry. Sandbox paper-only positions close locally without broker calls.'
+        : errMsg;
+      eventBus.log('ERROR', `Broker close FAILED for ${pos.tradingSymbol}: ${errMsg}`, 'portfolio_source');
+      journal.append('order_result', { correlation_id: correlationId, status: 'REJECTED', reason: errMsg, mode });
+      return { status: 'REJECTED', symbol: pos.tradingSymbol, reason: friendly };
     }
   }
 
-  async closePosition(key: InstrumentKey, _priceHint?: number, _kind?: FillKind, quantity?: number): Promise<CloseResult> {
-    await this.ensureFresh(true);
-    const pos = await this.findOpenPosition(key);
+  async closePosition(key: InstrumentKey, _priceHint?: number, _kind?: FillKind, quantity?: number, tradingSymbol?: string): Promise<CloseResult> {
+    await this.ensureFresh(false);
+    let pos = await this.findOpenPosition(key, tradingSymbol);
+    if (!pos) {
+      await this.ensureFresh(true);
+      pos = await this.findOpenPosition(key, tradingSymbol);
+    }
     if (!pos) return { status: 'noop', reason: 'No open position found', securityId: key.securityId };
+    if (this.isCloseRateLimited(pos.tradingSymbol)) {
+      return { status: 'REJECTED', symbol: pos.tradingSymbol, reason: 'Close cooling down after rate limit — retry shortly' };
+    }
+    if (this.brokerMode() === 'sandbox' && !this.isBrokerOpen(pos)) {
+      return this.closeSandboxPaperOnly(pos, 'manual close');
+    }
+    await this.ensureFresh(true);
     return this.reversePosition(pos, 'manual close', quantity);
   }
 
   async closeAll(_ltpResolver: LtpResolver): Promise<CloseResult[]> {
-    await this.ensureFresh(true);
-    const open = this.cachedPositions.filter((p) => p.netQty !== 0);
+    await this.ensureFresh(false);
+    const open = (await this.getPositions()).filter((p) => p.netQty !== 0);
     const results: CloseResult[] = [];
     for (const pos of open) {
       results.push(await this.reversePosition(pos, 'square-off'));

@@ -333,7 +333,7 @@ function classifyRegime(vix: number, pcr: number, expiry: string): OptionChainAn
   return 'NEUTRAL';
 }
 
-function parseOptionSymbol(symbol: string): { underlying: string; strike: number; type: 'CALL' | 'PUT' } | null {
+export function parseOptionSymbol(symbol: string): { underlying: string; strike: number; type: 'CALL' | 'PUT' } | null {
   const match = symbol.match(/^([A-Z]+).*?(\d{4,6})(CE|PE)$/i);
   if (!match) return null;
   return {

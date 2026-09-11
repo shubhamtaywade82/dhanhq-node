@@ -96,13 +96,13 @@ export const api = {
       body: JSON.stringify(order),
     }),
 
-  closePaperPosition: (key: { securityId: string; exchangeSegment: string }, ltp?: number) =>
+  closePaperPosition: (key: { securityId: string; exchangeSegment: string; tradingSymbol?: string }, ltp?: number) =>
     request<any>('/api/portfolio/paper/positions/close', {
       method: 'POST',
       body: JSON.stringify({ ...key, ltp }),
     }),
 
-  closePosition: (key: { securityId: string; exchangeSegment: string }, ltp?: number) =>
+  closePosition: (key: { securityId: string; exchangeSegment: string; tradingSymbol?: string }, ltp?: number) =>
     request<any>('/api/portfolio/positions/close', {
       method: 'POST',
       body: JSON.stringify({ ...key, ltp }),
@@ -133,7 +133,7 @@ export const api = {
     request<any>('/api/control/square-off', { method: 'POST', body: JSON.stringify({ reason: 'Manual square-off from control plane' }) }),
 
   longOptionPolicy: () =>
-    request<{ enabled: boolean; positions: Array<{ tradingSymbol: string; remainingQuantity: number; peakNet: number; floorNet: number; captureRatioSoFar: number | null; partialTaken: boolean }> }>('/api/control/long-option-policy'),
+    request<{ enabled: boolean; positions: Array<{ tradingSymbol: string; securityId?: string; exchangeSegment?: string; remainingQuantity: number; peakNet: number; floorNet: number; captureRatioSoFar: number | null; partialTaken: boolean }> }>('/api/control/long-option-policy'),
 
   setLongOptionPolicy: (enabled: boolean) =>
     request<any>('/api/control/long-option-policy', { method: 'POST', body: JSON.stringify({ enabled }) }),

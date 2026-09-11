@@ -334,6 +334,7 @@ export class AutonomyEngine {
 
     for (const p of positions) {
       if (p.netQty === 0 || !p.securityId || p.securityId === '0') continue;
+      if (process.env.TRADING_MODE === 'sandbox' && !this.portfolio.isOpenOnBroker(p)) continue;
       const key = `${p.exchangeSegment || 'NSE_FNO'}:${p.securityId}`;
       if (trackedKeys.has(key)) continue;
       if (this.longOptionManager.isEnabled() && this.longOptionManager.getState(p.tradingSymbol)) continue;
@@ -417,7 +418,6 @@ export class AutonomyEngine {
         // in broker mode, marked an irrelevant/empty paper position set
         // instead of anything the portfolio abstraction already covers.
         await this.portfolio.markToMarket((secId) => this.market.getFillablePrice(secId, { allowClosed: true, maxAgeMs: 60_000 }));
-        await this.longOptionManager.evaluate(marketClock().squareOffWindow);
         await this.publishPortfolioSnapshot();
       } catch { /* the 2s cycle below is the fallback */ }
     });

@@ -33,6 +33,7 @@ function stubPortfolio(positions: NormalizedPosition[], opts: { kind?: 'paper' |
     markToMarket: jest.fn(async () => ({ totalUnrealized: 0, staleCount: 0 })),
     closePosition: opts.closePosition ?? jest.fn(async () => ({ status: 'TRADED' as const, symbol: 'X', orderId: 'o1' })),
     closeAll: jest.fn(async () => []),
+    isOpenOnBroker: jest.fn(() => true),
     invalidate: jest.fn(),
   };
 }
@@ -111,6 +112,20 @@ describe('AutonomyEngine — unmanaged live position reconciler', () => {
       normalizedPosition({ netQty: 0, securityId: '77002' }),
       normalizedPosition({ netQty: 50, securityId: '0' }),
     ], { closePosition });
+    const { risk, autonomy } = setup(portfolio);
+    const armSpy = jest.spyOn(risk, 'armKillSwitch');
+
+    await (autonomy as any).reconcileUnmanagedLivePositions();
+
+    expect(closePosition).not.toHaveBeenCalled();
+    expect(armSpy).not.toHaveBeenCalled();
+  });
+
+  it('skips sandbox paper-only legs that are not open on the broker account', async () => {
+    process.env.TRADING_MODE = 'sandbox';
+    const closePosition = jest.fn();
+    const portfolio = stubPortfolio([normalizedPosition()], { closePosition });
+    (portfolio.isOpenOnBroker as jest.Mock).mockReturnValue(false);
     const { risk, autonomy } = setup(portfolio);
     const armSpy = jest.spyOn(risk, 'armKillSwitch');
 

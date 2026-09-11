@@ -2,6 +2,8 @@ import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { PortfolioSource } from './portfolioSource';
 import { executePaperOrder, closePaperPosition, defaultMarginResolver, calculateOrderCharges, listPaperPositions, closeParentStrategyIfFlat } from '../db';
+import { isValidSecurityId } from '../lib/instrumentKey';
+import { shouldEmitKeyedLog } from '../lib/logPolicy';
 import {
   applyExitFill, createLongOptionState, decideLongOption, DEFAULT_LONG_OPTION_POLICY_CONFIG,
   type FeeEstimator, type LongOptionState,
@@ -32,6 +34,8 @@ export class LongOptionPositionManager {
   private states = new Map<string, LongOptionState>();
   private enabled = process.env.LONG_OPTION_POLICY_ENABLED !== 'false';
   private evaluating = false;
+  private metaBySymbol = new Map<string, { securityId: string; exchangeSegment: string }>();
+  private sellBlockedUntil = new Map<string, number>();
 
   constructor(private market: MarketDataService, private portfolio?: PortfolioSource) {}
 
@@ -52,17 +56,22 @@ export class LongOptionPositionManager {
    * whole system exists to show: how much profit is locked in vs. still at
    * risk of being given back, right now, for every open long option. */
   snapshot(): Array<{
-    tradingSymbol: string; remainingQuantity: number; peakNet: number; floorNet: number;
+    tradingSymbol: string; securityId: string; exchangeSegment: string; remainingQuantity: number; peakNet: number; floorNet: number;
     captureRatioSoFar: number | null; partialTaken: boolean;
   }> {
-    return [...this.states.entries()].map(([tradingSymbol, s]) => ({
-      tradingSymbol,
-      remainingQuantity: s.remainingQuantity,
-      peakNet: Number(s.peakNet.toFixed(2)),
-      floorNet: Number(s.floorNet.toFixed(2)),
-      captureRatioSoFar: s.peakNet > 0 ? Number(((s.realizedNet - s.buyFees) / s.peakNet).toFixed(3)) : null,
-      partialTaken: s.partialTaken,
-    }));
+    return [...this.states.entries()].map(([tradingSymbol, s]) => {
+      const meta = this.metaBySymbol.get(tradingSymbol);
+      return {
+        tradingSymbol,
+        securityId: meta?.securityId ?? '0',
+        exchangeSegment: meta?.exchangeSegment ?? 'NSE_FNO',
+        remainingQuantity: s.remainingQuantity,
+        peakNet: Number(s.peakNet.toFixed(2)),
+        floorNet: Number(s.floorNet.toFixed(2)),
+        captureRatioSoFar: s.peakNet > 0 ? Number(((s.realizedNet - s.buyFees) / s.peakNet).toFixed(3)) : null,
+        partialTaken: s.partialTaken,
+      };
+    });
   }
 
   /** Both the tick-driven and the 2s-cycle caller can invoke this before the
@@ -81,6 +90,7 @@ export class LongOptionPositionManager {
       for (const pos of positions) {
         if (pos.netQty <= 0 || !String(pos.exchangeSegment || '').endsWith('_FNO')) continue;
         seen.add(pos.tradingSymbol);
+        this.metaBySymbol.set(pos.tradingSymbol, { securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment });
         await this.evaluateOne(pos, isEndOfDay);
       }
 
@@ -88,7 +98,10 @@ export class LongOptionPositionManager {
       // strategy loss-limit) — drop its policy state so a later re-entry
       // under the same symbol starts clean instead of inheriting a stale peak.
       for (const symbol of [...this.states.keys()]) {
-        if (!seen.has(symbol)) this.states.delete(symbol);
+        if (!seen.has(symbol)) {
+          this.states.delete(symbol);
+          this.metaBySymbol.delete(symbol);
+        }
       }
     } finally {
       this.evaluating = false;
@@ -131,11 +144,39 @@ export class LongOptionPositionManager {
   }
 
   private async sell(pos: any, qty: number, bid: number, state: LongOptionState, reason: string, isFirstPartial: boolean): Promise<void> {
+    const sym = String(pos.tradingSymbol).toUpperCase();
+    if ((this.sellBlockedUntil.get(sym) ?? 0) > Date.now()) return;
+
     try {
       let result: any;
+      const sandbox = (process.env.TRADING_MODE || 'paper') === 'sandbox';
       if (this.portfolio?.kind === 'broker') {
-        result = await this.portfolio.closePosition({ securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment }, bid, undefined, qty);
-        if (result.status !== 'TRADED') return;
+        if (sandbox && (!isValidSecurityId(String(pos.securityId)) || !this.portfolio.isOpenOnBroker(pos))) {
+          result = qty >= pos.netQty
+            ? await closePaperPosition(pos.tradingSymbol, bid)
+            : await executePaperOrder({
+                symbol: pos.tradingSymbol, securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment,
+                transactionType: 'SELL', orderType: 'MARKET', productType: pos.productType, quantity: qty, price: bid,
+                correlationId: `lop_${pos.securityId}_${Date.now().toString(36)}`.slice(0, 25),
+              }, defaultMarginResolver);
+        } else {
+          result = await this.portfolio.closePosition(
+            { securityId: String(pos.securityId), exchangeSegment: pos.exchangeSegment },
+            bid,
+            undefined,
+            qty,
+            pos.tradingSymbol,
+          );
+        }
+        if (result.status !== 'TRADED') {
+          if (String(result.reason || '').includes('429') || String(result.reason || '').includes('rate limit')) {
+            this.sellBlockedUntil.set(sym, Date.now() + 60_000);
+            if (shouldEmitKeyedLog(`long_option:sell_rate_limit:${sym}`, 60_000)) {
+              eventBus.log('WARN', `Long-option policy sell paused for ${sym} — Dhan rate limit (60s backoff)`, 'long_option_policy');
+            }
+          }
+          return;
+        }
         result = { status: 'TRADED', fillPrice: result.fillPrice ?? bid };
       } else {
         result = qty >= pos.netQty
@@ -157,6 +198,7 @@ export class LongOptionPositionManager {
       if (state.remainingQuantity <= 0) {
         this.market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         this.states.delete(pos.tradingSymbol);
+        this.metaBySymbol.delete(pos.tradingSymbol);
         // Found live: a single-leg strategy whose only exit is this policy
         // (the adaptive-supertrend scanner deliberately sets no risk_limits
         // and relies entirely on this ratchet) stayed stuck at status

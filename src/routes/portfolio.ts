@@ -13,8 +13,7 @@ import { aggregatePortfolioGreeks } from '../services/optionsAnalytics';
 
 import type { PaperExecutionEngine } from '../engines/paper';
 import type { AgentOrchestrator } from '../services/agent';
-import type { InstrumentKey } from '../lib/instrumentKey';
-import { keysMatch, toInstrumentKey } from '../lib/instrumentKey';
+import { isValidSecurityId, keysMatch, toInstrumentKey, type InstrumentKey } from '../lib/instrumentKey';
 import type { PortfolioSource } from '../services/portfolioSource';
 import { buildMarginReconcileReport, buildPaperMarginReconcileReport } from '../services/portfolioSource';
 import { marketClock } from '../services/marketHours';
@@ -29,9 +28,13 @@ function parseInstrumentKey(body: { securityId?: string; exchangeSegment?: strin
   return { securityId: String(body.securityId), exchangeSegment: String(body.exchangeSegment) };
 }
 
-async function findPositionByKey(key: InstrumentKey, portfolio?: PortfolioSource) {
+async function findPositionByKey(key: InstrumentKey, portfolio?: PortfolioSource, tradingSymbol?: string) {
   const positions = portfolio ? await portfolio.getPositions() : await listPaperPositions();
-  return positions.find((p) => keysMatch(toInstrumentKey(p), key));
+  const byKey = positions.find((p) => Number(p.netQty ?? 0) !== 0 && keysMatch(toInstrumentKey(p), key));
+  if (byKey) return byKey;
+  if (!tradingSymbol) return undefined;
+  const sym = String(tradingSymbol).toUpperCase();
+  return positions.find((p) => Number(p.netQty ?? 0) !== 0 && String(p.tradingSymbol ?? '').toUpperCase() === sym);
 }
 
 type OrderRow = ReturnType<typeof normalizeBrokerOrder>;
@@ -305,12 +308,14 @@ export function portfolioRoutes(
         return res.status(400).json({ error: 'Broker close is not available in paper mode — use /paper/positions/close' });
       }
       const key = parseInstrumentKey(req.body);
-      const { ltp } = req.body;
-      const pos = await findPositionByKey(key, portfolio);
+      const { ltp, tradingSymbol } = req.body;
+      const pos = await findPositionByKey(key, portfolio, tradingSymbol);
+      const effectiveKey = pos ? toInstrumentKey(pos) : key;
       const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
-      const result = await portfolio!.closePosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
+      const result = await portfolio!.closePosition(effectiveKey, liveLtp || (ltp ? Number(ltp) : undefined), undefined, undefined, pos?.tradingSymbol);
       if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
       if (result.status === 'REJECTED') return res.status(422).json({ error: result.reason || 'Close rejected' });
+      if (result.status === 'noop') return res.status(404).json({ error: result.reason || 'No open position found' });
       res.json(result);
     } catch (e: any) {
       res.status(e.message?.includes('required') ? 400 : 500).json({ error: e.message });
@@ -332,19 +337,22 @@ export function portfolioRoutes(
   router.post('/paper/positions/close', async (req, res) => {
     try {
       const key = parseInstrumentKey(req.body);
-      const { ltp } = req.body;
+      const { ltp, tradingSymbol } = req.body;
+      const pos = await findPositionByKey(key, !isLocalPaper() && portfolio ? portfolio : undefined, tradingSymbol);
+      const effectiveKey = pos ? toInstrumentKey(pos) : key;
       if (!isLocalPaper() && portfolio) {
-        const pos = await findPositionByKey(key, portfolio);
         const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
-        const result = await portfolio.closePosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
+        const result = await portfolio.closePosition(effectiveKey, liveLtp || (ltp ? Number(ltp) : undefined), undefined, undefined, pos?.tradingSymbol);
         if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
         if (result.status === 'REJECTED') return res.status(422).json({ error: result.reason || 'Close rejected' });
+        if (result.status === 'noop') return res.status(404).json({ error: result.reason || 'No open position found' });
         return res.json(result);
       }
-      const pos = await findPositionByKey(key);
       const liveLtp = pos ? market.getLtp(String(pos.securityId)) : null;
-      const result = await closePaperPosition(key, liveLtp || (ltp ? Number(ltp) : undefined));
+      const closeTarget = pos && !isValidSecurityId(effectiveKey.securityId) ? pos.tradingSymbol : effectiveKey;
+      const result = await closePaperPosition(closeTarget, liveLtp || (ltp ? Number(ltp) : undefined));
       if (pos) market.monitor.untrack(pos.exchangeSegment, String(pos.securityId));
+      if (result.status === 'noop') return res.status(404).json({ error: result.message || 'No open position found' });
       res.json(result);
     } catch (e: any) {
       res.status(e.message?.includes('required') ? 400 : 500).json({ error: e.message });

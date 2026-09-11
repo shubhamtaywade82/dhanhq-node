@@ -87,6 +87,16 @@ describe('BrokerPortfolioSource', () => {
     expect(client.funds.getLimit).toHaveBeenCalledTimes(1);
   });
 
+  it('pauses broker polls after HTTP 429 instead of hammering the API', async () => {
+    const client = stubClient({ positions: [rawPosition()] });
+    client.positions.list.mockRejectedValue(new Error('Dhan API rate limit exceeded (status 429)'));
+    client.funds.getLimit.mockRejectedValue(new Error('Dhan API rate limit exceeded (status 429)'));
+    const src = new BrokerPortfolioSource(client, 10);
+    await src.getPositions();
+    await src.getPositions();
+    expect(client.positions.list).toHaveBeenCalledTimes(1);
+  });
+
   it('markToMarket respects the poll TTL instead of forcing a fresh poll on every call', async () => {
     // Regression test for the force-poll bug: markToMarket used to call
     // ensureFresh(true) unconditionally, which would hit the broker API on
@@ -244,6 +254,54 @@ describe('BrokerPortfolioSource', () => {
     const src = new BrokerPortfolioSource(client, 60_000);
     const result = await src.closePosition({ securityId: '999', exchangeSegment: 'NSE_FNO' });
     expect(result.status).toBe('noop');
+  });
+
+  it('closePosition matches by tradingSymbol when the caller sends a placeholder securityId', async () => {
+    const place = jest.fn(async () => ({ correlationId: 'c', data: { orderId: 'ord_sym' } }));
+    const client = stubClient({
+      positions: [rawPosition({ tradingSymbol: 'BANKNIFTY56800CE' })],
+      place,
+    });
+    const src = new BrokerPortfolioSource(client, 60_000);
+    const result = await src.closePosition(
+      { securityId: '0', exchangeSegment: 'NSE_FNO' },
+      undefined,
+      undefined,
+      undefined,
+      'BANKNIFTY56800CE',
+    );
+    expect(result.status).toBe('TRADED');
+    expect(place).toHaveBeenCalledWith(expect.objectContaining({ securityId: LEG_KEY.securityId, transactionType: 'SELL' }));
+  });
+
+  it('sandbox paper-only close avoids broker and option-chain API calls', async () => {
+    process.env.TRADING_MODE = 'sandbox';
+    const { initDatabase, executePaperOrder, pool } = await import('../db');
+    await initDatabase();
+    await executePaperOrder({
+      symbol: 'BANKNIFTY56800CE',
+      securityId: '0',
+      exchangeSegment: 'NSE_FNO',
+      quantity: 30,
+      transactionType: 'BUY',
+      price: 713.25,
+    });
+    const place = jest.fn(async () => ({ correlationId: 'c', data: { orderId: 'ord_paper' } }));
+    const fetchNormalized = jest.fn(async () => ({ strikes: [] }));
+    const client = stubClient({ positions: [], place });
+    client.optionChain = { fetchNormalized, expiryList: jest.fn(async () => []) };
+    const src = new BrokerPortfolioSource(client, 60_000);
+    const result = await src.closePosition(
+      { securityId: '0', exchangeSegment: 'NSE_FNO' },
+      485.2,
+      undefined,
+      undefined,
+      'BANKNIFTY56800CE',
+    );
+    expect(result.status).toBe('TRADED');
+    expect(place).not.toHaveBeenCalled();
+    expect(fetchNormalized).not.toHaveBeenCalled();
+    await pool?.end().catch(() => {});
   });
 
   it('closeAll reverses every open position and skips flat ones', async () => {

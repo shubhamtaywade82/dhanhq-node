@@ -8,6 +8,10 @@ import { RotateCcw, Power } from 'lucide-react';
 import { api } from '../services/api';
 import type { InstrumentKey } from '../store/types';
 
+function instrumentKeyLabel(key: InstrumentKey): string {
+  return `${key.exchangeSegment}:${key.securityId}`;
+}
+
 type PolicyState = { peakNet: number; floorNet: number; captureRatioSoFar: number | null; partialTaken: boolean };
 type TradingMode = 'paper' | 'sandbox' | 'live';
 
@@ -45,7 +49,11 @@ export function Positions() {
         const res = await api.longOptionPolicy();
         if (!mounted) return;
         setPolicyEnabled(res.enabled);
-        setPolicyBySymbol(Object.fromEntries(res.positions.map((p) => [p.tradingSymbol, p])));
+        setPolicyBySymbol(Object.fromEntries(res.positions.flatMap((p) => {
+          const entries: [string, PolicyState][] = [[p.tradingSymbol, p]];
+          if (p.securityId) entries.push([`${p.exchangeSegment || 'NSE_FNO'}:${p.securityId}`, p]);
+          return entries;
+        })));
       } catch { /* control plane unreachable — table just shows no lock data */ }
     };
     load();
@@ -87,14 +95,15 @@ export function Positions() {
     };
   });
 
-  const closeOne = async (key: InstrumentKey, ltp: number) => {
-    if (isPaper) return api.closePaperPosition(key, ltp);
-    return api.closePosition(key, ltp);
+  const closeOne = async (key: InstrumentKey, label: string, ltp: number) => {
+    const payload = { ...key, tradingSymbol: label };
+    if (isPaper) return api.closePaperPosition(payload, ltp);
+    return api.closePosition(payload, ltp);
   };
 
   const handleClose = async (key: InstrumentKey, label: string, ltp: number) => {
     try {
-      await closeOne(key, ltp);
+      await closeOne(key, label, ltp);
       showToast(`Position ${label} closed successfully`, 'success');
       addSystemLog('INFO', `Position closed for ${label} (${key.exchangeSegment}/${key.securityId}) @ ${ltp}`, isPaper ? 'paper_execution' : 'portfolio_source');
       await refreshPortfolio();
@@ -121,7 +130,7 @@ export function Positions() {
             closeModal();
             try {
               if (isPaper) {
-                for (const p of realPositions) await api.closePaperPosition(p.key, p.ltp);
+                for (const p of realPositions) await closeOne(p.key, p.instrument, p.ltp);
               } else {
                 await api.closeAllPositions();
               }
@@ -190,7 +199,7 @@ export function Positions() {
                   </td>
                   <td className="px-2.5 py-[7px] border-b border-border/60 font-mono text-[10px]">
                     {(() => {
-                      const pol = policyBySymbol[p.instrument];
+                      const pol = policyBySymbol[p.instrument] || policyBySymbol[instrumentKeyLabel(p.key)];
                       if (!pol) return <span className="text-muted font-normal">—</span>;
                       return (
                         <div className="flex flex-col leading-tight">

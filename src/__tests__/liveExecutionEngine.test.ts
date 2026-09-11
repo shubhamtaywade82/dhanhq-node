@@ -25,6 +25,7 @@ function stubPortfolio(): PortfolioSource {
     markToMarket: jest.fn(async () => ({ totalUnrealized: 0, staleCount: 0 })),
     closePosition: jest.fn(async () => ({ status: 'noop' as const })),
     closeAll: jest.fn(async () => []),
+    isOpenOnBroker: jest.fn(() => true),
     invalidate: jest.fn(),
   };
 }
