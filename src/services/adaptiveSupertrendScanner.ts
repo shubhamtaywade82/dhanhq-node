@@ -80,6 +80,7 @@ export class AdaptiveSupertrendScanner {
   private paramAI: AdaptiveParameterAI;
   private signalAI = new FuzzySignalAI();
   private lastScanAt = 0;
+  private bootedAt = Date.now();
   private pendingLearns = new Map<string, PendingLearn>();
   private openLeg = new Map<string, string>(); // symbol -> securityId
   private lastProcessedCandleTs = new Map<string, number>();
@@ -103,7 +104,9 @@ export class AdaptiveSupertrendScanner {
 
   async evaluate(clock: { isMarketOpen: boolean; squareOffWindow: boolean }): Promise<void> {
     if (!clock.isMarketOpen || clock.squareOffWindow) return;
-    if (Date.now() - this.lastScanAt < SCAN_INTERVAL_MS) return;
+    const bootGrace = Number(process.env.ADAPTIVE_SCANNER_BOOT_GRACE_MS ?? 60_000);
+    if (this.lastScanAt === 0 && Date.now() - this.bootedAt < bootGrace) return;
+    if (this.lastScanAt > 0 && Date.now() - this.lastScanAt < SCAN_INTERVAL_MS) return;
     const gate = this.risk.canTrade();
     if (!gate.allowed) return;
 
@@ -325,6 +328,7 @@ export class AdaptiveSupertrendScanner {
   }
 
   private async deploy(symbol: string, signal: AdaptiveSignal, state: string, actionIndex: number, spot: number): Promise<boolean> {
+    if (isDhanRateLimited()) return false;
     const expiry = nearestIndexExpiry(symbol);
     const chain = await this.client.optionChain
       .fetchNormalized({ underlyingScrip: Number(INDEX_INSTRUMENTS[symbol]!.securityId), underlyingSeg: 'IDX_I', expiry })

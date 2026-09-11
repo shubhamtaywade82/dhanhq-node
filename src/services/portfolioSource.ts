@@ -473,7 +473,31 @@ export class BrokerPortfolioSource implements PortfolioSource {
 
   async getWallet(): Promise<WalletSnapshot> {
     await this.ensureFresh();
-    return this.cachedWallet;
+    if (this.brokerMode() !== 'sandbox') return this.cachedWallet;
+    return this.withSandboxPaperWallet(this.cachedWallet);
+  }
+
+  /** Sandbox fills land at Dhan *and* on the local paper ledger. When the
+   * local book still has open legs the broker API has never seen (429
+   * rejects, restarts, paper-only closes), margin and net-worth must follow
+   * the paper wallet — not the broker's empty ₹50k sandbox allocation. */
+  private async withSandboxPaperWallet(brokerWallet: WalletSnapshot): Promise<WalletSnapshot> {
+    const paperOpen = (await listPaperPositions()).filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0);
+    if (paperOpen.length === 0) return brokerWallet;
+    const paperWallet = await getPaperWallet().catch(() => null);
+    if (!paperWallet) return brokerWallet;
+    return {
+      ...brokerWallet,
+      availableMargin: Number(paperWallet.availableMargin),
+      usedMargin: Number(paperWallet.usedMargin),
+      totalBalance: Number(paperWallet.totalBalance),
+      realizedPnl: Number(paperWallet.realizedPnl ?? paperWallet.sessionRealizedPnl ?? 0),
+      sessionRealizedPnl: Number(paperWallet.sessionRealizedPnl ?? paperWallet.realizedPnl ?? 0),
+      netRealizedPnl: Number(paperWallet.netRealizedPnl ?? paperWallet.sessionRealizedPnl ?? 0),
+      totalCharges: Number(paperWallet.totalCharges ?? 0),
+      unrealizedPnl: Number(paperWallet.unrealizedPnl ?? brokerWallet.unrealizedPnl),
+      equity: Number(paperWallet.equity ?? brokerWallet.equity),
+    };
   }
 
   /** Compares this poll's realizedProfit per symbol against the last poll's
@@ -521,14 +545,15 @@ export class BrokerPortfolioSource implements PortfolioSource {
     if (this.brokerMode() === 'sandbox') {
       const mark = await markPositionsToMarket(ltpResolver);
       await this.maybeRefreshBrokerSnapshot(false);
-      if (this.cachedPositions.length === 0) {
-        this.cachedPositions = (await listPaperPositions()) as unknown as NormalizedPosition[];
-      }
-      const paperWallet = await getPaperWallet().catch(() => null);
-      if (paperWallet && this.cachedPositions.every((p) => p.netQty === 0)) {
-        this.cachedWallet.usedMargin = Number(paperWallet.usedMargin ?? this.cachedWallet.usedMargin);
-        this.cachedWallet.availableMargin = Number(paperWallet.availableMargin ?? this.cachedWallet.availableMargin);
-        this.cachedWallet.totalBalance = Number(paperWallet.totalBalance ?? this.cachedWallet.totalBalance);
+      const brokerOpen = this.cachedPositions.filter((p) => p.netQty !== 0);
+      const paperOpen = (await listPaperPositions()).filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0);
+      if (brokerOpen.length === 0 && paperOpen.length > 0) {
+        const paperWallet = await getPaperWallet().catch(() => null);
+        if (paperWallet) {
+          this.cachedWallet.usedMargin = Number(paperWallet.usedMargin);
+          this.cachedWallet.availableMargin = Number(paperWallet.availableMargin);
+          this.cachedWallet.totalBalance = Number(paperWallet.totalBalance);
+        }
       }
       this.cachedWallet.unrealizedPnl = mark.totalUnrealized;
       this.cachedWallet.equity = Number((this.cachedWallet.totalBalance + mark.totalUnrealized).toFixed(2));

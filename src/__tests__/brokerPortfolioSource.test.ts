@@ -1,4 +1,6 @@
 import { BrokerPortfolioSource, buildMarginReconcileReport, buildPaperMarginReconcileReport } from '../services/portfolioSource';
+import { resetDhanRateLimitForTests } from '../lib/dhanRateLimit';
+import * as db from '../db';
 
 // A lightweight object shaped like the three DhanClient namespaces
 // BrokerPortfolioSource actually touches — same pattern as
@@ -39,6 +41,7 @@ describe('BrokerPortfolioSource', () => {
   const priorMode = process.env.TRADING_MODE;
 
   beforeEach(() => { process.env.TRADING_MODE = 'live'; });
+  afterEach(() => resetDhanRateLimitForTests());
   afterAll(() => {
     if (priorMode === undefined) delete process.env.TRADING_MODE;
     else process.env.TRADING_MODE = priorMode;

@@ -3,6 +3,7 @@ import { SandboxExecutionEngine } from '../engines/sandbox';
 import { RiskEngine } from '../services/riskEngine';
 import { MarketDataService } from '../services/marketData';
 import * as sandboxInstruments from '../services/sandboxInstruments';
+import { noteDhanRateLimit, resetDhanRateLimitForTests } from '../lib/dhanRateLimit';
 
 function stubClient(): DhanClient {
   return new DhanClient({ clientId: 'test', token: 'test', baseURL: 'https://sandbox.dhan.co/v2' });
@@ -20,7 +21,10 @@ describe('SandboxExecutionEngine.placeOrder', () => {
     return { sandbox, client, risk, market };
   }
 
-  afterEach(() => jest.restoreAllMocks());
+  afterEach(() => {
+    jest.restoreAllMocks();
+    resetDhanRateLimitForTests();
+  });
 
   it('places the order against the sandbox client and reports the settled status', async () => {
     const { sandbox, client } = setup({ orderStatus: 'TRADED', averagePrice: 100, filledQty: 50 });
@@ -75,6 +79,45 @@ describe('SandboxExecutionEngine.placeOrder', () => {
     expect(client.orders.place).not.toHaveBeenCalled();
   });
 
+  it('does not record order rejection stats when Dhan returns 429', async () => {
+    const { sandbox, client, risk } = setup({ orderStatus: 'TRADED' });
+    jest.spyOn(sandboxInstruments, 'resolveSandboxOptionLeg').mockResolvedValue({
+      securityId: '11111', quantity: 50, exchangeSegment: 'NSE_FNO', tickSize: 0.05,
+    });
+    jest.spyOn(client.orders, 'place').mockRejectedValue(new Error('Dhan API rate limit exceeded (status 429) (DH-904 | Rate_Limit)'));
+    const recordSpy = jest.spyOn(risk.getPortfolio(), 'recordOrderOutcome');
+
+    const res = await sandbox.placeOrder({
+      correlation_id: 'corr429', intent_id: 'i429',
+      params: {
+        security_id: '11111', quantity: 50, transaction_type: 'BUY', price: 99.5,
+        exchange_segment: 'NSE_FNO',
+      },
+    });
+
+    expect(res.status).toBe('REJECTED');
+    expect(recordSpy).not.toHaveBeenCalled();
+  });
+
+  it('skips broker calls while global Dhan rate-limit gate is active', async () => {
+    noteDhanRateLimit({ retryAfterMs: 60_000 });
+    const { sandbox, client } = setup({ orderStatus: 'TRADED' });
+    const resolveSpy = jest.spyOn(sandboxInstruments, 'resolveSandboxOptionLeg');
+
+    const res = await sandbox.placeOrder({
+      correlation_id: 'corr_gate', intent_id: 'i_gate',
+      params: {
+        security_id: '11111', quantity: 50, transaction_type: 'BUY', price: 99.5,
+        exchange_segment: 'NSE_FNO',
+      },
+    });
+
+    expect(res.status).toBe('REJECTED');
+    expect(String(res.reason)).toContain('rate limit');
+    expect(resolveSpy).not.toHaveBeenCalled();
+    expect(client.orders.place).not.toHaveBeenCalled();
+  });
+
   it('tracks filled position in PositionMonitor and invalidates portfolio when risk_limits provided', async () => {
     const { sandbox, market, risk } = setup({ orderStatus: 'TRADED', averagePrice: 100, filledQty: 50 });
     const trackSpy = jest.spyOn(market.monitor, 'track');
@@ -109,7 +152,10 @@ describe('SandboxExecutionEngine.closeLeg', () => {
     return { sandbox, client, risk };
   }
 
-  afterEach(() => jest.restoreAllMocks());
+  afterEach(() => {
+    jest.restoreAllMocks();
+    resetDhanRateLimitForTests();
+  });
 
   it('places a reversing order and bypasses risk.canTrade() — unwinding a partial fill must work even when entries are blocked', async () => {
     const { sandbox, client, risk } = setup({ orderStatus: 'TRADED' });

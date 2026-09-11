@@ -83,6 +83,11 @@ export class SandboxExecutionEngine {
       exchangeSegment: exchange_segment,
     });
     if (!leg) {
+      if (isDhanRateLimited()) {
+        const reason = `Dhan API rate limit — retry in ${dhanRateLimitRemainingSec()}s`;
+        journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox', rate_limited: true });
+        return { status: 'REJECTED', reason };
+      }
       const reason = `sandbox: ${exchange_segment}/${security_id} not found in scrip master`;
       journal.append('order_intent', { correlation_id, intent_id, params, risk_limits, mode: 'sandbox' });
       journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });

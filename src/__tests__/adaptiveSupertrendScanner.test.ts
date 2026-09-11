@@ -7,6 +7,7 @@ import { AdaptiveSupertrendScanner } from '../services/adaptiveSupertrendScanner
 import { AdaptiveParameterAI } from '../services/adaptiveSupertrend';
 import * as db from '../db';
 import { initDatabase, resetPaperWallet, listPaperStrategies, listPaperPositions } from '../db';
+import { resetDhanRateLimitForTests } from '../lib/dhanRateLimit';
 
 // Engineered so a bullish 1m Supertrend crossover fires on the very last
 // bar, the 5m Supertrend (derived from the same buffer) agrees, and the
@@ -86,8 +87,10 @@ describe('AdaptiveSupertrendScanner (wired against real db.ts)', () => {
   beforeEach(async () => {
     process.env.TRADING_MODE = 'paper';
     process.env.ADAPTIVE_SUPERTREND_ENTRY_MODE = 'crossover';
+    process.env.ADAPTIVE_SCANNER_BOOT_GRACE_MS = '0';
     await resetPaperWallet();
   });
+  afterEach(() => resetDhanRateLimitForTests());
   afterAll(() => {
     if (priorMode === undefined) delete process.env.TRADING_MODE;
     else process.env.TRADING_MODE = priorMode;

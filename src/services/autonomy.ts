@@ -185,6 +185,8 @@ export class AutonomyEngine {
 
   private async evaluateAutonomousScan(clock: ReturnType<typeof marketClock>): Promise<void> {
     if (!this.scanEnabled || !this.agent || !clock.isMarketOpen || clock.squareOffWindow) return;
+    const bootGrace = Number(process.env.AUTONOMOUS_SCAN_BOOT_GRACE_MS ?? 45_000);
+    if (Date.now() - this.bootedAt < bootGrace) return;
     const cooldown = Number(process.env.AUTONOMOUS_SCAN_INTERVAL_MS) || 180_000;
     if (Date.now() - this.lastScanAt < cooldown) return;
 

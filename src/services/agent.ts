@@ -1,6 +1,7 @@
 import { AgentToolRegistry, Policy, type DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { OllamaClient, type Logger as OllamaLogger } from '@nemesis-oss/ollama-sdk';
 import { moduleLogger } from '../lib/logger';
+import { dhanRateLimitRemainingSec, isDhanRateLimited } from '../lib/dhanRateLimit';
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
@@ -941,11 +942,14 @@ export class AgentOrchestrator {
 
   private async executeStrategy(runId: string, objective: string, strat: ConstructedStrategy | null, allowed: boolean): Promise<any> {
     const wantsTrade = /buy|sell|straddle|strangle|condor|spread|deploy|execute|trade|survey|scan|auto/i.test(objective);
-    const gate = this.risk.canTrade();
-    if (!wantsTrade || !strat || !allowed || !gate.allowed) {
-      const reason = !gate.allowed ? gate.reason : !allowed ? 'risk blocked' : !strat ? 'no strategy' : 'no trade intent';
-      this.step(runId, 'execution', 'OBSERVE', `Skipped: ${reason}`);
+    if (!wantsTrade || !strat || !allowed) {
+      this.step(runId, 'execution', 'OBSERVE', `Skipped: ${!allowed ? 'risk blocked' : !strat ? 'no strategy' : 'no trade intent'}`);
       return { status: 'SKIPPED' };
+    }
+    if (isDhanRateLimited()) {
+      const reason = `Dhan API rate limit — retry in ${dhanRateLimitRemainingSec()}s`;
+      this.step(runId, 'execution', 'OBSERVE', `Skipped: ${reason}`);
+      return { status: 'SKIPPED', reason };
     }
 
     this.market.addInstruments(strat.legs.map((l) => ({ securityId: l.securityId, exchangeSegment: l.exchangeSegment || 'NSE_FNO' })));
