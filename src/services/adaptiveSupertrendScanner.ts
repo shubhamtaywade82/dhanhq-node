@@ -11,6 +11,7 @@ export type ScannerExecutionEngine = { placeOrder(intent: any): Promise<any> };
 import { MAX_CONCURRENT_POSITIONS } from './autonomy';
 import { listPaperPositions, createPaperStrategy } from '../db';
 import type { PortfolioSource } from './portfolioSource';
+import { isDhanRateLimited } from '../lib/dhanRateLimit';
 import { buildAdaptiveSupertrendStrategy } from './strategyConstructor';
 import { CandleStore } from './adaptiveSupertrendCandles';
 import { extractMarketFeatures, formatRegimeKey, AdaptiveParameterAI, FuzzySignalAI, type AdaptiveSignal } from './adaptiveSupertrend';

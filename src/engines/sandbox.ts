@@ -6,6 +6,9 @@ import { toTrailConfig } from '../services/marketData';
 import type { RiskEngine } from '../services/riskEngine';
 import { buildSandboxPlaceRequest, resolveSandboxOptionLeg, roundToTick } from '../services/sandboxInstruments';
 import { executePaperOrder, closePaperPosition } from '../db';
+import {
+  dhanRateLimitRemainingSec, isDhanRateLimited, isRateLimitError, noteDhanRateLimit,
+} from '../lib/dhanRateLimit';
 
 function dhanErrorDetail(e: any): string {
   return [e.errorCode, e.errorType, e.errorMessage].filter(Boolean).join(' | ');
@@ -61,6 +64,12 @@ export class SandboxExecutionEngine {
       eventBus.emit('order', { kind: 'rejection', correlationId: correlation_id, reason: gate.reason });
       journal.append('order_result', { correlation_id, status: 'REJECTED', reason: gate.reason, mode: 'sandbox' });
       return { status: 'REJECTED', reason: gate.reason };
+    }
+    if (isDhanRateLimited()) {
+      const reason = `Dhan API rate limit — retry in ${dhanRateLimitRemainingSec()}s`;
+      eventBus.log('WARN', `Sandbox order skipped for ${correlation_id}: ${reason}`, 'sandbox_engine');
+      journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox', rate_limited: true });
+      return { status: 'REJECTED', reason };
     }
 
     let secId = String(security_id);
@@ -198,7 +207,13 @@ export class SandboxExecutionEngine {
     } catch (e: any) {
       const detail = dhanErrorDetail(e);
       const reason = detail ? `${e.message} (${detail})` : e.message;
-      this.risk.getPortfolio().recordOrderOutcome({ status: 'REJECTED' });
+      if (isRateLimitError(reason)) {
+        noteDhanRateLimit({ message: reason, retryAfterMs: e.retryAfterMs }, (msg) => {
+          eventBus.log('WARN', msg, 'sandbox_engine');
+        });
+      } else {
+        this.risk.getPortfolio().recordOrderOutcome({ status: 'REJECTED' });
+      }
       eventBus.log('ERROR', `Sandbox order FAILED for ${correlation_id}: ${reason}`, 'sandbox_engine');
       journal.append('order_result', { correlation_id, status: 'REJECTED', reason, mode: 'sandbox' });
       return { status: 'REJECTED', reason };

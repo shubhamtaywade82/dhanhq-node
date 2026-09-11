@@ -941,8 +941,10 @@ export class AgentOrchestrator {
 
   private async executeStrategy(runId: string, objective: string, strat: ConstructedStrategy | null, allowed: boolean): Promise<any> {
     const wantsTrade = /buy|sell|straddle|strangle|condor|spread|deploy|execute|trade|survey|scan|auto/i.test(objective);
-    if (!wantsTrade || !strat || !allowed) {
-      this.step(runId, 'execution', 'OBSERVE', `Skipped: ${!allowed ? 'risk blocked' : !strat ? 'no strategy' : 'no trade intent'}`);
+    const gate = this.risk.canTrade();
+    if (!wantsTrade || !strat || !allowed || !gate.allowed) {
+      const reason = !gate.allowed ? gate.reason : !allowed ? 'risk blocked' : !strat ? 'no strategy' : 'no trade intent';
+      this.step(runId, 'execution', 'OBSERVE', `Skipped: ${reason}`);
       return { status: 'SKIPPED' };
     }
 

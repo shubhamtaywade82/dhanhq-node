@@ -9,6 +9,7 @@ import { nearestIndexExpiry } from './marketHours';
 import { calculateGreeks, getLastIv } from './optionsAnalytics';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 import { getSystemState } from './systemState';
+import { dhanRateLimitRemainingSec, isDhanRateLimited } from '../lib/dhanRateLimit';
 import {
   pushAlert, getRiskState, saveRiskState,
   listPaperStrategies, updatePaperStrategyStatus,
@@ -175,6 +176,9 @@ export class RiskEngine {
     if (this.killed) return { allowed: false, reason: 'Kill switch engaged' };
     const clock = marketClock();
     if (clock.squareOffWindow) return { allowed: false, reason: 'EOD square-off window — no new entries' };
+    if (isDhanRateLimited()) {
+      return { allowed: false, reason: `Dhan API rate limit — retry in ${dhanRateLimitRemainingSec()}s` };
+    }
     // These breakers were computed by the last evaluate() cycle (runs every
     // tick) and displayed in the UI as ERROR, but nothing actually blocked
     // new entries on them — the dashboard could show red while the agent
@@ -182,6 +186,10 @@ export class RiskEngine {
     for (const rule of ['Margin Utilization', 'Stale Market Tick', 'Concurrent Strategies', 'Portfolio Net Delta']) {
       const row = this.lastBreakers.find((b) => b.rule === rule);
       if (row?.state === 'ERROR') return { allowed: false, reason: `${rule} breached (${row.current} vs ${row.threshold})` };
+    }
+    const rejectionRow = this.lastBreakers.find((b) => b.rule === 'Order Rejection Rate');
+    if (rejectionRow?.state === 'WARN') {
+      return { allowed: false, reason: `Order rejection rate elevated (${rejectionRow.current})` };
     }
     return { allowed: true };
   }

@@ -15,6 +15,9 @@ import { INDEX_INSTRUMENTS } from './marketData';
 import { parseOptionSymbol } from './optionsAnalytics';
 import { resolveNearestExpiry } from './strategyConstructor';
 import { shouldEmitKeyedLog } from '../lib/logPolicy';
+import {
+  clearDhanRateLimit, isDhanRateLimited, isRateLimitError, noteDhanRateLimit,
+} from '../lib/dhanRateLimit';
 
 /**
  * Normalizes RiskEngine's and AutonomyEngine's view of "the account" across
@@ -323,8 +326,6 @@ export class BrokerPortfolioSource implements PortfolioSource {
   private consecutiveLosses = 0;
   private realizedProfitBySymbol = new Map<string, number>();
   private closeBlockedUntil = new Map<string, number>();
-  private brokerRateLimitedUntil = 0;
-  private consecutiveBrokerRateLimits = 0;
 
   constructor(client: DhanClient, pollIntervalMs = 3000) {
     this.client = client;
@@ -381,28 +382,15 @@ export class BrokerPortfolioSource implements PortfolioSource {
   }
 
   private isBrokerRateLimited(): boolean {
-    return Date.now() < this.brokerRateLimitedUntil;
+    return isDhanRateLimited();
   }
 
   private noteBrokerRateLimit(err?: { message?: string; retryAfterMs?: number }): void {
-    this.consecutiveBrokerRateLimits++;
-    const retryAfter = Number(err?.retryAfterMs ?? 0);
-    const backoffMs = retryAfter > 0
-      ? retryAfter
-      : Math.min(10_000 * 2 ** (this.consecutiveBrokerRateLimits - 1), 120_000);
-    this.brokerRateLimitedUntil = Date.now() + backoffMs;
-    if (shouldEmitKeyedLog('portfolio_source:broker_rate_limit', 30_000)) {
-      eventBus.log(
-        'WARN',
-        `Broker portfolio API rate-limited — pausing polls for ${Math.round(backoffMs / 1000)}s`,
-        'portfolio_source',
-      );
-    }
+    noteDhanRateLimit(err, (msg) => eventBus.log('WARN', msg, 'portfolio_source'));
   }
 
   private clearBrokerRateLimit(): void {
-    this.consecutiveBrokerRateLimits = 0;
-    this.brokerRateLimitedUntil = 0;
+    clearDhanRateLimit();
   }
 
   private async maybeRefreshBrokerSnapshot(force = false): Promise<void> {
@@ -447,7 +435,7 @@ export class BrokerPortfolioSource implements PortfolioSource {
     } catch (e: any) {
       this.degraded = true;
       const msg = String(e?.message || e);
-      if (msg.includes('429') || msg.toLowerCase().includes('rate limit')) {
+      if (isRateLimitError(msg)) {
         this.noteBrokerRateLimit(e);
       } else if (shouldEmitKeyedLog('portfolio_source:poll_failed', 60_000)) {
         eventBus.log('WARN', `Broker portfolio poll failed: ${msg} — serving last-known snapshot`, 'portfolio_source');
@@ -665,11 +653,11 @@ export class BrokerPortfolioSource implements PortfolioSource {
       return { status: 'TRADED', symbol: pos.tradingSymbol, orderId, fillPrice };
     } catch (e: any) {
       const errMsg = String(e.message || 'Close rejected');
-      if (errMsg.includes('429')) {
+      if (isRateLimitError(errMsg)) {
         this.noteCloseRateLimit(pos.tradingSymbol);
         this.noteBrokerRateLimit({ message: errMsg });
       }
-      const friendly = errMsg.includes('429')
+      const friendly = isRateLimitError(errMsg)
         ? 'Dhan API rate limit exceeded — wait a few seconds and retry. Sandbox paper-only positions close locally without broker calls.'
         : errMsg;
       eventBus.log('ERROR', `Broker close FAILED for ${pos.tradingSymbol}: ${errMsg}`, 'portfolio_source');

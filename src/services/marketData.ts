@@ -1,6 +1,7 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { PositionMonitor, OrderUpdateWS, RateLimitError } from '@nemesis-oss/dhanhq-sdk';
 import { hasTotpCredentials, hasExternalAuthProvider } from '../auth';
+import { clearDhanRateLimit, dhanRateLimitRemainingMs, isDhanRateLimited, noteDhanRateLimit } from '../lib/dhanRateLimit';
 import { eventBus } from './eventBus';
 import { marketClock, istNow, isWsMarketWindowOpen, msUntilNextWsWindow } from './marketHours';
 
@@ -96,8 +97,6 @@ export class MarketDataService {
   private lastTickAt = 0;
   private lastWsTickAt = 0;
   private source: 'ws' | 'rest' | 'none' = 'none';
-  private rateLimitedUntil = 0;                           // backoff gate after a 429
-  private consecutiveRateLimits = 0;
   private lastWs429At = 0;                                // backoff timestamp for WebSocket 429 rate limit
   private wsListenersAttached = false;
   private wsRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -372,7 +371,7 @@ export class MarketDataService {
       }
 
       const wsFresh = this.wsTickCount > 0 && Date.now() - this.lastWsTickAt < 15_000;
-      const backoffRemaining = this.rateLimitedUntil - Date.now();
+      const backoffRemaining = dhanRateLimitRemainingMs();
       // When WS is active, REST heartbeat polls at 12s to preserve API quota while staying
       // well under the 15s WARN and 30s ERROR boundaries. If WS drops or pauses, REST polls
       // at 4s during market hours to ensure continuous fresh price feeds.
@@ -387,7 +386,7 @@ export class MarketDataService {
   }
 
   private requestRestRefresh(): void {
-    if (Date.now() >= this.rateLimitedUntil) void this.refreshRestQuotes();
+    if (!isDhanRateLimited()) void this.refreshRestQuotes();
   }
 
   private async refreshRestQuotes(): Promise<void> {
@@ -415,19 +414,16 @@ export class MarketDataService {
       if (touched) {
         this.restTickCount++;
         this.lastTickAt = Date.now();
-        this.consecutiveRateLimits = 0;
+        clearDhanRateLimit();
         if (this.wsTickCount === 0 || Date.now() - this.lastWsTickAt >= 10_000) {
           this.source = 'rest';
         }
       }
     } catch (e: any) {
       if (e instanceof RateLimitError) {
-        this.consecutiveRateLimits++;
-        // Exponential backoff (10s, 20s, 40s ... capped at 2min) — retrying every
-        // 3s into a 429 just keeps renewing Dhan's rate-limit window forever.
-        const backoffMs = e.retryAfterMs || Math.min(10_000 * 2 ** (this.consecutiveRateLimits - 1), 120_000);
-        this.rateLimitedUntil = Date.now() + backoffMs;
-        eventBus.log('WARN', `Index quote poll rate-limited — backing off ${Math.round(backoffMs / 1000)}s`, 'market_data');
+        noteDhanRateLimit({ message: e.message, retryAfterMs: e.retryAfterMs }, (msg) => {
+          eventBus.log('WARN', msg.replace('broker calls', 'quote polls'), 'market_data');
+        });
       } else {
         eventBus.log('WARN', `Index quote poll failed: ${e?.message || e}`, 'market_data');
       }

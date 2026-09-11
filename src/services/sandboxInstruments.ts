@@ -1,4 +1,7 @@
 import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
+import {
+  clearDhanRateLimit, isDhanRateLimited, isRateLimitError, noteDhanRateLimit,
+} from '../lib/dhanRateLimit';
 
 export type SandboxLegInput = {
   securityId: string | number;
@@ -22,10 +25,16 @@ export async function resolveSandboxOptionLeg(
   client: DhanClient,
   input: SandboxLegInput,
 ): Promise<SandboxLeg | null> {
+  if (isDhanRateLimited()) return null;
   const instrument = await client.instruments.findBySecurityId(
     input.exchangeSegment,
     input.securityId,
-  );
+  ).catch((e: any) => {
+    if (isRateLimitError(String(e?.message || e))) {
+      noteDhanRateLimit({ message: String(e?.message || e), retryAfterMs: e?.retryAfterMs });
+    }
+    return null;
+  });
   if (!instrument) return null;
   const lot = Number(instrument.lotSize);
   if (!(lot > 0)) return null;

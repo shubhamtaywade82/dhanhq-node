@@ -43,6 +43,7 @@ export class AutonomyEngine {
   private running = false;
   private lastCycleAt = 0;
   private lastScanAt = 0;
+  private bootedAt = Date.now();
   private lastLedgerCheckAt = 0;
   private lastStaleWarnAt = 0;
   private cycles = 0;
