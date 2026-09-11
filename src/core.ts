@@ -18,6 +18,7 @@ import { journal, summarizeDay, type JournalEntry } from './services/journal';
 import { OllamaClient } from '@nemesis-oss/ollama-sdk';
 import { PaperPortfolioSource, BrokerPortfolioSource, type PortfolioSource } from './services/portfolioSource';
 import { getSystemState, setSystemState } from './services/systemState';
+import { getTradingMode, isLiveMode, isSandboxMode, describeModeContract } from './lib/tradingMode';
 import { ResearchOrchestrator } from './services/research/researchOrchestrator';
 import { ResearchScheduler } from './services/research/researchScheduler';
 import { initResearchRepository } from './services/research/researchRepository';
@@ -86,17 +87,19 @@ export async function startCore(): Promise<Core> {
   // only after a supervised first live session (minimum lot size, one
   // index) confirms the kill switch and reconciler actually fire correctly
   // against the real account — not as a standalone code change.
-  if (process.env.TRADING_MODE === 'live' && process.env.ALLOW_LIVE_TRADING !== 'true') {
+  if (isLiveMode() && process.env.ALLOW_LIVE_TRADING !== 'true') {
     throw new Error(
       'TRADING_MODE=live is deliberately disabled pending confirmation: set ALLOW_LIVE_TRADING=true ' +
       'in .env to confirm live trading with real capital.'
     );
   }
-  if (process.env.TRADING_MODE === 'sandbox' && !createSandboxDhanClient()) {
+  if (isSandboxMode() && !createSandboxDhanClient()) {
     throw new Error(
       'TRADING_MODE=sandbox requires DHAN_SANDBOX_CLIENT_ID and DHAN_SANDBOX_ACCESS_TOKEN — set them, or use TRADING_MODE=paper.'
     );
   }
+
+  const mode = getTradingMode();
 
   setSystemState('BOOTING', 'Initializing database and clients');
   await initDatabase();
@@ -109,9 +112,9 @@ export async function startCore(): Promise<Core> {
   // acts on — RiskEngine, AutonomyEngine and LiveExecutionEngine all take
   // the SAME instance so there is exactly one broker poll cache and one
   // idea of "the current positions" shared across them, not one each.
-  const portfolio: PortfolioSource = process.env.TRADING_MODE === 'live'
+  const portfolio: PortfolioSource = isLiveMode()
     ? new BrokerPortfolioSource(client)
-    : process.env.TRADING_MODE === 'sandbox' && sandboxClient
+    : isSandboxMode() && sandboxClient
       ? new BrokerPortfolioSource(sandboxClient)
       : new PaperPortfolioSource();
   const risk = new RiskEngine(client, market, portfolio);
@@ -120,11 +123,13 @@ export async function startCore(): Promise<Core> {
   // OrderTracker: resolve live orders to fills from order-update WS
   // events (MarketDataService re-emits them on the bus).
   const tracker = new OrderTracker();
-  eventBus.on('order', (env) => {
-    if (env.payload?.kind === 'order_update' && env.payload?.order) {
-      try { tracker.onOrderUpdate(env.payload.order); } catch { /* defensive */ }
-    }
-  });
+  if (isLiveMode()) {
+    eventBus.on('order', (env) => {
+      if (env.payload?.kind === 'order_update' && env.payload?.order) {
+        try { tracker.onOrderUpdate(env.payload.order); } catch { /* defensive */ }
+      }
+    });
+  }
 
   const paper = new PaperExecutionEngine(client, market.monitor, market, risk);
   const live = new LiveExecutionEngine(client, tracker, market.monitor, market, risk, portfolio);
@@ -138,7 +143,7 @@ export async function startCore(): Promise<Core> {
   const research = new ResearchOrchestrator(client, market, undefined, ollama);
   autonomy.setAgent(agent);
   autonomy.setResearch(research);
-  const executionEngine = pickExecutionEngine(process.env.TRADING_MODE, { paper, live, sandbox });
+  const executionEngine = pickExecutionEngine(mode, { paper, live, sandbox });
   autonomy.setScanner(new AdaptiveSupertrendScanner(client, market, executionEngine, risk, undefined, portfolio));
 
   await initResearchRepository();
@@ -191,8 +196,8 @@ export async function startCore(): Promise<Core> {
     setSystemState('READY', 'Core initialization complete');
   }
 
-  eventBus.emit('system', { type: 'boot', mode: process.env.TRADING_MODE || 'paper' });
-  eventBus.log('SYSTEM', `Core stack online (mode=${process.env.TRADING_MODE || 'paper'}) — backend is autonomous; frontend optional`, 'core');
+  eventBus.emit('system', { type: 'boot', mode });
+  eventBus.log('SYSTEM', `Core stack online (mode=${mode}: ${describeModeContract()}) — backend is autonomous; frontend optional`, 'core');
 
   return { client, sandboxClient, portfolio, market, risk, autonomy, agent, research, researchScheduler, paper, live, sandbox, tracker, selfHealing };
 }
@@ -211,7 +216,7 @@ export async function crossCheckJournalOnBoot(
   priorEntries: JournalEntry[], risk: RiskEngine, client: DhanClient, sandboxClient?: DhanClient,
 ): Promise<void> {
   if (priorEntries.length === 0) return;
-  const mode = process.env.TRADING_MODE || 'paper';
+  const mode = getTradingMode();
   const summary = summarizeDay(priorEntries, mode);
   const problems: string[] = [];
 

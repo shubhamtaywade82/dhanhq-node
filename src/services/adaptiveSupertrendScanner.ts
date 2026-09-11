@@ -12,6 +12,7 @@ import { MAX_CONCURRENT_POSITIONS } from './autonomy';
 import { listPaperPositions, createPaperStrategy } from '../db';
 import type { PortfolioSource } from './portfolioSource';
 import { isDhanRateLimited } from '../lib/dhanRateLimit';
+import { isPaperMode, isSandboxMode } from '../lib/tradingMode';
 import { buildAdaptiveSupertrendStrategy } from './strategyConstructor';
 import { CandleStore } from './adaptiveSupertrendCandles';
 import { extractMarketFeatures, formatRegimeKey, AdaptiveParameterAI, FuzzySignalAI, type AdaptiveSignal } from './adaptiveSupertrend';
@@ -22,7 +23,7 @@ import { extractMarketFeatures, formatRegimeKey, AdaptiveParameterAI, FuzzySigna
 const WATCHLIST_ALL = ['NIFTY', 'SENSEX', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'];
 
 function watchlist(): string[] {
-  if (process.env.TRADING_MODE === 'sandbox') {
+  if (isSandboxMode()) {
     return WATCHLIST_ALL.filter((s) => s !== 'SENSEX'); // BSE FNO not supported in Dhan sandbox
   }
   return WATCHLIST_ALL;
@@ -360,7 +361,7 @@ export class AdaptiveSupertrendScanner {
     });
     if (result.status !== 'TRADED') return false;
 
-    if ((process.env.TRADING_MODE || 'paper') === 'paper') {
+    if (isPaperMode()) {
       await createPaperStrategy({
         id: strat.id, name: strat.name, symbol: strat.symbol, type: strat.type, lots: strat.lots,
         legs: [{ ...leg, price: result.fill_price ?? leg.price }],
@@ -376,7 +377,7 @@ export class AdaptiveSupertrendScanner {
   }
 
   private openPositionCount(positions: any[]): number {
-    if ((process.env.TRADING_MODE || 'paper') === 'paper') {
+    if (isPaperMode()) {
       return positions.filter((p: any) => p.netQty !== 0).length;
     }
     return this.openLeg.size;

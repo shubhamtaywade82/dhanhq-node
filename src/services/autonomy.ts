@@ -15,6 +15,7 @@ import {
 } from '../db';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 import { shouldEmitKeyedLog } from '../lib/logPolicy';
+import { getTradingMode, isSandboxMode } from '../lib/tradingMode';
 
 /**
  * Autonomy engine — the heartbeat that keeps the system trading when no
@@ -103,7 +104,7 @@ export class AutonomyEngine {
     this.unsubBus.push(eventBus.on('tick', () => this.scheduleTickMark()));
 
     this.scheduleNext(1000);
-    eventBus.log('SYSTEM', `Autonomy engine started (mode=${process.env.TRADING_MODE || 'paper'}, EOD 15:20 IST, scanner=${this.scanEnabled})`, 'autonomy');
+    eventBus.log('SYSTEM', `Autonomy engine started (mode=${getTradingMode()}, EOD 15:20 IST, scanner=${this.scanEnabled})`, 'autonomy');
   }
 
   setEnabled(on: boolean): void {
@@ -337,7 +338,7 @@ export class AutonomyEngine {
 
     for (const p of positions) {
       if (p.netQty === 0 || !p.securityId || p.securityId === '0') continue;
-      if (process.env.TRADING_MODE === 'sandbox' && !this.portfolio.isOpenOnBroker(p)) continue;
+      if (isSandboxMode() && !this.portfolio.isOpenOnBroker(p)) continue;
       const key = `${p.exchangeSegment || 'NSE_FNO'}:${p.securityId}`;
       if (trackedKeys.has(key)) continue;
       if (this.longOptionManager.isEnabled() && this.longOptionManager.getState(p.tradingSymbol)) continue;

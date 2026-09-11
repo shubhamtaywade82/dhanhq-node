@@ -5,6 +5,7 @@ import type { AutonomyEngine } from '../services/autonomy';
 import type { AgentOrchestrator } from '../services/agent';
 import type { MarketDataService } from '../services/marketData';
 import { crossCheckJournalOnBoot } from '../core';
+import { getTradingMode } from '../lib/tradingMode';
 import { eventBus } from '../services/eventBus';
 import { journal } from '../services/journal';
 import { getSystemState, setSystemState } from '../services/systemState';
@@ -35,7 +36,7 @@ export function controlRoutes(
   router.get('/state', async (_req, res) => {
     const [alerts, agentEvents] = await Promise.all([listAlerts(50), agent.events(50)]);
     res.json({
-      mode: process.env.TRADING_MODE || 'paper',
+      mode: getTradingMode(),
       systemState: getSystemState(),
       risk: risk.snapshot(),
       autonomy: autonomy.stats(),

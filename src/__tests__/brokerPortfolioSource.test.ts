@@ -307,6 +307,37 @@ describe('BrokerPortfolioSource', () => {
     await pool?.end().catch(() => {});
   });
 
+  it('uses paper ledger wallet in sandbox when broker is flat but local book has positions', async () => {
+    process.env.TRADING_MODE = 'sandbox';
+    const client = stubClient({
+      positions: [],
+      funds: { availabelBalance: 50412, utilizedAmount: 0 },
+    });
+    const paperWalletSpy = jest.spyOn(db, 'getPaperWallet').mockResolvedValue({
+      availableMargin: 26400,
+      usedMargin: 73600,
+      totalBalance: 100000,
+      equity: 95000,
+      unrealizedPnl: -5000,
+      sessionRealizedPnl: 0,
+      realizedPnl: 0,
+      netRealizedPnl: 0,
+      totalCharges: 0,
+      spanMargin: 51520,
+      exposureMargin: 22080,
+    });
+    const listSpy = jest.spyOn(db, 'listPaperPositions').mockResolvedValue([
+      { tradingSymbol: 'NIFTY24000CE', netQty: 50, net_qty: 50 } as any,
+    ]);
+    const src = new BrokerPortfolioSource(client, 60_000);
+    const wallet = await src.getWallet();
+    expect(wallet.availableMargin).toBe(26400);
+    expect(wallet.usedMargin).toBe(73600);
+    expect(wallet.totalBalance).toBe(100000);
+    paperWalletSpy.mockRestore();
+    listSpy.mockRestore();
+  });
+
   it('closeAll reverses every open position and skips flat ones', async () => {
     const place = jest.fn(async () => ({ correlationId: 'c', data: { orderId: 'x' } }));
     const client = stubClient({

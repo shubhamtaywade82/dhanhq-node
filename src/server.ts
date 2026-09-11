@@ -3,6 +3,7 @@ import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import './lib/env';
+import { getTradingMode } from './lib/tradingMode';
 import { startCore } from './core';
 import { marketRoutes } from './routes/market';
 import { portfolioRoutes } from './routes/portfolio';
@@ -99,7 +100,7 @@ async function main() {
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
-      mode: process.env.TRADING_MODE || 'paper',
+      mode: getTradingMode(),
       persistence: dbMode(),
       killed: core.risk.isKilled(),
       autonomy: core.autonomy.isEnabled(),

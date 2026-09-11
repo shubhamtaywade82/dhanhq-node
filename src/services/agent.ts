@@ -2,6 +2,7 @@ import { AgentToolRegistry, Policy, type DhanClient } from '@nemesis-oss/dhanhq-
 import { OllamaClient, type Logger as OllamaLogger } from '@nemesis-oss/ollama-sdk';
 import { moduleLogger } from '../lib/logger';
 import { dhanRateLimitRemainingSec, isDhanRateLimited } from '../lib/dhanRateLimit';
+import { getTradingMode } from '../lib/tradingMode';
 import { eventBus } from './eventBus';
 import type { MarketDataService } from './marketData';
 import type { RiskEngine } from './riskEngine';
@@ -953,7 +954,7 @@ export class AgentOrchestrator {
     }
 
     this.market.addInstruments(strat.legs.map((l) => ({ securityId: l.securityId, exchangeSegment: l.exchangeSegment || 'NSE_FNO' })));
-    const mode = process.env.TRADING_MODE;
+    const mode = getTradingMode();
     const engine = mode === 'live' ? this.live : mode === 'sandbox' && this.sandbox ? this.sandbox : this.paper;
 
     const deployResult = await deployMultiLeg(engine, strat, runId, this.market, this.risk);

@@ -18,6 +18,7 @@ import { shouldEmitKeyedLog } from '../lib/logPolicy';
 import {
   clearDhanRateLimit, isDhanRateLimited, isRateLimitError, noteDhanRateLimit,
 } from '../lib/dhanRateLimit';
+import { brokerJournalMode } from '../lib/tradingMode';
 
 /**
  * Normalizes RiskEngine's and AutonomyEngine's view of "the account" across
@@ -482,7 +483,7 @@ export class BrokerPortfolioSource implements PortfolioSource {
    * rejects, restarts, paper-only closes), margin and net-worth must follow
    * the paper wallet — not the broker's empty ₹50k sandbox allocation. */
   private async withSandboxPaperWallet(brokerWallet: WalletSnapshot): Promise<WalletSnapshot> {
-    const paperOpen = (await listPaperPositions()).filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0);
+    const paperOpen = (await listPaperPositions()).filter((p) => Number(p.netQty ?? 0) !== 0);
     if (paperOpen.length === 0) return brokerWallet;
     const paperWallet = await getPaperWallet().catch(() => null);
     if (!paperWallet) return brokerWallet;
@@ -546,7 +547,7 @@ export class BrokerPortfolioSource implements PortfolioSource {
       const mark = await markPositionsToMarket(ltpResolver);
       await this.maybeRefreshBrokerSnapshot(false);
       const brokerOpen = this.cachedPositions.filter((p) => p.netQty !== 0);
-      const paperOpen = (await listPaperPositions()).filter((p) => Number(p.netQty ?? p.net_qty ?? 0) !== 0);
+      const paperOpen = (await listPaperPositions()).filter((p) => Number(p.netQty ?? 0) !== 0);
       if (brokerOpen.length === 0 && paperOpen.length > 0) {
         const paperWallet = await getPaperWallet().catch(() => null);
         if (paperWallet) {
@@ -615,7 +616,7 @@ export class BrokerPortfolioSource implements PortfolioSource {
    * correct for real capital than forcing a specific price the way the
    * paper fill model does. */
   private brokerMode(): 'sandbox' | 'live' {
-    return process.env.TRADING_MODE === 'sandbox' ? 'sandbox' : 'live';
+    return brokerJournalMode();
   }
 
   private async reversePosition(pos: NormalizedPosition, reason: string, quantity?: number): Promise<CloseResult> {
@@ -761,7 +762,7 @@ export async function buildMarginReconcileReport(
   client: DhanClient,
   portfolio: PortfolioSource,
 ): Promise<MarginReconcileReport> {
-  const mode = process.env.TRADING_MODE || 'live';
+  const mode = brokerJournalMode();
   const [fundsRes, brokerPositions, paperWallet, paperPositions] = await Promise.all([
     client.funds.getLimit().catch(() => ({})),
     portfolio.getPositions(),

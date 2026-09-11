@@ -2,6 +2,7 @@ import pino, { Logger, LoggerOptions } from 'pino';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { getTradingMode } from './tradingMode';
 
 /**
  * Structured logging core (Pino).
@@ -40,7 +41,7 @@ const options: LoggerOptions = {
     service: process.env.SERVICE_NAME ?? 'dhanhq-node',
     env: process.env.NODE_ENV ?? 'development',
     version: process.env.GIT_SHA ?? process.env.APP_VERSION ?? 'dev',
-    mode: process.env.TRADING_MODE ?? 'paper',
+    mode: getTradingMode(),
   },
   redact: {
     paths: [

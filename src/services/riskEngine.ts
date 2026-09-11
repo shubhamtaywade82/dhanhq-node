@@ -10,6 +10,7 @@ import { calculateGreeks, getLastIv } from './optionsAnalytics';
 import { PaperPortfolioSource, type PortfolioSource } from './portfolioSource';
 import { getSystemState } from './systemState';
 import { dhanRateLimitRemainingSec, isDhanRateLimited } from '../lib/dhanRateLimit';
+import { getTradingMode, isLiveMode } from '../lib/tradingMode';
 import {
   pushAlert, getRiskState, saveRiskState,
   listPaperStrategies, updatePaperStrategyStatus,
@@ -223,9 +224,9 @@ export class RiskEngine {
     this.killedDate = marketClock().istDate;
     await saveRiskState({ killed: true, killedReason: reason, killedDate: this.killedDate, limits: this.limits });
 
-    const details: any = { mode: process.env.TRADING_MODE || 'paper', positionsClosed: 0 };
+    const details: any = { mode: getTradingMode(), positionsClosed: 0 };
 
-    if ((process.env.TRADING_MODE || 'paper') === 'live') {
+    if (isLiveMode()) {
       try {
         await (this.client as any).traderControls?.setKillSwitch?.('ACTIVATE');
         details.brokerKillSwitch = 'ACTIVATE';
@@ -285,7 +286,7 @@ export class RiskEngine {
     this.killedDate = null;
     await saveRiskState({ killed: false, killedDate: null, limits: this.limits });
     try {
-      if ((process.env.TRADING_MODE || 'paper') === 'live') {
+      if (isLiveMode()) {
         await (this.client as any).traderControls?.setKillSwitch?.('DEACTIVATE');
       }
     } catch { /* broker may reject if not armed */ }

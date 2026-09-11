@@ -1,5 +1,6 @@
 import './lib/env';
 import { startCore, resolveExecutionEngine } from "./core";
+import { getTradingMode } from "./lib/tradingMode";
 import Redis from "ioredis";
 import type { Core } from "./core";
 import { moduleLogger, logError } from "./lib/logger";
@@ -25,7 +26,7 @@ process.on("unhandledRejection", (e: any) =>
  * whether or not anything else is attached.
  */
 async function main() {
-  log.info({ mode: process.env.TRADING_MODE || "paper" }, "Starting DhanHQ-TS Execution Sidecar (headless)");
+  log.info({ mode: getTradingMode() }, "Starting DhanHQ-TS Execution Sidecar (headless)");
 
   try {
     const core = await startCore();
@@ -60,7 +61,7 @@ async function listenForIntents(core: Core): Promise<void> {
     try {
       const intent = JSON.parse(message);
       log.info({ intentId: intent.intent_id, strategy: intent.strategy }, "Processing execution intent");
-      const engine = resolveExecutionEngine(core, process.env.TRADING_MODE);
+      const engine = resolveExecutionEngine(core, getTradingMode());
       await engine.placeOrder(intent);
     } catch (e: any) {
       logError(log, "Execution failed", e);

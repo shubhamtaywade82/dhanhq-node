@@ -16,6 +16,7 @@ import type { AgentOrchestrator } from '../services/agent';
 import { isValidSecurityId, keysMatch, toInstrumentKey, type InstrumentKey } from '../lib/instrumentKey';
 import type { PortfolioSource } from '../services/portfolioSource';
 import { buildMarginReconcileReport, buildPaperMarginReconcileReport } from '../services/portfolioSource';
+import { brokerJournalMode, executionBrokerClient, isPaperMode } from '../lib/tradingMode';
 import { marketClock } from '../services/marketHours';
 import { journal, type JournalEntry } from '../services/journal';
 
@@ -160,9 +161,7 @@ export function portfolioRoutes(
 ): Router {
   const router = Router();
   const isLocalPaper = () => !portfolio || portfolio.kind === 'paper';
-  const brokerApiClient = () => (
-    (process.env.TRADING_MODE || 'paper') === 'sandbox' && sandboxClient ? sandboxClient : client
-  );
+  const brokerApiClient = () => executionBrokerClient(client, sandboxClient);
 
   router.get('/summary', async (req, res) => {
     try {
@@ -172,7 +171,7 @@ export function portfolioRoutes(
           portfolio!.getPositions(),
           portfolio!.getWallet(),
           listPaperStrategies(),
-          listBrokerOrders(brokerApiClient(), (process.env.TRADING_MODE || 'live') as 'sandbox' | 'live'),
+          listBrokerOrders(brokerApiClient(), brokerJournalMode()),
         ]);
       const indices = market.getIndices();
       const spotMap: Record<string, number> = {};
@@ -212,7 +211,7 @@ export function portfolioRoutes(
       if (isLocalPaper() || req.query.mode === 'paper') {
         return res.json(await listPaperOrders());
       }
-      const mode = ((process.env.TRADING_MODE || 'live') === 'sandbox' ? 'sandbox' : 'live') as 'sandbox' | 'live';
+      const mode = brokerJournalMode();
       res.json(await listBrokerOrders(brokerApiClient(), mode));
     } catch (e: any) {
       log.warn({ requestId: req.id, err: { message: e.message }, resource: 'orders' }, 'Orders fetch failed');
@@ -264,6 +263,9 @@ export function portfolioRoutes(
 
   router.post('/paper/order', async (req, res) => {
     try {
+      if (!isPaperMode()) {
+        return res.status(400).json({ error: 'Manual paper orders are only available when TRADING_MODE=paper' });
+      }
       const { symbol, quantity, transactionType, price, orderType, productType, securityId, exchangeSegment } = req.body;
       if (!symbol || !quantity || !transactionType) {
         return res.status(400).json({ error: 'symbol, quantity, and transactionType are required' });
@@ -399,6 +401,9 @@ export function portfolioRoutes(
 
   router.post('/paper/strategy/deploy', async (req, res) => {
     try {
+      if (!isPaperMode()) {
+        return res.status(400).json({ error: 'Paper strategy deploy is only available when TRADING_MODE=paper' });
+      }
       const { name, symbol, type, lots, legs } = req.body;
       // Strategy deployment is blocked by the kill switch / EOD window too.
       const gate = risk?.canTrade();

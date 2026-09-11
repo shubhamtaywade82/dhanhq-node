@@ -4,6 +4,7 @@ import type { PortfolioSource } from './portfolioSource';
 import { executePaperOrder, closePaperPosition, defaultMarginResolver, calculateOrderCharges, listPaperPositions, closeParentStrategyIfFlat } from '../db';
 import { isValidSecurityId } from '../lib/instrumentKey';
 import { shouldEmitKeyedLog } from '../lib/logPolicy';
+import { isSandboxMode } from '../lib/tradingMode';
 import {
   applyExitFill, createLongOptionState, decideLongOption, DEFAULT_LONG_OPTION_POLICY_CONFIG,
   type FeeEstimator, type LongOptionState,
@@ -149,7 +150,7 @@ export class LongOptionPositionManager {
 
     try {
       let result: any;
-      const sandbox = (process.env.TRADING_MODE || 'paper') === 'sandbox';
+      const sandbox = isSandboxMode();
       if (this.portfolio?.kind === 'broker') {
         if (sandbox && (!isValidSecurityId(String(pos.securityId)) || !this.portfolio.isOpenOnBroker(pos))) {
           result = qty >= pos.netQty

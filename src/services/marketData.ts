@@ -2,6 +2,7 @@ import type { DhanClient } from '@nemesis-oss/dhanhq-sdk';
 import { PositionMonitor, OrderUpdateWS, RateLimitError } from '@nemesis-oss/dhanhq-sdk';
 import { hasTotpCredentials, hasExternalAuthProvider } from '../auth';
 import { clearDhanRateLimit, dhanRateLimitRemainingMs, isDhanRateLimited, noteDhanRateLimit } from '../lib/dhanRateLimit';
+import { isLiveMode } from '../lib/tradingMode';
 import { eventBus } from './eventBus';
 import { marketClock, istNow, isWsMarketWindowOpen, msUntilNextWsWindow } from './marketHours';
 
@@ -10,8 +11,11 @@ import { marketClock, istNow, isWsMarketWindowOpen, msUntilNextWsWindow } from '
  *
  * - Primary source: DhanHQ binary WebSocket (SDK `client.ws.market`) —
  *   real-time ticks, no polling cost.
- * - Fallback source: REST `marketFeed.quote` polling (every 3s) when the
- *   WS is not connected (off-hours token absence, WS outage, sandbox runs).
+ * - Fallback source: REST `marketFeed.quote` polling when the WS is down.
+ *
+ * Market data always uses the **production** DhanHQ client (real-time
+ * quotes/WS) in every TRADING_MODE. Order-update WS connects **live mode
+ * only** — paper is local, sandbox settles synchronously via REST.
  *
  * The service starts at server boot and keeps running with ZERO frontend
  * clients attached — the autonomy loop and risk engine both consume it.
@@ -277,28 +281,30 @@ export class MarketDataService {
           eventBus.log('WARN', `Market WS error: ${msg}`, 'market_data');
         });
 
-        // Always register error and close handlers on orders WS to prevent Uncaught Exception
-        ws.orders?.on?.('open', () => {
-          if (!this.feedLog.ordersWs) {
-            eventBus.log('INFO', 'DhanHQ orders WebSocket connected', 'market_data');
-            this.feedLog.ordersWs = true;
-          }
-        });
-        ws.orders?.on?.('order', (order: any) => {
-          eventBus.emit('order', { kind: 'order_update', order });
-        });
-        ws.orders?.on?.('error', (e: any) => {
-          const msg = e?.message || String(e);
-          if (!msg.includes('429')) {
-            eventBus.log('WARN', `Orders WS error: ${msg}`, 'market_data');
-          }
-        });
-        ws.orders?.on?.('close', () => {
-          if (this.feedLog.ordersWs) {
-            eventBus.log('INFO', 'Orders WS closed', 'market_data');
-            this.feedLog.ordersWs = false;
-          }
-        });
+        // Live mode only — paper is local, sandbox settles via REST getById.
+        if (isLiveMode()) {
+          ws.orders?.on?.('open', () => {
+            if (!this.feedLog.ordersWs) {
+              eventBus.log('INFO', 'DhanHQ orders WebSocket connected', 'market_data');
+              this.feedLog.ordersWs = true;
+            }
+          });
+          ws.orders?.on?.('order', (order: any) => {
+            eventBus.emit('order', { kind: 'order_update', order });
+          });
+          ws.orders?.on?.('error', (e: any) => {
+            const msg = e?.message || String(e);
+            if (!msg.includes('429')) {
+              eventBus.log('WARN', `Orders WS error: ${msg}`, 'market_data');
+            }
+          });
+          ws.orders?.on?.('close', () => {
+            if (this.feedLog.ordersWs) {
+              eventBus.log('INFO', 'Orders WS closed', 'market_data');
+              this.feedLog.ordersWs = false;
+            }
+          });
+        }
       }
 
       if (!ws.market?.isConnected) {
@@ -316,7 +322,7 @@ export class MarketDataService {
       } else if (!this.wsStarted) {
         this.scheduleWsRetry(undefined, force);
       }
-      if (!ws.orders?.isConnected) {
+      if (!ws.orders?.isConnected && isLiveMode()) {
         ws.orders?.connect?.().catch(() => {});
       }
     } catch (e: any) {
